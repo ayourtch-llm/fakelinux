@@ -47,6 +47,7 @@ pub const SYS_DUP3: u64 = 24;
 pub const SYS_PIPE2: u64 = 59;
 pub const SYS_SOCKET: u64 = 198;
 pub const SYS_PPOLL: u64 = 73;
+pub const SYS_TGKILL: u64 = 131;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;

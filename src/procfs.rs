@@ -28,10 +28,18 @@ pub struct ProcFs {
 static PROCFS: Mutex<Option<ProcFs>> = Mutex::new(None);
 
 pub fn init(exe_path: &str) {
+    // Ensure exe_path is absolute (glibc asserts it starts with '/')
+    let abs_path = if exe_path.starts_with('/') {
+        exe_path.to_string()
+    } else {
+        let mut cwd = std::env::current_dir().unwrap_or_default();
+        cwd.push(exe_path);
+        cwd.to_string_lossy().to_string()
+    };
     let mut lock = PROCFS.lock().unwrap();
     *lock = Some(ProcFs {
         mappings: Vec::new(),
-        exe_path: exe_path.to_string(),
+        exe_path: abs_path,
         auxv: Vec::new(),
         vfds: HashMap::new(),
     });

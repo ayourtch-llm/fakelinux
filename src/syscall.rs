@@ -79,6 +79,16 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_PIPE2 => do_pipe2(args[0], args[1] as i32),
         SYS_PPOLL => (-38_i64) as u64, // ENOSYS stub
         SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
+        SYS_TGKILL => {
+            // tgkill(tgid, tid, sig) — send signal to specific thread
+            let sig = args[2] as i32;
+            if sig == 6 { // SIGABRT
+                eprintln!("fakelinux: guest called abort (tgkill SIGABRT)");
+                unsafe { libc::_exit(134) } // 128 + SIGABRT(6)
+            }
+            unsafe { libc::kill(libc::getpid(), sig); }
+            0
+        }
         _ => {
             eprintln!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})",
@@ -139,6 +149,15 @@ fn do_fstat(fd: i32, statbuf: u64) -> u64 {
 }
 
 fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32) -> u64 {
+    // AT_EMPTY_PATH (0x1000): if pathname is empty, operate on the fd directly
+    const LINUX_AT_EMPTY_PATH: i32 = 0x1000;
+    if linux_flags & LINUX_AT_EMPTY_PATH != 0 {
+        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        if path.to_bytes().is_empty() {
+            return do_fstat(linux_dirfd, statbuf);
+        }
+    }
+
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
 
@@ -294,7 +313,22 @@ fn do_munmap(addr: u64, length: u64) -> u64 {
 
 fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let mac_prot = translate::translate_mmap_prot(prot);
-    let ret = unsafe { libc::mprotect(addr as *mut _, len as usize, mac_prot) };
+    let page: u64 = 16384;
+
+    // macOS requires 16KB page alignment; Linux guests use 4KB.
+    // Only protect fully-covered 16KB pages to avoid making adjacent
+    // writable data read-only (e.g., RELRO vs .data sharing a page).
+    let aligned_addr = (addr + page - 1) & !(page - 1); // round UP
+    let aligned_end = (addr + len) & !(page - 1);        // round DOWN
+
+    if aligned_addr >= aligned_end {
+        // No full 16KB pages covered — silently succeed.
+        // This commonly happens for RELRO regions smaller than 16KB.
+        return 0;
+    }
+
+    let aligned_len = aligned_end - aligned_addr;
+    let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 

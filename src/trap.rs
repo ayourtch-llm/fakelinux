@@ -140,6 +140,11 @@ unsafe extern "C" fn sigtrap_handler(
         let val = GUEST_TPIDR.load(Ordering::SeqCst);
         write_reg(regs, rn, val);
         regs.pc = pc + 4;
+    } else if instr & 0xFFE0_001F == 0xD420_0000 {
+        // BRK #N — guest's own breakpoint/trap (e.g. glibc __builtin_trap)
+        let brk_imm = (instr >> 5) & 0xFFFF;
+        eprintln!("fakelinux: guest BRK #{:#x} at pc={:#x}", brk_imm, pc);
+        libc::_exit(128 + libc::SIGTRAP);
     } else {
         eprintln!(
             "fakelinux: unexpected SIGTRAP at pc={:#x} instr={:#010x}",
