@@ -2,8 +2,18 @@ use crate::elf::{self, Elf, ElfError};
 use crate::linux::*;
 use crate::procfs;
 use crate::syscall;
-use crate::thread;
 use crate::trap;
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Side table mapping patched PC addresses to their original instructions.
+/// Used for MSR/MRS tpidr_el0 instructions that we replace with BRK.
+pub static TPIDR_PATCH_TABLE: Mutex<Option<HashMap<u64, u32>>> = Mutex::new(None);
+
+pub fn tpidr_lookup(pc: u64) -> Option<u32> {
+    TPIDR_PATCH_TABLE.lock().unwrap().as_ref()?.get(&pc).copied()
+}
 
 const PAGE_SIZE: u64 = 16384; // macOS aarch64
 
@@ -25,11 +35,28 @@ pub struct LoadedElf {
 
 /// Load an ELF binary into memory, rewrite SVC→BRK, set up the stack.
 pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Result<LoadedElf, ElfError> {
-    // For PIE (ET_DYN), pick a base address; for ET_EXEC, use the addresses as-is
     let base_offset: u64 = if elf.header.e_type == ET_DYN {
         0x5_0000_0000 // load PIE at 20GB mark
     } else {
-        0
+        // macOS Apple Silicon enforces a 4GB PAGEZERO — we can't map at typical
+        // Linux ET_EXEC addresses (0x400000). Relocate above 4GB instead.
+        // aarch64 code uses PC-relative addressing (ADRP/ADR/B/BL) so this
+        // works for most binaries despite being non-PIE.
+        let min_vaddr = elf.phdrs.iter()
+            .filter(|p| p.p_type == PT_LOAD)
+            .map(|p| p.p_vaddr)
+            .min()
+            .unwrap_or(0);
+        if min_vaddr < 0x1_0000_0000 {
+            let base = 0x7_0000_0000_u64;
+            eprintln!(
+                "fakelinux: relocating ET_EXEC {:#x} → {:#x} (macOS 4GB PAGEZERO)",
+                min_vaddr, base + min_vaddr
+            );
+            base
+        } else {
+            0
+        }
     };
 
     let mut brk_end: u64 = 0;
@@ -85,6 +112,13 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         offset: 0,
         name: "[heap]".into(),
     });
+
+    // Apply ELF relocations for PIE binaries.
+    // The binary's self-relocation code may not work correctly in our environment,
+    // so we do it here before handing off control.
+    if elf.header.e_type == ET_DYN {
+        apply_relocations(elf, data, base_offset)?;
+    }
 
     // Set up the guest stack
     let stack_ptr = setup_stack(elf, base_offset, phdr_addr, interp_base, guest_args)?;
@@ -216,22 +250,73 @@ fn get_interp(elf: &Elf, data: &[u8]) -> Option<String> {
     None
 }
 
-/// Scan executable memory and replace SVC #0 with BRK #0xF000
+/// Scan executable memory and replace SVC #0 with BRK #0xF000,
+/// and MSR tpidr_el0 with BRK #0xF001 + register number.
 fn rewrite_svc_instructions(start: u64, size: u64) {
     let count = size / 4;
     let base = start as *mut u32;
-    let mut patched = 0u64;
+    let mut svc_patched = 0u64;
+    let mut tpidr_patched = 0u64;
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
             if instr == trap::SVC_0 {
+                // SVC #0 → BRK #0xF000
                 base.add(i).write(trap::BRK_MARKER);
-                patched += 1;
+                svc_patched += 1;
+            } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
+                   || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
+                // MSR/MRS tpidr_el0 → leave the original instruction in place.
+                // It will trap as SIGTRAP because macOS clobbers TPIDR_EL0 on
+                // every signal, so we need to intercept all accesses.
+                // We replace with BRK #0xF000 but keep the original instruction
+                // at the same PC — the handler reads it to determine the operation.
+                // Actually: DON'T replace. The handler reads *(pc) to detect MSR/MRS.
+                // If we replace with BRK, *(pc) = BRK, not MSR. So we need to store
+                // the original instruction somewhere. Simplest: use BRK with a different
+                // immediate that encodes "this was a TPIDR access", then let the handler
+                // decide based on the immediate. But we lose the register number.
+                //
+                // Better approach: DON'T patch MSR/MRS. Instead, make them trap by
+                // marking the code pages as non-executable, then... no, that's worse.
+                //
+                // Simplest approach: NOP out the MSR/MRS and insert the original
+                // instruction at pc+4... no, that shifts code.
+                //
+                // Actually the cleanest approach: leave MSR/MRS as-is. They will
+                // execute natively (reading/writing the macOS-clobbered value).
+                // We DON'T need to intercept them if we ensure TPIDR_EL0 has the
+                // guest value whenever guest code runs. We can do this by writing
+                // the guest TPIDR value just before sigreturn.
+                //
+                // But macOS restores TPIDR on sigreturn! So we can't.
+                //
+                // Final approach: patch to BRK, store original instruction in a side table.
+                // The handler looks up the original instruction from the side table.
+                //
+                // For simplicity, just leave the instruction in place at the PC.
+                // We DON'T replace it with BRK — instead, we'll use a different
+                // mechanism to trap. We'll mark the page as execute-only (no read)
+                // ... no, that's complex.
+                //
+                // OK: patch MSR/MRS to BRK #0xF000, BUT the handler checks *(pc)
+                // which will now be BRK, not MSR. We need to save the original.
+                // Let's use a global HashMap<u64, u32> mapping PC → original instruction.
+                let pc_addr = base.add(i) as u64;
+                crate::procfs::with(|_| {}); // ensure procfs is initialized
+                TPIDR_PATCH_TABLE.lock().unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(pc_addr, instr);
+                base.add(i).write(trap::BRK_MARKER);
+                tpidr_patched += 1;
             }
         }
     }
-    if patched > 0 {
-        eprintln!("fakelinux: patched {} SVC→BRK instructions", patched);
+    if svc_patched > 0 {
+        eprintln!("fakelinux: patched {} SVC→BRK instructions", svc_patched);
+    }
+    if tpidr_patched > 0 {
+        eprintln!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
     }
 }
 
@@ -365,6 +450,103 @@ fn setup_stack(
     Ok(sp)
 }
 
+/// Apply R_AARCH64_RELATIVE relocations from the DYNAMIC segment.
+/// This does what the binary's self-relocation code would normally do at startup.
+fn apply_relocations(elf: &Elf, data: &[u8], base: u64) -> Result<(), ElfError> {
+    // Find the PT_DYNAMIC segment
+    let dyn_phdr = elf.phdrs.iter().find(|p| p.p_type == 2 /* PT_DYNAMIC */);
+    let dyn_phdr = match dyn_phdr {
+        Some(p) => p,
+        None => return Ok(()), // no dynamic section
+    };
+
+    // Read dynamic entries from the file to find DT_RELA, DT_RELASZ, DT_JMPREL, DT_PLTRELSZ
+    let dyn_off = dyn_phdr.p_offset as usize;
+    let dyn_size = dyn_phdr.p_filesz as usize;
+    if dyn_off + dyn_size > data.len() {
+        return Err(ElfError("DYNAMIC segment out of bounds".into()));
+    }
+
+    let mut rela_offset: u64 = 0;
+    let mut rela_size: u64 = 0;
+    let mut rela_ent: u64 = 24; // default RELA entry size
+    let mut jmprel_offset: u64 = 0;
+    let mut jmprel_size: u64 = 0;
+
+    // Parse DT entries (each is 16 bytes: d_tag:8, d_val:8)
+    let mut i = dyn_off;
+    while i + 16 <= dyn_off + dyn_size {
+        let tag = u64::from_le_bytes(data[i..i+8].try_into().unwrap());
+        let val = u64::from_le_bytes(data[i+8..i+16].try_into().unwrap());
+        match tag {
+            0 => break,           // DT_NULL
+            7 => rela_offset = val,   // DT_RELA (vaddr of .rela.dyn)
+            8 => rela_size = val,     // DT_RELASZ
+            9 => rela_ent = val,      // DT_RELAENT
+            23 => jmprel_offset = val, // DT_JMPREL (vaddr of .rela.plt)
+            2 => jmprel_size = val,   // DT_PLTRELSZ
+            _ => {}
+        }
+        i += 16;
+    }
+
+    let mut applied = 0u64;
+
+    // Apply .rela.dyn
+    if rela_offset != 0 && rela_size != 0 {
+        applied += apply_rela_section(data, base, rela_offset, rela_size, rela_ent)?;
+    }
+
+    // Apply .rela.plt (JMPREL)
+    if jmprel_offset != 0 && jmprel_size != 0 {
+        applied += apply_rela_section(data, base, jmprel_offset, jmprel_size, rela_ent)?;
+    }
+
+    if applied > 0 {
+        eprintln!("fakelinux: applied {} R_AARCH64_RELATIVE relocations", applied);
+    }
+
+    Ok(())
+}
+
+/// Apply relocations from a single RELA section.
+fn apply_rela_section(data: &[u8], base: u64, rela_vaddr: u64, rela_size: u64, rela_ent: u64) -> Result<u64, ElfError> {
+    // rela_vaddr is a virtual address in the original ELF; find the file offset
+    // by looking it up as a file offset directly (for PIE with vaddr=0 base, these are the same as file offsets for the first segment)
+    // Actually, for a PIE binary, the file offset and vaddr of the first LOAD segment start at 0,
+    // so rela_vaddr IS the file offset for sections in the first LOAD segment.
+    let rela_file_off = rela_vaddr as usize;
+
+    let count = rela_size / rela_ent;
+    let mut applied = 0u64;
+
+    for j in 0..count {
+        let off = rela_file_off + (j as usize) * (rela_ent as usize);
+        if off + 24 > data.len() {
+            break;
+        }
+        let r_offset = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
+        let r_info = u64::from_le_bytes(data[off+8..off+16].try_into().unwrap());
+        let r_addend = u64::from_le_bytes(data[off+16..off+24].try_into().unwrap());
+
+        let r_type = (r_info & 0xFFFFFFFF) as u32;
+
+        // R_AARCH64_RELATIVE = 0x403 (1027)
+        if r_type == 0x403 {
+            let target_addr = base + r_offset;
+            let value = base + r_addend;
+            unsafe {
+                (target_addr as *mut u64).write(value);
+            }
+            applied += 1;
+        }
+        // R_AARCH64_GLOB_DAT = 0x401, R_AARCH64_JUMP_SLOT = 0x402
+        // These require symbol resolution — skip for now
+    }
+
+    Ok(applied)
+}
+
 fn elf_to_mmap_prot(flags: u32) -> i32 {
     let mut prot = 0;
     if flags & PF_R != 0 { prot |= libc::PROT_READ; }
@@ -375,9 +557,6 @@ fn elf_to_mmap_prot(flags: u32) -> i32 {
 
 /// Transfer control to the loaded binary. Never returns.
 pub unsafe fn jump_to_entry(stack_ptr: u64, entry: u64) -> ! {
-    // Save macOS TLS before entering guest code
-    thread::save_macos_tls();
-
     std::arch::asm!(
         "mov sp, {sp}",
         "br {entry}",

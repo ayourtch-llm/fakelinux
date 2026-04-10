@@ -9,8 +9,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Current program break (heap end), set by the loader after mapping segments.
 pub static BRK_CURRENT: AtomicU64 = AtomicU64::new(0);
 
+/// Enable syscall tracing via FAKELINUX_TRACE=1
+static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_trace(on: bool) {
+    TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Emulate a single Linux aarch64 syscall. Returns the result value for x0.
 pub fn emulate(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
+    let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
+    if trace {
+        eprintln!(
+            "fakelinux: syscall {} (x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x})",
+            nr, args[0], args[1], args[2], args[3], args[4], args[5]
+        );
+    }
+    let result = emulate_inner(nr, args, _regs);
+    if trace {
+        eprintln!("fakelinux:   → {:#x} ({})", result, result as i64);
+    }
+    result
+}
+
+fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
     match nr {
         SYS_WRITE => do_write(args[0], args[1], args[2]),
         SYS_READ => do_read(args[0], args[1], args[2]),

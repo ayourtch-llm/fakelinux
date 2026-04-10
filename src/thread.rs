@@ -44,6 +44,10 @@ pub fn current_tid() -> i32 {
 
 static MACOS_TLS: AtomicU64 = AtomicU64::new(0);
 
+pub fn get_macos_tls() -> u64 {
+    MACOS_TLS.load(Ordering::SeqCst)
+}
+
 /// Save the current (macOS) TPIDR_EL0 value. Call once before jumping to guest.
 pub fn save_macos_tls() {
     let tls: u64;

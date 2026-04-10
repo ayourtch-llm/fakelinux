@@ -35,6 +35,9 @@ fn main() {
     );
 
     // Initialize subsystems
+    if std::env::var("FAKELINUX_TRACE").is_ok() {
+        syscall::set_trace(true);
+    }
     procfs::init(elf_path);
     thread::init_main_tid();
     trap::install_handler();
