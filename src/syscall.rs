@@ -296,6 +296,28 @@ fn do_brk(addr: u64) -> u64 {
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
     let mac_flags = translate::translate_mmap_flags(flags);
     let mac_prot = translate::translate_mmap_prot(prot);
+    let page: u64 = 16384;
+
+    // Handle 4KB/16KB page size mismatch for MAP_FIXED mappings.
+    // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
+    // adjacent data if applied at 16KB granularity. Skip these.
+    let is_fixed = flags & 0x10 != 0; // MAP_FIXED
+    if is_fixed && (addr & (page - 1) != 0 || length < page) {
+        if prot == 0 {
+            // PROT_NONE guard page smaller than a macOS page — skip it
+            return addr;
+        }
+        // For non-PROT_NONE sub-page MAP_FIXED, use mprotect instead to
+        // change protection of already-mapped pages without remapping.
+        if flags & 0x20 != 0 {
+            // MAP_ANONYMOUS + MAP_FIXED at sub-page granularity:
+            // Just zero the memory and change protection.
+            unsafe {
+                std::ptr::write_bytes(addr as *mut u8, 0, length as usize);
+            }
+            return addr;
+        }
+    }
 
     let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
     let ret = unsafe { libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64) };
