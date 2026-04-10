@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 
 use crate::syscall;
+use crate::thread;
 
 /// The BRK instruction we patch in place of SVC #0.
 /// BRK #0xF000 = 0xD43E0000
@@ -52,6 +53,9 @@ unsafe extern "C" fn sigtrap_handler(
     _info: *mut libc::siginfo_t,
     ctx: *mut c_void,
 ) {
+    // Swap to macOS TLS so our emulation code can safely call macOS APIs
+    let guest_tls = thread::swap_to_macos_tls();
+
     let uctx = &mut *(ctx as *mut UContext);
     let mctx = &mut *uctx.uc_mcontext;
     let regs = &mut mctx.ss;
@@ -60,7 +64,6 @@ unsafe extern "C" fn sigtrap_handler(
     let pc = regs.pc;
     let instr = *(pc as *const u32);
     if instr != BRK_MARKER {
-        // Not ours — re-raise as default SIGTRAP behavior (abort)
         eprintln!(
             "fakelinux: unexpected SIGTRAP at pc={:#x} instr={:#010x}",
             pc, instr
@@ -76,16 +79,19 @@ unsafe extern "C" fn sigtrap_handler(
 
     let result = syscall::emulate(nr, &args, regs);
 
-    // Write result to x0 (unless the syscall already exited)
+    // Write result to x0
     regs.x[0] = result as u64;
 
     // Advance PC past the BRK
     regs.pc = pc + 4;
+
+    // Restore guest TLS before returning to guest code
+    thread::restore_guest_tls(guest_tls);
 }
 
 pub fn install_handler() {
     unsafe {
-        // Allocate a signal-handler stack so we don't stomp the guest's stack
+        // Allocate a signal-handler stack
         let stack_size: usize = 128 * 1024;
         let stack = libc::mmap(
             std::ptr::null_mut(),

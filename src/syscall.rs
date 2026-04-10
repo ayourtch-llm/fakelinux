@@ -1,4 +1,8 @@
 use crate::linux::*;
+use crate::procfs;
+use crate::signal;
+use crate::thread;
+use crate::translate;
 use crate::trap::ThreadState64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,98 +16,211 @@ pub fn emulate(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_READ => do_read(args[0], args[1], args[2]),
         SYS_OPENAT => do_openat(args[0] as i32, args[1], args[2] as i32, args[3] as u32),
         SYS_CLOSE => do_close(args[0] as i32),
+        SYS_LSEEK => do_lseek(args[0] as i32, args[1] as i64, args[2] as i32),
         SYS_FSTAT => do_fstat(args[0] as i32, args[1]),
-        SYS_EXIT | SYS_EXIT_GROUP => {
-            // Flush stdout/stderr before exiting
-            unsafe { libc::_exit(args[0] as i32) }
-        }
+        SYS_NEWFSTATAT => do_newfstatat(args[0] as i32, args[1], args[2], args[3] as i32),
+        SYS_EXIT | SYS_EXIT_GROUP => unsafe { libc::_exit(args[0] as i32) },
         SYS_BRK => do_brk(args[0]),
         SYS_MMAP => do_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYS_MUNMAP => do_munmap(args[0], args[1]),
         SYS_MPROTECT => do_mprotect(args[0], args[1], args[2]),
-        SYS_MADVISE => 0, // silently succeed
+        SYS_MADVISE => 0,
         SYS_GETPID => unsafe { libc::getpid() as u64 },
         SYS_GETPPID => unsafe { libc::getppid() as u64 },
         SYS_GETUID => unsafe { libc::getuid() as u64 },
         SYS_GETEUID => unsafe { libc::geteuid() as u64 },
         SYS_GETGID => unsafe { libc::getgid() as u64 },
         SYS_GETEGID => unsafe { libc::getegid() as u64 },
-        SYS_GETTID => unsafe { libc::getpid() as u64 }, // single-threaded: tid == pid
-        SYS_SET_TID_ADDRESS => unsafe { libc::getpid() as u64 },
+        SYS_GETTID => thread::current_tid() as u64,
+        SYS_SET_TID_ADDRESS => thread::current_tid() as u64,
         SYS_SET_ROBUST_LIST => 0,
-        SYS_RT_SIGACTION => 0,    // stub: pretend success
-        SYS_RT_SIGPROCMASK => 0,  // stub: pretend success
+        SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
+        SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
+        SYS_RT_SIGRETURN => 0, // stub
         SYS_CLOCK_GETTIME => do_clock_gettime(args[0] as i32, args[1]),
         SYS_UNAME => do_uname(args[0]),
         SYS_GETRANDOM => do_getrandom(args[0], args[1], args[2] as u32),
         SYS_PRLIMIT64 => do_prlimit64(args[0], args[1] as i32, args[2], args[3]),
         SYS_RSEQ => (-38_i64) as u64, // ENOSYS
+        SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
         SYS_SCHED_GETAFFINITY => (-38_i64) as u64,
+        SYS_SCHED_YIELD => { unsafe { libc::sched_yield(); } 0 }
         SYS_READLINKAT => do_readlinkat(args[0] as i32, args[1], args[2], args[3]),
-        SYS_NEWFSTATAT => do_fstat(args[2] as i32, args[3]), // simplified
-        SYS_IOCTL => (-25_i64) as u64, // ENOTTY
-        SYS_FCNTL => (-38_i64) as u64, // ENOSYS stub
+        SYS_IOCTL => do_ioctl(args[0] as i32, args[1], args[2]),
+        SYS_FCNTL => do_fcntl(args[0] as i32, args[1] as i32, args[2]),
         SYS_WRITEV => do_writev(args[0], args[1], args[2]),
-        SYS_FACCESSAT => 0, // stub: pretend success
+        SYS_FACCESSAT => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
+        SYS_CLONE => thread::do_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYS_FUTEX => thread::do_futex(args[0], args[1] as u32, args[2] as u32, args[3], args[4], args[5] as u32),
+        SYS_DUP => do_dup(args[0] as i32),
+        SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),
+        SYS_PIPE2 => do_pipe2(args[0], args[1] as i32),
+        SYS_PPOLL => (-38_i64) as u64, // ENOSYS stub
+        SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
         _ => {
-            eprintln!("fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})", nr, args[0], args[1], args[2]);
+            eprintln!(
+                "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})",
+                nr, args[0], args[1], args[2]
+            );
             (-38_i64) as u64 // -ENOSYS
         }
     }
 }
 
+// ─── File I/O ────────────────────────────────────────────────────────────────
+
 fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
     let ret = unsafe { libc::write(fd as i32, buf as *const _, count as usize) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        ret as u64
-    }
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
 fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     let ret = unsafe { libc::read(fd as i32, buf as *mut _, count as usize) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        ret as u64
-    }
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
-fn do_openat(dirfd: i32, pathname: u64, flags: i32, mode: u32) -> u64 {
-    // TODO: translate Linux open flags to macOS flags (they differ!)
-    // For now, pass through — works for simple cases
-    let ret = unsafe { libc::openat(dirfd, pathname as *const i8, flags, mode) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        ret as u64
+fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u64 {
+    let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+
+    // Check if this is a /proc path we handle virtually
+    if let Some(fd) = procfs::try_open(path.to_bytes()) {
+        return fd as u64;
     }
+
+    let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let mac_flags = translate::translate_open_flags(linux_flags);
+
+    let ret = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
 fn do_close(fd: i32) -> u64 {
     let ret = unsafe { libc::close(fd) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        0
-    }
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
+    let ret = unsafe { libc::lseek(fd, offset, whence) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
 fn do_fstat(fd: i32, statbuf: u64) -> u64 {
-    // Linux and macOS struct stat differ — this is a stub that zeros the buffer
-    // A full implementation needs field-by-field translation
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
         let ret = libc::fstat(fd, &mut mac_stat);
         if ret < 0 {
-            return linux_errno();
+            return translate::linux_errno();
         }
-        // Zero the Linux stat buffer (128 bytes on aarch64 Linux)
-        std::ptr::write_bytes(statbuf as *mut u8, 0, 128);
+        translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
     }
     0
 }
+
+fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32) -> u64 {
+    let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let mac_flags = translate::translate_at_flags(linux_flags);
+
+    unsafe {
+        let mut mac_stat: libc::stat = std::mem::zeroed();
+        let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
+    }
+    0
+}
+
+fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
+    // TIOCGWINSZ (Linux 0x5413 = macOS TIOCGWINSZ)
+    const LINUX_TIOCGWINSZ: u64 = 0x5413;
+    match request {
+        LINUX_TIOCGWINSZ => {
+            let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, arg as *mut libc::winsize) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        _ => (-25_i64) as u64, // -ENOTTY
+    }
+}
+
+fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
+    if let Some(mac_cmd) = translate::translate_fcntl_cmd(linux_cmd) {
+        let ret = unsafe { libc::fcntl(fd, mac_cmd, arg as i32) };
+        if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    } else {
+        eprintln!("fakelinux: unsupported fcntl cmd {}", linux_cmd);
+        (-22_i64) as u64 // -EINVAL
+    }
+}
+
+fn do_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
+    let ret = unsafe { libc::writev(fd as i32, iov as *const libc::iovec, iovcnt as i32) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) -> u64 {
+    let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let mac_flags = translate::translate_at_flags(linux_flags);
+    let ret = unsafe { libc::faccessat(mac_dirfd, pathname as *const i8, mode, mac_flags) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 {
+    let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+
+    // Check /proc paths first
+    if let Some(result) = procfs::try_readlink(path.to_bytes(), buf, bufsiz) {
+        return result;
+    }
+
+    let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let ret = unsafe {
+        libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
+    };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_dup(fd: i32) -> u64 {
+    let ret = unsafe { libc::dup(fd) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
+    // macOS doesn't have dup3; use dup2 + fcntl for O_CLOEXEC
+    let ret = unsafe { libc::dup2(oldfd, newfd) };
+    if ret < 0 {
+        return translate::linux_errno();
+    }
+    if flags & 0o2000000 != 0 {
+        // O_CLOEXEC
+        unsafe { libc::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC); }
+    }
+    newfd as u64
+}
+
+fn do_pipe2(pipefd_ptr: u64, flags: i32) -> u64 {
+    let fds = pipefd_ptr as *mut [i32; 2];
+    let ret = unsafe { libc::pipe((*fds).as_mut_ptr()) };
+    if ret < 0 {
+        return translate::linux_errno();
+    }
+    // Handle O_CLOEXEC and O_NONBLOCK
+    if flags & 0o2000000 != 0 {
+        unsafe {
+            libc::fcntl((*fds)[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl((*fds)[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    if flags & 0o4000 != 0 {
+        unsafe {
+            libc::fcntl((*fds)[0], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl((*fds)[1], libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    0
+}
+
+// ─── Memory management ──────────────────────────────────────────────────────
 
 fn do_brk(addr: u64) -> u64 {
     let current = BRK_CURRENT.load(Ordering::SeqCst);
@@ -111,10 +228,9 @@ fn do_brk(addr: u64) -> u64 {
         return current;
     }
     if addr < current {
-        return current; // can't shrink below initial
+        return current;
     }
-    // Extend: mmap the new pages
-    let page_size = 16384_u64; // macOS aarch64 page size
+    let page_size = 16384_u64;
     let old_end = (current + page_size - 1) & !(page_size - 1);
     let new_end = (addr + page_size - 1) & !(page_size - 1);
     if new_end > old_end {
@@ -129,7 +245,7 @@ fn do_brk(addr: u64) -> u64 {
             )
         };
         if ret == libc::MAP_FAILED {
-            return current; // allocation failed, return old break
+            return current;
         }
     }
     BRK_CURRENT.store(addr, Ordering::SeqCst);
@@ -137,32 +253,13 @@ fn do_brk(addr: u64) -> u64 {
 }
 
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
-    // Translate Linux mmap flags to macOS
-    let mut mac_flags: i32 = 0;
-    if flags & LINUX_MAP_PRIVATE != 0 {
-        mac_flags |= libc::MAP_PRIVATE;
-    }
-    if flags & LINUX_MAP_SHARED != 0 {
-        mac_flags |= libc::MAP_SHARED;
-    }
-    if flags & LINUX_MAP_ANONYMOUS != 0 {
-        mac_flags |= libc::MAP_ANON;
-    }
-    if flags & LINUX_MAP_FIXED != 0 {
-        mac_flags |= libc::MAP_FIXED;
-    }
+    let mac_flags = translate::translate_mmap_flags(flags);
+    let mac_prot = translate::translate_mmap_prot(prot);
 
-    let mac_prot = translate_prot(prot);
-
-    let hint = if addr == 0 {
-        std::ptr::null_mut()
-    } else {
-        addr as *mut _
-    };
-
+    let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
     let ret = unsafe { libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64) };
     if ret == libc::MAP_FAILED {
-        linux_errno()
+        translate::linux_errno()
     } else {
         ret as u64
     }
@@ -170,32 +267,24 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
 
 fn do_munmap(addr: u64, length: u64) -> u64 {
     let ret = unsafe { libc::munmap(addr as *mut _, length as usize) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        0
-    }
+    if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
 fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
-    let mac_prot = translate_prot(prot);
+    let mac_prot = translate::translate_mmap_prot(prot);
     let ret = unsafe { libc::mprotect(addr as *mut _, len as usize, mac_prot) };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        0
-    }
+    if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
+// ─── Info / misc ────────────────────────────────────────────────────────────
+
 fn do_clock_gettime(clk_id: i32, tp: u64) -> u64 {
-    // Linux CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 — same on macOS
     unsafe {
         let mut ts: libc::timespec = std::mem::zeroed();
         let ret = libc::clock_gettime(clk_id as u32, &mut ts);
         if ret < 0 {
-            return linux_errno();
+            return translate::linux_errno();
         }
-        // Linux aarch64 timespec: i64 tv_sec, i64 tv_nsec
         let out = tp as *mut i64;
         *out = ts.tv_sec as i64;
         *out.add(1) = ts.tv_nsec as i64;
@@ -204,7 +293,6 @@ fn do_clock_gettime(clk_id: i32, tp: u64) -> u64 {
 }
 
 fn do_uname(buf: u64) -> u64 {
-    // Linux struct utsname: 6 fields of 65 bytes each
     let ptr = buf as *mut u8;
     unsafe {
         std::ptr::write_bytes(ptr, 0, 6 * 65);
@@ -223,73 +311,20 @@ fn do_uname(buf: u64) -> u64 {
 }
 
 fn do_getrandom(buf: u64, buflen: u64, _flags: u32) -> u64 {
-    // Fill with random bytes from macOS arc4random
     let ptr = buf as *mut u8;
     for i in 0..buflen as usize {
-        unsafe {
-            *ptr.add(i) = libc::arc4random() as u8;
-        }
+        unsafe { *ptr.add(i) = libc::arc4random() as u8; }
     }
     buflen
 }
 
 fn do_prlimit64(_pid: u64, _resource: i32, _new_limit: u64, old_limit: u64) -> u64 {
     if old_limit != 0 {
-        // Return a generous default: rlim_cur = rlim_max = large value
         unsafe {
             let ptr = old_limit as *mut u64;
-            *ptr = u64::MAX; // rlim_cur
-            *ptr.add(1) = u64::MAX; // rlim_max
+            *ptr = u64::MAX;
+            *ptr.add(1) = u64::MAX;
         }
     }
     0
-}
-
-fn do_readlinkat(_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 {
-    let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
-    let path_str = path.to_bytes();
-    // Handle /proc/self/exe
-    if path_str == b"/proc/self/exe" {
-        let fake = b"/fakelinux-guest";
-        let len = fake.len().min(bufsiz as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(fake.as_ptr(), buf as *mut u8, len);
-        }
-        return len as u64;
-    }
-    (-2_i64) as u64 // -ENOENT
-}
-
-fn do_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
-    // struct iovec { void *iov_base; size_t iov_len; } — same layout on Linux/macOS aarch64
-    let ret = unsafe {
-        libc::writev(fd as i32, iov as *const libc::iovec, iovcnt as i32)
-    };
-    if ret < 0 {
-        linux_errno()
-    } else {
-        ret as u64
-    }
-}
-
-fn translate_prot(linux_prot: u64) -> i32 {
-    // Protection flags happen to have the same values on Linux and macOS
-    let mut p: i32 = 0;
-    if linux_prot & LINUX_PROT_READ != 0 {
-        p |= libc::PROT_READ;
-    }
-    if linux_prot & LINUX_PROT_WRITE != 0 {
-        p |= libc::PROT_WRITE;
-    }
-    if linux_prot & LINUX_PROT_EXEC != 0 {
-        p |= libc::PROT_EXEC;
-    }
-    p
-}
-
-fn linux_errno() -> u64 {
-    // Return negated errno. Linux uses negative return values for errors.
-    // macOS errno values are mostly compatible for common errors.
-    let e = unsafe { *libc::__error() };
-    (-(e as i64)) as u64
 }
