@@ -556,10 +556,49 @@ fn elf_to_mmap_prot(flags: u32) -> i32 {
 }
 
 /// Transfer control to the loaded binary. Never returns.
+///
+/// Mimics the Linux kernel's initial register state: all GPRs zeroed,
+/// SP pointing to the argc/argv/envp/auxv structure.
+/// x0 = 0 is critical: glibc's _start interprets x0 as rtld_fini.
 pub unsafe fn jump_to_entry(stack_ptr: u64, entry: u64) -> ! {
     std::arch::asm!(
-        "mov sp, {sp}",
-        "br {entry}",
+        // Use x9/x10 as temporaries (they'll be zeroed after use)
+        "mov x9, {sp}",
+        "mov x10, {entry}",
+        // Zero all general-purpose registers
+        "mov x0, xzr",
+        "mov x1, xzr",
+        "mov x2, xzr",
+        "mov x3, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        // Set SP and jump
+        "mov sp, x9",
+        "mov x9, xzr",
+        "br x10",
         sp = in(reg) stack_ptr,
         entry = in(reg) entry,
         options(noreturn)
