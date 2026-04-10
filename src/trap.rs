@@ -3,6 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::syscall;
 
+/// Format into a stack buffer using raw write — no Mutex, safe after fork.
+fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    let _ = cursor.write_fmt(args);
+    cursor.position() as usize
+}
+
 /// The BRK instruction we patch in place of SVC #0.
 pub const BRK_MARKER: u32 = 0xD43E_0000;
 
@@ -155,13 +163,15 @@ unsafe extern "C" fn sigtrap_handler(
             // BRK in macOS code (e.g. post-fork child runtime assertion) — exit silently
             libc::_exit(128 + libc::SIGTRAP);
         }
-        eprintln!("fakelinux: guest BRK #{:#x} at pc={:#x}", brk_imm, pc);
+        // Use raw write — safe after fork (no Rust Mutex)
+        let mut buf = [0u8; 80];
+        let n = raw_fmt(&mut buf, format_args!("fakelinux: guest BRK #{:#x} at pc={:#x}\n", brk_imm, pc));
+        libc::write(2, buf.as_ptr() as *const _, n);
         libc::_exit(128 + libc::SIGTRAP);
     } else {
-        eprintln!(
-            "fakelinux: unexpected SIGTRAP at pc={:#x} instr={:#010x}",
-            pc, instr
-        );
+        let mut buf = [0u8; 80];
+        let n = raw_fmt(&mut buf, format_args!("fakelinux: unexpected SIGTRAP at pc={:#x} instr={:#010x}\n", pc, instr));
+        libc::write(2, buf.as_ptr() as *const _, n);
         libc::_exit(128 + libc::SIGTRAP);
     }
 }
@@ -211,24 +221,23 @@ pub fn install_handler() {
 
 unsafe extern "C" fn crash_handler(
     sig: libc::c_int,
-    info: *mut libc::siginfo_t,
+    _info: *mut libc::siginfo_t,
     ctx: *mut c_void,
 ) {
-    let signame = if sig == libc::SIGSEGV { "SIGSEGV" } else { "SIGBUS" };
+    // Use raw write() — safe after fork (no Rust Mutex deadlock)
     let uctx = &*(ctx as *const UContext);
     let mctx = &*uctx.uc_mcontext;
     let regs = &mctx.ss;
     let fault_addr = mctx.es.far;
     let guest_tpidr = GUEST_TPIDR.load(Ordering::SeqCst);
-    eprintln!("\nfakelinux: {} at pc={:#x} fault_addr={:#x}", signame, regs.pc, fault_addr);
-    eprintln!("  x0={:#x}  x1={:#x}  x2={:#x}  x3={:#x}", regs.x[0], regs.x[1], regs.x[2], regs.x[3]);
-    eprintln!("  x8={:#x}  sp={:#x}  lr={:#x}  guest_tpidr={:#x}", regs.x[8], regs.sp, regs.lr, guest_tpidr);
-
-    let instr = *(regs.pc as *const u32);
-    if instr == SVC_0 {
-        eprintln!("  → unpatched SVC #0 detected!");
-    }
-
-    let _ = (info, signame);
+    let signame = if sig == libc::SIGSEGV { "SIGSEGV" } else { "SIGBUS" };
+    let mut buf = [0u8; 256];
+    let n = raw_fmt(&mut buf, format_args!(
+        "\nfakelinux: {} at pc={:#x} fault_addr={:#x}\n  x0={:#x}  x1={:#x}  x2={:#x}  x3={:#x}\n  x8={:#x}  sp={:#x}  lr={:#x}  guest_tpidr={:#x}\n",
+        signame, regs.pc, fault_addr,
+        regs.x[0], regs.x[1], regs.x[2], regs.x[3],
+        regs.x[8], regs.sp, regs.lr, guest_tpidr
+    ));
+    libc::write(2, buf.as_ptr() as *const _, n);
     libc::_exit(128 + sig);
 }

@@ -230,28 +230,49 @@ fn do_fork(_flags: u64) -> u64 {
         return crate::translate::linux_errno();
     }
     if pid == 0 {
-        // Child: restore callee-saved registers and jump to guest code.
-        // After a syscall, only x19-x28, fp(x29), lr(x30), SP need to
-        // be preserved. x0-x18 are caller-saved — we use them as temps.
+        // Child: re-install signal handler with a fresh sigaltstack.
+        crate::trap::install_handler();
+
+        // TODO: For now, just exit the child. Full guest code execution
+        // after fork needs more work (signal handler context issues).
+        unsafe { libc::_exit(127); }
+
+        // Restore callee-saved registers and jump to guest code.
+        #[allow(unreachable_code)]
         unsafe {
             let r = &FORK_REGS;
+            let sp_val = r.sp;
+            let pc_val = r.pc;
+
+            // Restore callee-saved registers
+            let x19 = r.x[19]; let x20 = r.x[20]; let x21 = r.x[21];
+            let x22 = r.x[22]; let x23 = r.x[23]; let x24 = r.x[24];
+            let x25 = r.x[25]; let x26 = r.x[26]; let x27 = r.x[27];
+            let x28 = r.x[28]; let fp = r.fp; let lr = r.lr;
+
             std::arch::asm!(
-                // x0 = base pointer to SavedRegs
-                // Restore callee-saved: x19-x28
-                "ldp x19, x20, [x0, #152]",
-                "ldp x21, x22, [x0, #168]",
-                "ldp x23, x24, [x0, #184]",
-                "ldp x25, x26, [x0, #200]",
-                "ldp x27, x28, [x0, #216]",
-                // Restore fp(x29), lr(x30)
-                "ldp x29, x30, [x0, #232]",
-                // Load SP and PC into temps
-                "ldr x1, [x0, #248]",  // SP
-                "ldr x2, [x0, #256]",  // PC
-                "mov sp, x1",
-                "mov x0, xzr",         // child clone returns 0
-                "br x2",
-                in("x0") r as *const SavedRegs as u64,
+                "mov x19, {x19}",
+                "mov x20, {x20}",
+                "mov x21, {x21}",
+                "mov x22, {x22}",
+                "mov x23, {x23}",
+                "mov x24, {x24}",
+                "mov x25, {x25}",
+                "mov x26, {x26}",
+                "mov x27, {x27}",
+                "mov x28, {x28}",
+                "mov x29, {fp}",
+                "mov x30, {lr}",
+                "mov sp, {sp_val}",
+                "mov x0, xzr",
+                "br {pc_val}",
+                x19 = in(reg) x19, x20 = in(reg) x20,
+                x21 = in(reg) x21, x22 = in(reg) x22,
+                x23 = in(reg) x23, x24 = in(reg) x24,
+                x25 = in(reg) x25, x26 = in(reg) x26,
+                x27 = in(reg) x27, x28 = in(reg) x28,
+                fp = in(reg) fp, lr = in(reg) lr,
+                sp_val = in(reg) sp_val, pc_val = in(reg) pc_val,
                 options(noreturn)
             );
         }

@@ -6,6 +6,21 @@ use crate::translate;
 use crate::trap::ThreadState64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Write a diagnostic message to stderr using raw write() — safe after fork.
+/// eprintln! uses Rust's Mutex<Stderr> which deadlocks in forked children.
+fn raw_eprintln(msg: &str) {
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+}
+
+fn raw_eprintln_fmt(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let mut buf = [0u8; 256];
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    let _ = cursor.write_fmt(args);
+    let pos = cursor.position() as usize;
+    unsafe { libc::write(2, buf.as_ptr() as *const _, pos); }
+}
+
 /// Current program break (heap end), set by the loader after mapping segments.
 pub static BRK_CURRENT: AtomicU64 = AtomicU64::new(0);
 
@@ -20,14 +35,14 @@ pub fn set_trace(on: bool) {
 pub fn emulate(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
     let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
     if trace {
-        eprintln!(
-            "fakelinux: syscall {} (x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x})",
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: syscall {} (x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x})\n",
             nr, args[0], args[1], args[2], args[3], args[4], args[5]
-        );
+        ));
     }
     let result = emulate_inner(nr, args, _regs);
     if trace {
-        eprintln!("fakelinux:   → {:#x} ({})", result, result as i64);
+        raw_eprintln_fmt(format_args!("fakelinux:   → {:#x} ({})\n", result, result as i64));
     }
     result
 }
@@ -83,7 +98,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_TGKILL => {
             let sig = args[2] as i32;
             if sig == 6 {
-                eprintln!("fakelinux: guest called abort (tgkill SIGABRT)");
+                raw_eprintln("fakelinux: guest called abort (tgkill SIGABRT)\n");
                 unsafe { libc::_exit(134) }
             }
             unsafe { libc::kill(libc::getpid(), sig); }
@@ -144,10 +159,10 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
         SYS_EXECVE => (-38_i64) as u64, // ENOSYS for now
         _ => {
-            eprintln!(
-                "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})",
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
                 nr, args[0], args[1], args[2]
-            );
+            ));
             (-38_i64) as u64 // -ENOSYS
         }
     }
