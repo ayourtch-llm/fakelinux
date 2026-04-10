@@ -77,18 +77,72 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_DUP => do_dup(args[0] as i32),
         SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),
         SYS_PIPE2 => do_pipe2(args[0], args[1] as i32),
+        SYS_GETDENTS64 => do_getdents64(args[0] as i32, args[1], args[2]),
         SYS_PPOLL => (-38_i64) as u64, // ENOSYS stub
         SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
         SYS_TGKILL => {
-            // tgkill(tgid, tid, sig) — send signal to specific thread
             let sig = args[2] as i32;
-            if sig == 6 { // SIGABRT
+            if sig == 6 {
                 eprintln!("fakelinux: guest called abort (tgkill SIGABRT)");
-                unsafe { libc::_exit(134) } // 128 + SIGABRT(6)
+                unsafe { libc::_exit(134) }
             }
             unsafe { libc::kill(libc::getpid(), sig); }
             0
         }
+        SYS_UMASK => {
+            let ret = unsafe { libc::umask(args[0] as libc::mode_t) };
+            ret as u64
+        }
+        SYS_GETGROUPS => {
+            // getgroups(size, list) — return 0 groups for simplicity
+            0
+        }
+        SYS_SETPRIORITY => 0, // stub success
+        SYS_GETPRIORITY => 20, // default nice value
+        SYS_SETITIMER => 0, // stub success
+        SYS_GETCWD => do_getcwd(args[0], args[1]),
+        SYS_CHDIR => {
+            let ret = unsafe { libc::chdir(args[0] as *const i8) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FCHDIR => {
+            let ret = unsafe { libc::fchdir(args[0] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_MKDIRAT => {
+            let ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_UNLINKAT => {
+            let mac_flags = if args[2] & 0x200 != 0 { libc::AT_REMOVEDIR } else { 0 };
+            let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, mac_flags) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_RENAMEAT => {
+            let ret = unsafe { libc::renameat(
+                translate::translate_dirfd(args[0] as i32), args[1] as *const i8,
+                translate::translate_dirfd(args[2] as i32), args[3] as *const i8,
+            ) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FCHMOD => {
+            let ret = unsafe { libc::fchmod(args[0] as i32, args[1] as libc::mode_t) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FCHMODAT => {
+            let ret = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t, args[3] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FCHOWN => {
+            let ret = unsafe { libc::fchown(args[0] as i32, args[1] as u32, args[2] as u32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FCHOWNAT => {
+            let ret = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_WAIT4 => (-10_i64) as u64, // -ECHILD (no children)
+        SYS_EXECVE => (-38_i64) as u64, // ENOSYS for now
         _ => {
             eprintln!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})",
@@ -259,6 +313,81 @@ fn do_pipe2(pipefd_ptr: u64, flags: i32) -> u64 {
         }
     }
     0
+}
+
+fn do_getdents64(fd: i32, buf: u64, bufsize: u64) -> u64 {
+    // Use macOS __getdirentries64 (raw syscall) to read directory entries,
+    // then convert to Linux struct linux_dirent64 format.
+    extern "C" {
+        fn __getdirentries64(fd: libc::c_int, buf: *mut libc::c_char, bufsize: libc::c_int, basep: *mut libc::c_long) -> libc::c_int;
+    }
+
+    let mut mac_buf = vec![0u8; bufsize as usize];
+    let mut basep: libc::c_long = 0;
+
+    let n = unsafe {
+        __getdirentries64(fd, mac_buf.as_mut_ptr() as *mut i8, bufsize as i32, &mut basep)
+    };
+    if n < 0 {
+        return translate::linux_errno();
+    }
+    if n == 0 {
+        return 0;
+    }
+
+    let mut out_pos: usize = 0;
+    let mut in_pos: usize = 0;
+    let out_buf = buf as *mut u8;
+
+    while in_pos < n as usize {
+        // macOS struct dirent: d_ino(8), d_seekoff(8), d_reclen(2), d_namlen(2), d_type(1), d_name[]
+        if in_pos + 21 > n as usize {
+            break;
+        }
+        let mac_ptr = mac_buf[in_pos..].as_ptr();
+        let d_ino = unsafe { (mac_ptr as *const u64).read_unaligned() };
+        let d_reclen_mac = unsafe { (mac_ptr.add(16) as *const u16).read_unaligned() } as usize;
+        let d_namlen = unsafe { (mac_ptr.add(18) as *const u16).read_unaligned() } as usize;
+        let d_type = unsafe { *mac_ptr.add(20) };
+
+        if in_pos + 21 + d_namlen > n as usize || d_reclen_mac == 0 {
+            break;
+        }
+        let d_name = &mac_buf[in_pos + 21..in_pos + 21 + d_namlen];
+
+        // Linux dirent64: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name + null
+        let linux_reclen = (19 + d_namlen + 1 + 7) & !7;
+
+        if out_pos + linux_reclen > bufsize as usize {
+            break;
+        }
+
+        unsafe {
+            let out = out_buf.add(out_pos);
+            std::ptr::write_bytes(out, 0, linux_reclen);
+            (out as *mut u64).write_unaligned(d_ino);
+            (out.add(8) as *mut i64).write_unaligned((out_pos + linux_reclen) as i64);
+            (out.add(16) as *mut u16).write_unaligned(linux_reclen as u16);
+            *out.add(18) = d_type;
+            std::ptr::copy_nonoverlapping(d_name.as_ptr(), out.add(19), d_namlen);
+        }
+
+        out_pos += linux_reclen;
+        in_pos += d_reclen_mac;
+    }
+
+    out_pos as u64
+}
+
+fn do_getcwd(buf: u64, size: u64) -> u64 {
+    let ret = unsafe { libc::getcwd(buf as *mut i8, size as usize) };
+    if ret.is_null() {
+        translate::linux_errno()
+    } else {
+        // Linux getcwd returns the length including null terminator
+        let len = unsafe { std::ffi::CStr::from_ptr(ret).to_bytes_with_nul().len() };
+        len as u64
+    }
 }
 
 // ─── Memory management ──────────────────────────────────────────────────────

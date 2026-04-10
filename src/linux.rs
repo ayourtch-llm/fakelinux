@@ -48,6 +48,25 @@ pub const SYS_PIPE2: u64 = 59;
 pub const SYS_SOCKET: u64 = 198;
 pub const SYS_PPOLL: u64 = 73;
 pub const SYS_TGKILL: u64 = 131;
+pub const SYS_SETPRIORITY: u64 = 140;
+pub const SYS_GETPRIORITY: u64 = 141;
+pub const SYS_SETITIMER: u64 = 103;
+pub const SYS_GETDENTS64: u64 = 61;
+pub const SYS_UMASK: u64 = 166;
+pub const SYS_GETGROUPS: u64 = 158;
+pub const SYS_SETGROUPS: u64 = 159;
+pub const SYS_WAIT4: u64 = 260;
+pub const SYS_EXECVE: u64 = 221;
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_FCHDIR: u64 = 50;
+pub const SYS_GETCWD: u64 = 17;
+pub const SYS_MKDIRAT: u64 = 34;
+pub const SYS_UNLINKAT: u64 = 35;
+pub const SYS_RENAMEAT: u64 = 38;
+pub const SYS_FCHMOD: u64 = 52;
+pub const SYS_FCHMODAT: u64 = 53;
+pub const SYS_FCHOWN: u64 = 55;
+pub const SYS_FCHOWNAT: u64 = 54;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;
