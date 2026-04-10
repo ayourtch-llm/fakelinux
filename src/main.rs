@@ -48,6 +48,9 @@ fn main() {
         std::process::exit(1);
     });
 
+    // Freeze the TPIDR patch table for lock-free lookup (safe after fork)
+    loader::freeze_tpidr_patches();
+
     // Transfer control to the Linux binary
     unsafe {
         loader::jump_to_entry(loaded.stack_ptr, loaded.entry);

@@ -141,7 +141,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
             let ret = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
-        SYS_WAIT4 => (-10_i64) as u64, // -ECHILD (no children)
+        SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
         SYS_EXECVE => (-38_i64) as u64, // ENOSYS for now
         _ => {
             eprintln!(

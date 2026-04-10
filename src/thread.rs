@@ -89,12 +89,16 @@ pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 
-/// Minimal clone implementation for CLONE_THREAD.
-/// args: [flags, stack, parent_tid_ptr, tls, child_tid_ptr]
+/// Implement clone: fork (no CLONE_VM) or thread creation (CLONE_VM|CLONE_THREAD).
 pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64) -> u64 {
-    // We only support thread creation (CLONE_VM | CLONE_THREAD)
-    if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 {
-        eprintln!("fakelinux: clone without CLONE_VM|CLONE_THREAD not supported (flags={:#x})", flags);
+    // Fork: clone without CLONE_VM
+    if flags & CLONE_VM == 0 {
+        return do_fork(flags);
+    }
+
+    // Thread creation requires CLONE_THREAD
+    if flags & CLONE_THREAD == 0 {
+        eprintln!("fakelinux: clone with CLONE_VM but without CLONE_THREAD not supported (flags={:#x})", flags);
         return (-38_i64) as u64; // -ENOSYS
     }
 
@@ -189,6 +193,90 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
             options(noreturn)
         );
     }
+}
+
+/// Saved guest register state for fork. The signal handler copies the
+/// mcontext registers here before calling clone, so the forked child
+/// can jump to guest code with the correct register state.
+#[repr(C)]
+pub struct SavedRegs {
+    pub x: [u64; 29],
+    pub fp: u64,
+    pub lr: u64,
+    pub sp: u64,
+    pub pc: u64,
+}
+
+static mut FORK_REGS: SavedRegs = SavedRegs {
+    x: [0; 29], fp: 0, lr: 0, sp: 0, pc: 0,
+};
+
+/// Save guest registers for fork. Called from the signal handler.
+pub fn save_fork_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
+    unsafe {
+        FORK_REGS.x = regs.x;
+        FORK_REGS.fp = regs.fp;
+        FORK_REGS.lr = regs.lr;
+        FORK_REGS.sp = regs.sp;
+        FORK_REGS.pc = resume_pc;
+    }
+}
+
+/// Fork using macOS fork(). The child jumps directly to guest code
+/// bypassing sigreturn (which crashes in forked children from signal handlers).
+fn do_fork(_flags: u64) -> u64 {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return crate::translate::linux_errno();
+    }
+    if pid == 0 {
+        // Child: restore callee-saved registers and jump to guest code.
+        // After a syscall, only x19-x28, fp(x29), lr(x30), SP need to
+        // be preserved. x0-x18 are caller-saved — we use them as temps.
+        unsafe {
+            let r = &FORK_REGS;
+            std::arch::asm!(
+                // x0 = base pointer to SavedRegs
+                // Restore callee-saved: x19-x28
+                "ldp x19, x20, [x0, #152]",
+                "ldp x21, x22, [x0, #168]",
+                "ldp x23, x24, [x0, #184]",
+                "ldp x25, x26, [x0, #200]",
+                "ldp x27, x28, [x0, #216]",
+                // Restore fp(x29), lr(x30)
+                "ldp x29, x30, [x0, #232]",
+                // Load SP and PC into temps
+                "ldr x1, [x0, #248]",  // SP
+                "ldr x2, [x0, #256]",  // PC
+                "mov sp, x1",
+                "mov x0, xzr",         // child clone returns 0
+                "br x2",
+                in("x0") r as *const SavedRegs as u64,
+                options(noreturn)
+            );
+        }
+    } else {
+        pid as u64
+    }
+}
+
+/// wait4(pid, wstatus, options, rusage)
+pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
+    let mut status: i32 = 0;
+    let status_ptr = if wstatus_ptr != 0 { &mut status as *mut i32 } else { std::ptr::null_mut() };
+    let rusage = if rusage_ptr != 0 { rusage_ptr as *mut libc::rusage } else { std::ptr::null_mut() };
+
+    let ret = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
+    if ret < 0 {
+        return crate::translate::linux_errno();
+    }
+
+    // Write status back to guest memory (Linux and macOS wstatus format is compatible)
+    if wstatus_ptr != 0 {
+        unsafe { (wstatus_ptr as *mut i32).write(status); }
+    }
+
+    ret as u64
 }
 
 // ─── Futex emulation ────────────────────────────────────────────────────────

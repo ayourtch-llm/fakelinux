@@ -8,11 +8,31 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Side table mapping patched PC addresses to their original instructions.
-/// Used for MSR/MRS tpidr_el0 instructions that we replace with BRK.
-pub static TPIDR_PATCH_TABLE: Mutex<Option<HashMap<u64, u32>>> = Mutex::new(None);
+/// Written during loading, then frozen. Uses a sorted Vec for lock-free lookup
+/// (safe to use after fork, unlike Mutex<HashMap>).
+static TPIDR_PATCHES: Mutex<Option<Vec<(u64, u32)>>> = Mutex::new(None);
+/// Frozen sorted copy for lock-free lookup at runtime.
+static mut TPIDR_PATCHES_FROZEN: Option<Vec<(u64, u32)>> = None;
+
+pub fn freeze_tpidr_patches() {
+    let mut lock = TPIDR_PATCHES.lock().unwrap();
+    if let Some(mut v) = lock.take() {
+        v.sort_by_key(|&(pc, _)| pc);
+        unsafe { TPIDR_PATCHES_FROZEN = Some(v); }
+    }
+}
+
+fn add_tpidr_patch(pc: u64, instr: u32) {
+    TPIDR_PATCHES.lock().unwrap()
+        .get_or_insert_with(Vec::new)
+        .push((pc, instr));
+}
 
 pub fn tpidr_lookup(pc: u64) -> Option<u32> {
-    TPIDR_PATCH_TABLE.lock().unwrap().as_ref()?.get(&pc).copied()
+    let table = unsafe { TPIDR_PATCHES_FROZEN.as_ref()? };
+    table.binary_search_by_key(&pc, |&(addr, _)| addr)
+        .ok()
+        .map(|i| table[i].1)
 }
 
 const PAGE_SIZE: u64 = 16384; // macOS aarch64
@@ -304,9 +324,7 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
                 // Let's use a global HashMap<u64, u32> mapping PC → original instruction.
                 let pc_addr = base.add(i) as u64;
                 crate::procfs::with(|_| {}); // ensure procfs is initialized
-                TPIDR_PATCH_TABLE.lock().unwrap()
-                    .get_or_insert_with(HashMap::new)
-                    .insert(pc_addr, instr);
+                add_tpidr_patch(pc_addr, instr);
                 base.add(i).write(trap::BRK_MARKER);
                 tpidr_patched += 1;
             }

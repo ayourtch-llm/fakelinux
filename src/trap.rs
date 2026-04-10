@@ -122,6 +122,14 @@ unsafe extern "C" fn sigtrap_handler(
         let args = [
             regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5],
         ];
+
+        // For fork (clone without CLONE_VM), save guest registers so the
+        // forked child can jump directly to guest code without sigreturn.
+        use crate::linux::SYS_CLONE;
+        if nr == SYS_CLONE && args[0] & 0x100 == 0 {
+            crate::thread::save_fork_regs(regs, pc + 4);
+        }
+
         let result = syscall::emulate(nr, &args, regs);
         regs.x[0] = result as u64;
         regs.pc = pc + 4;
@@ -141,8 +149,12 @@ unsafe extern "C" fn sigtrap_handler(
         write_reg(regs, rn, val);
         regs.pc = pc + 4;
     } else if instr & 0xFFE0_001F == 0xD420_0000 {
-        // BRK #N — guest's own breakpoint/trap (e.g. glibc __builtin_trap)
+        // BRK #N — could be guest's own trap or macOS internal trap (e.g. after fork)
         let brk_imm = (instr >> 5) & 0xFFFF;
+        if pc < 0x500000000 {
+            // BRK in macOS code (e.g. post-fork child runtime assertion) — exit silently
+            libc::_exit(128 + libc::SIGTRAP);
+        }
         eprintln!("fakelinux: guest BRK #{:#x} at pc={:#x}", brk_imm, pc);
         libc::_exit(128 + libc::SIGTRAP);
     } else {
