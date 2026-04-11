@@ -1017,7 +1017,7 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
             }
             let read_len = file_read_len(fd, offset, length);
             if read_len > 0 {
-                unsafe { libc::pread(fd, addr as *mut _, read_len as usize, offset as i64); }
+                pread_full(fd, addr, read_len, offset as i64);
             }
             if has_exec && length > 0 {
                 loader::patch_new_code(addr, length);
@@ -1052,7 +1052,7 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
         // Read file content (clamped to file size)
         let read_len = file_read_len(fd, offset, length);
         if read_len > 0 {
-            unsafe { libc::pread(fd, result_addr as *mut _, read_len as usize, offset as i64); }
+            pread_full(fd, result_addr, read_len, offset as i64);
         }
 
         // Patch SVC/TPIDR if executable
@@ -1076,6 +1076,20 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
         return translate::linux_errno();
     }
     ret as u64
+}
+
+/// Helper: pread that loops until all bytes are read (or EOF/error).
+/// macOS pread can return short reads for large requests.
+fn pread_full(fd: i32, addr: u64, len: u64, offset: i64) {
+    let mut done: usize = 0;
+    let total = len as usize;
+    while done < total {
+        let ret = unsafe {
+            libc::pread(fd, (addr as usize + done) as *mut _, total - done, offset + done as i64)
+        };
+        if ret <= 0 { break; } // EOF or error
+        done += ret as usize;
+    }
 }
 
 /// Helper: compute how many bytes to pread from fd at offset, clamped to file size.
