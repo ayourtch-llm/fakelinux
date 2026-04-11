@@ -67,6 +67,10 @@ pub const SYS_FCHMOD: u64 = 52;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_FCHOWNAT: u64 = 54;
+pub const SYS_READV: u64 = 65;
+pub const SYS_PREAD64: u64 = 67;
+pub const SYS_PWRITE64: u64 = 68;
+pub const SYS_STATX: u64 = 291;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;

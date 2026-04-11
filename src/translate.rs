@@ -239,6 +239,87 @@ pub fn mac_stat_to_linux(mac: &libc::stat, out: *mut u8) {
     }
 }
 
+// ─── statx translation ──────────────────────────────────────────────────────
+// Linux struct statx layout (256 bytes):
+//   offset  0: u32 stx_mask
+//   offset  4: u32 stx_blksize
+//   offset  8: u64 stx_attributes
+//   offset 16: u32 stx_nlink
+//   offset 20: u32 stx_uid
+//   offset 24: u32 stx_gid
+//   offset 28: u16 stx_mode
+//   offset 30: u16 __spare0
+//   offset 32: u64 stx_ino
+//   offset 40: u64 stx_size
+//   offset 48: u64 stx_blocks
+//   offset 56: u64 stx_attributes_mask
+//   offset 64: struct statx_timestamp stx_atime (16 bytes: i64 tv_sec + u32 tv_nsec + i32 __reserved)
+//   offset 80: struct statx_timestamp stx_btime
+//   offset 96: struct statx_timestamp stx_ctime
+//   offset112: struct statx_timestamp stx_mtime
+//   offset128: u32 stx_rdev_major
+//   offset132: u32 stx_rdev_minor
+//   offset136: u32 stx_dev_major
+//   offset140: u32 stx_dev_minor
+//   offset144: u64 stx_mnt_id
+//   ... rest is spare/padding up to 256 bytes
+pub const LINUX_STATX_SIZE: usize = 256;
+const STATX_BASIC_STATS: u32 = 0x07ff;
+
+pub fn mac_stat_to_linux_statx(mac: &libc::stat, out: *mut u8) {
+    unsafe {
+        std::ptr::write_bytes(out, 0, LINUX_STATX_SIZE);
+
+        let w64 = |off: usize, val: u64| {
+            (out.add(off) as *mut u64).write_unaligned(val);
+        };
+        let w32 = |off: usize, val: u32| {
+            (out.add(off) as *mut u32).write_unaligned(val);
+        };
+        let w16 = |off: usize, val: u16| {
+            (out.add(off) as *mut u16).write_unaligned(val);
+        };
+        let wi64 = |off: usize, val: i64| {
+            (out.add(off) as *mut i64).write_unaligned(val);
+        };
+        w32(0, STATX_BASIC_STATS);          // stx_mask
+        w32(4, mac.st_blksize as u32);      // stx_blksize
+        w64(8, 0);                            // stx_attributes
+        w32(16, mac.st_nlink as u32);        // stx_nlink
+        w32(20, mac.st_uid);                  // stx_uid
+        w32(24, mac.st_gid);                  // stx_gid
+        w16(28, mac.st_mode as u16);         // stx_mode
+        w64(32, mac.st_ino);                  // stx_ino
+        w64(40, mac.st_size as u64);         // stx_size
+        w64(48, mac.st_blocks as u64);       // stx_blocks
+        w64(56, 0);                           // stx_attributes_mask
+
+        // stx_atime (offset 64): tv_sec(i64) + tv_nsec(u32)
+        wi64(64, mac.st_atime);
+        w32(72, mac.st_atime_nsec as u32);
+
+        // stx_btime (offset 80): macOS has st_birthtime
+        wi64(80, mac.st_birthtime);
+        w32(88, mac.st_birthtime_nsec as u32);
+
+        // stx_ctime (offset 96)
+        wi64(96, mac.st_ctime);
+        w32(104, mac.st_ctime_nsec as u32);
+
+        // stx_mtime (offset 112)
+        wi64(112, mac.st_mtime);
+        w32(120, mac.st_mtime_nsec as u32);
+
+        // stx_rdev_major/minor (offset 128/132)
+        w32(128, libc::major(mac.st_rdev as libc::dev_t) as u32);
+        w32(132, libc::minor(mac.st_rdev as libc::dev_t) as u32);
+
+        // stx_dev_major/minor (offset 136/140)
+        w32(136, libc::major(mac.st_dev as libc::dev_t) as u32);
+        w32(140, libc::minor(mac.st_dev as libc::dev_t) as u32);
+    }
+}
+
 // ─── mmap flag translation ───────────────────────────────────────────────────
 // These are also in linux.rs / syscall.rs; consolidated here for completeness.
 

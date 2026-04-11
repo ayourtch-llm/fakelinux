@@ -86,6 +86,10 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_IOCTL => do_ioctl(args[0] as i32, args[1], args[2]),
         SYS_FCNTL => do_fcntl(args[0] as i32, args[1] as i32, args[2]),
         SYS_WRITEV => do_writev(args[0], args[1], args[2]),
+        SYS_READV => do_readv(args[0], args[1], args[2]),
+        SYS_PREAD64 => do_pread64(args[0] as i32, args[1], args[2], args[3] as i64),
+        SYS_PWRITE64 => do_pwrite64(args[0] as i32, args[1], args[2], args[3] as i64),
+        SYS_STATX => do_statx(args[0] as i32, args[1], args[2] as i32, args[3] as u32, args[4]),
         SYS_FACCESSAT => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
         SYS_CLONE => thread::do_clone(args[0], args[1], args[2], args[3], args[4]),
         SYS_FUTEX => thread::do_futex(args[0], args[1] as u32, args[2] as u32, args[3], args[4], args[5] as u32),
@@ -266,6 +270,46 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
 fn do_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
     let ret = unsafe { libc::writev(fd as i32, iov as *const libc::iovec, iovcnt as i32) };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_readv(fd: u64, iov: u64, iovcnt: u64) -> u64 {
+    let ret = unsafe { libc::readv(fd as i32, iov as *const libc::iovec, iovcnt as i32) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_pread64(fd: i32, buf: u64, count: u64, offset: i64) -> u64 {
+    let ret = unsafe { libc::pread(fd, buf as *mut libc::c_void, count as usize, offset) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_pwrite64(fd: i32, buf: u64, count: u64, offset: i64) -> u64 {
+    let ret = unsafe { libc::pwrite(fd, buf as *const libc::c_void, count as usize, offset) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statxbuf: u64) -> u64 {
+    let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let mac_flags = translate::translate_at_flags(linux_flags);
+
+    unsafe {
+        let mut mac_stat: libc::stat = std::mem::zeroed();
+        // AT_EMPTY_PATH (0x1000): operate on dirfd itself when pathname is empty
+        let ret = if linux_flags & 0x1000 != 0 {
+            let path = std::ffi::CStr::from_ptr(pathname as *const i8);
+            if path.to_bytes().is_empty() {
+                libc::fstat(mac_dirfd, &mut mac_stat)
+            } else {
+                libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags)
+            }
+        } else {
+            libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags)
+        };
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
+    }
+    0
 }
 
 fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) -> u64 {
