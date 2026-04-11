@@ -134,7 +134,7 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         let interp_full = candidates.iter()
             .find(|p| std::path::Path::new(p).exists())
             .cloned()
-            .unwrap_or_else(|| candidates.first().unwrap().clone());
+            .unwrap_or_else(|| candidates.last().unwrap().clone());
 
         let interp_data = std::fs::read(&interp_full).map_err(|e| {
             ElfError(format!(

@@ -1194,16 +1194,29 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
 
     match option {
         PR_SET_NAME => {
-            // Set thread name — stub success (could call pthread_setname_np)
+            // Set thread name via macOS pthread_setname_np
+            if arg2 != 0 {
+                let name = unsafe { std::ffi::CStr::from_ptr(arg2 as *const i8) };
+                // Truncate to 15 chars (Linux limit)
+                let s = name.to_bytes();
+                let len = s.len().min(15);
+                let truncated = std::ffi::CString::new(&s[..len]).unwrap_or_default();
+                unsafe { libc::pthread_setname_np(truncated.as_ptr()); }
+            }
             0
         }
         PR_GET_NAME => {
-            // Return "fakelinux" as thread name
+            // Get thread name — read from macOS thread name
             if arg2 != 0 {
-                let name = b"fakelinux\0\0\0\0\0\0\0"; // 16 bytes
+                let mut name_buf = [0u8; 16];
                 unsafe {
+                    libc::pthread_getname_np(
+                        libc::pthread_self(),
+                        name_buf.as_mut_ptr() as *mut i8,
+                        16,
+                    );
                     std::ptr::copy_nonoverlapping(
-                        name.as_ptr(),
+                        name_buf.as_ptr(),
                         arg2 as *mut u8,
                         16,
                     );
@@ -1231,9 +1244,9 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
 }
 
 fn do_sysinfo(buf: u64) -> u64 {
-    // Linux struct sysinfo on aarch64 is 112 bytes:
-    //   offset  0: i64 uptime (seconds since boot)
-    //   offset  8: [u64; 3] loads (1, 5, 15 min load averages * 65536)
+    // Linux struct sysinfo on aarch64 (64-bit) is 112 bytes:
+    //   offset  0: i64 uptime
+    //   offset  8: [u64; 3] loads
     //   offset 32: u64 totalram
     //   offset 40: u64 freeram
     //   offset 48: u64 sharedram
@@ -1241,9 +1254,11 @@ fn do_sysinfo(buf: u64) -> u64 {
     //   offset 64: u64 totalswap
     //   offset 72: u64 freeswap
     //   offset 80: u16 procs
-    //   offset 84: u64 totalhigh
-    //   offset 92: u64 freehigh
-    //   offset 100: u32 mem_unit
+    //   offset 82: u16 pad
+    //   offset 84: u32 pad2
+    //   offset 88: u64 totalhigh
+    //   offset 96: u64 freehigh
+    //   offset 104: u32 mem_unit
     if buf == 0 {
         return (-14_i64) as u64; // -EFAULT
     }
@@ -1289,21 +1304,23 @@ fn do_sysinfo(buf: u64) -> u64 {
         (out.add(32) as *mut u64).write_unaligned(memsize); // totalram
         (out.add(40) as *mut u64).write_unaligned(memsize / 2); // freeram (rough estimate)
 
-        // procs
-        let mut nprocs: i32 = 1;
+        // procs — number of current processes (not CPUs)
+        // Use kern.proc to approximate, or just report a reasonable default
+        let mut nprocs: i32 = 0;
         let mut nplen = std::mem::size_of::<i32>();
-        let npname = b"hw.ncpu\0";
-        libc::sysctlbyname(
+        let npname = b"kern.nprocs\0";
+        let np_ret = libc::sysctlbyname(
             npname.as_ptr() as *const i8,
             &mut nprocs as *mut _ as *mut _,
             &mut nplen,
             std::ptr::null_mut(),
             0,
         );
+        if np_ret != 0 || nprocs <= 0 { nprocs = 100; } // fallback estimate
         (out.add(80) as *mut u16).write_unaligned(nprocs as u16);
 
-        // mem_unit = 1
-        (out.add(100) as *mut u32).write_unaligned(1);
+        // mem_unit = 1 (at offset 104 on aarch64, not 100)
+        (out.add(104) as *mut u32).write_unaligned(1);
     }
     0
 }
