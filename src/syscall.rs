@@ -285,6 +285,25 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_FLOCK => do_flock(args[0] as i32, args[1] as i32),
         SYS_UTIMENSAT => do_utimensat(args[0] as i32, args[1], args[2], args[3] as i32),
         SYS_FTRUNCATE => do_ftruncate(args[0] as i32, args[1] as i64),
+        SYS_NANOSLEEP => do_nanosleep(args[0], args[1]),
+        SYS_CLOCK_GETRES => do_clock_getres(args[0] as i32, args[1]),
+        SYS_CLOCK_NANOSLEEP => do_clock_nanosleep(args[0] as i32, args[1] as i32, args[2], args[3]),
+        SYS_SETSID => {
+            let ret = unsafe { libc::setsid() };
+            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+        }
+        SYS_GETPGID => {
+            let ret = unsafe { libc::getpgid(args[0] as i32) };
+            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+        }
+        SYS_SETPGID => {
+            let ret = unsafe { libc::setpgid(args[0] as i32, args[1] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_GETSID => {
+            let ret = unsafe { libc::getsid(args[0] as i32) };
+            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+        }
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -416,14 +435,124 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
 }
 
 fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
-    // TIOCGWINSZ (Linux 0x5413 = macOS TIOCGWINSZ)
+    const LINUX_TCGETS: u64 = 0x5401;
+    const LINUX_TCSETS: u64 = 0x5402;
+    const LINUX_TCSETSW: u64 = 0x5403;
+    const LINUX_TCSETSF: u64 = 0x5404;
+    const LINUX_TIOCGPGRP: u64 = 0x540F;
+    const LINUX_TIOCSPGRP: u64 = 0x5410;
+    const LINUX_TIOCSCTTY: u64 = 0x540E;
+    const LINUX_TIOCNOTTY: u64 = 0x5422;
     const LINUX_TIOCGWINSZ: u64 = 0x5413;
+    const LINUX_TIOCSWINSZ: u64 = 0x5414;
+    const LINUX_FIONREAD: u64 = 0x541B;
+    const LINUX_FIONBIO: u64 = 0x5421;
+
     match request {
+        LINUX_TCGETS => {
+            let mut mac_t: libc::termios = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::tcgetattr(fd, &mut mac_t) };
+            if ret < 0 { return translate::linux_errno(); }
+            mac_termios_to_linux(&mac_t, arg);
+            0
+        }
+        LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
+            let mac_t = linux_termios_to_mac(arg);
+            let action = match request {
+                LINUX_TCSETS => libc::TCSANOW,
+                LINUX_TCSETSW => libc::TCSADRAIN,
+                _ => libc::TCSAFLUSH,
+            };
+            let ret = unsafe { libc::tcsetattr(fd, action, &mac_t) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        LINUX_TIOCGPGRP => {
+            let pgrp = unsafe { libc::tcgetpgrp(fd) };
+            if pgrp < 0 { return translate::linux_errno(); }
+            unsafe { (arg as *mut i32).write_unaligned(pgrp) };
+            0
+        }
+        LINUX_TIOCSPGRP => {
+            let pgrp = unsafe { (arg as *const i32).read_unaligned() };
+            let ret = unsafe { libc::tcsetpgrp(fd, pgrp) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        LINUX_TIOCSCTTY => {
+            let ret = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, arg as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        LINUX_TIOCNOTTY => {
+            let ret = unsafe { libc::ioctl(fd, libc::TIOCNOTTY as libc::c_ulong) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
         LINUX_TIOCGWINSZ => {
             let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, arg as *mut libc::winsize) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
+        LINUX_TIOCSWINSZ => {
+            let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, arg as *const libc::winsize) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        LINUX_FIONREAD => {
+            let mut avail: libc::c_int = 0;
+            let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) };
+            if ret < 0 { return translate::linux_errno(); }
+            unsafe { (arg as *mut i32).write_unaligned(avail) };
+            0
+        }
+        LINUX_FIONBIO => {
+            let val = unsafe { (arg as *const i32).read_unaligned() };
+            let ret = unsafe { libc::ioctl(fd, libc::FIONBIO, &val) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
         _ => (-25_i64) as u64, // -ENOTTY
+    }
+}
+
+/// Convert macOS termios to Linux aarch64 termios (60 bytes) at guest address.
+/// Linux layout: u32 iflag, u32 oflag, u32 cflag, u32 lflag, u8 c_line,
+///               u8 c_cc[32], u8 pad[3], u32 ispeed, u32 ospeed
+fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
+    unsafe {
+        let p = linux_ptr as *mut u8;
+        (p as *mut u32).write_unaligned(mac.c_iflag as u32);
+        (p.add(4) as *mut u32).write_unaligned(mac.c_oflag as u32);
+        (p.add(8) as *mut u32).write_unaligned(mac.c_cflag as u32);
+        (p.add(12) as *mut u32).write_unaligned(mac.c_lflag as u32);
+        // c_line (Linux-specific, byte at offset 16)
+        *p.add(16) = 0;
+        // c_cc: copy min(20, 32) from macOS, zero-fill rest
+        let cc_dst = p.add(17);
+        std::ptr::write_bytes(cc_dst, 0, 32);
+        // Map macOS cc indices to Linux cc indices (first ~20 are compatible)
+        for i in 0..20usize {
+            *cc_dst.add(i) = mac.c_cc[i];
+        }
+        // padding
+        std::ptr::write_bytes(p.add(49), 0, 3);
+        // speeds
+        (p.add(52) as *mut u32).write_unaligned(mac.c_ispeed as u32);
+        (p.add(56) as *mut u32).write_unaligned(mac.c_ospeed as u32);
+    }
+}
+
+/// Convert Linux aarch64 termios (60 bytes at guest address) to macOS termios.
+fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
+    unsafe {
+        let p = linux_ptr as *const u8;
+        let mut mac: libc::termios = std::mem::zeroed();
+        mac.c_iflag = (p as *const u32).read_unaligned() as u64;
+        mac.c_oflag = (p.add(4) as *const u32).read_unaligned() as u64;
+        mac.c_cflag = (p.add(8) as *const u32).read_unaligned() as u64;
+        mac.c_lflag = (p.add(12) as *const u32).read_unaligned() as u64;
+        // c_cc: copy first 20 from Linux
+        let cc_src = p.add(17);
+        for i in 0..20usize {
+            mac.c_cc[i] = *cc_src.add(i);
+        }
+        mac.c_ispeed = (p.add(52) as *const u32).read_unaligned() as u64;
+        mac.c_ospeed = (p.add(56) as *const u32).read_unaligned() as u64;
+        mac
     }
 }
 
@@ -1085,7 +1214,7 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 fn do_clock_gettime(clk_id: i32, tp: u64) -> u64 {
     unsafe {
         let mut ts: libc::timespec = std::mem::zeroed();
-        let ret = libc::clock_gettime(clk_id as u32, &mut ts);
+        let ret = libc::clock_gettime(translate_clock_id(clk_id), &mut ts);
         if ret < 0 {
             return translate::linux_errno();
         }
@@ -1688,4 +1817,69 @@ fn timespec_to_timeval(ts: &libc::timespec) -> libc::timeval {
 fn do_ftruncate(fd: i32, length: i64) -> u64 {
     let ret = unsafe { libc::ftruncate(fd, length) };
     if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_nanosleep(req_ptr: u64, rem_ptr: u64) -> u64 {
+    // Linux and macOS struct timespec have the same layout on aarch64
+    let req = req_ptr as *const libc::timespec;
+    let rem = if rem_ptr != 0 { rem_ptr as *mut libc::timespec } else { std::ptr::null_mut() };
+    let ret = unsafe { libc::nanosleep(req, rem) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_clock_getres(clk_id: i32, res_ptr: u64) -> u64 {
+    // Translate Linux clock IDs to macOS (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 are the same)
+    let mac_clk = translate_clock_id(clk_id);
+    if res_ptr == 0 {
+        // Just checking if clock is supported
+        return 0;
+    }
+    let res = res_ptr as *mut libc::timespec;
+    let ret = unsafe { libc::clock_getres(mac_clk, res) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_clock_nanosleep(clk_id: i32, flags: i32, req_ptr: u64, rem_ptr: u64) -> u64 {
+    // flags: 0 = relative, 1 = TIMER_ABSTIME
+    // macOS doesn't have clock_nanosleep, emulate via nanosleep for relative
+    let req = req_ptr as *const libc::timespec;
+    let rem = if rem_ptr != 0 { rem_ptr as *mut libc::timespec } else { std::ptr::null_mut() };
+
+    if flags & 1 != 0 {
+        // TIMER_ABSTIME: compute relative time
+        let mac_clk = translate_clock_id(clk_id);
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe { libc::clock_gettime(mac_clk, &mut now) };
+        let abs = unsafe { *req };
+        let rel = libc::timespec {
+            tv_sec: abs.tv_sec - now.tv_sec - if abs.tv_nsec < now.tv_nsec { 1 } else { 0 },
+            tv_nsec: if abs.tv_nsec >= now.tv_nsec {
+                abs.tv_nsec - now.tv_nsec
+            } else {
+                1_000_000_000 + abs.tv_nsec - now.tv_nsec
+            },
+        };
+        if rel.tv_sec < 0 {
+            return 0; // already past
+        }
+        let ret = unsafe { libc::nanosleep(&rel, std::ptr::null_mut()) };
+        if ret < 0 { translate::linux_errno() } else { 0 }
+    } else {
+        let ret = unsafe { libc::nanosleep(req, rem) };
+        if ret < 0 { translate::linux_errno() } else { 0 }
+    }
+}
+
+fn translate_clock_id(linux_clk: i32) -> libc::clockid_t {
+    match linux_clk {
+        0 => libc::CLOCK_REALTIME,        // CLOCK_REALTIME
+        1 => libc::CLOCK_MONOTONIC,       // CLOCK_MONOTONIC
+        2 => libc::CLOCK_PROCESS_CPUTIME_ID, // CLOCK_PROCESS_CPUTIME_ID
+        3 => libc::CLOCK_THREAD_CPUTIME_ID,  // CLOCK_THREAD_CPUTIME_ID
+        4 => libc::CLOCK_MONOTONIC,       // CLOCK_MONOTONIC_RAW → MONOTONIC
+        5 => libc::CLOCK_REALTIME,        // CLOCK_REALTIME_COARSE → REALTIME
+        6 => libc::CLOCK_MONOTONIC,       // CLOCK_MONOTONIC_COARSE → MONOTONIC
+        7 => libc::CLOCK_MONOTONIC,       // CLOCK_BOOTTIME → MONOTONIC
+        _ => libc::CLOCK_REALTIME,
+    }
 }

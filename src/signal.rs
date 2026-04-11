@@ -580,7 +580,7 @@ fn install_forwarder(mac_sig: i32, handler: u64) {
             // Install our signal_forwarder which will build a sigframe
             // and redirect guest execution to the guest handler.
             sa.sa_sigaction = signal_forwarder as *const () as libc::sighandler_t;
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(mac_sig, &sa, std::ptr::null_mut());
             return;
