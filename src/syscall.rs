@@ -1,6 +1,7 @@
 use crate::epoll;
 use crate::eventfd;
 use crate::linux::*;
+use crate::net;
 use crate::procfs;
 use crate::signal;
 use crate::thread;
@@ -113,7 +114,22 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_EPOLL_CREATE1 => epoll::do_epoll_create1(args[0] as i32),
         SYS_EPOLL_CTL => epoll::do_epoll_ctl(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
         SYS_EPOLL_PWAIT => epoll::do_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
-        SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
+        SYS_SOCKET => net::do_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        SYS_SOCKETPAIR => net::do_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
+        SYS_BIND => net::do_bind(args[0] as i32, args[1], args[2] as u32),
+        SYS_LISTEN => net::do_listen(args[0] as i32, args[1] as i32),
+        SYS_ACCEPT => net::do_accept4(args[0] as i32, args[1], args[2], 0),
+        SYS_ACCEPT4 => net::do_accept4(args[0] as i32, args[1], args[2], args[3] as i32),
+        SYS_CONNECT => net::do_connect(args[0] as i32, args[1], args[2] as u32),
+        SYS_GETSOCKNAME => net::do_getsockname(args[0] as i32, args[1], args[2]),
+        SYS_GETPEERNAME => net::do_getpeername(args[0] as i32, args[1], args[2]),
+        SYS_SENDTO => net::do_sendto(args[0] as i32, args[1], args[2], args[3] as i32, args[4], args[5] as u32),
+        SYS_RECVFROM => net::do_recvfrom(args[0] as i32, args[1], args[2], args[3] as i32, args[4], args[5]),
+        SYS_SETSOCKOPT => net::do_setsockopt(args[0] as i32, args[1] as i32, args[2] as i32, args[3], args[4] as u32),
+        SYS_GETSOCKOPT => net::do_getsockopt(args[0] as i32, args[1] as i32, args[2] as i32, args[3], args[4]),
+        SYS_SHUTDOWN => net::do_shutdown(args[0] as i32, args[1] as i32),
+        SYS_SENDMSG => net::do_sendmsg(args[0] as i32, args[1], args[2] as i32),
+        SYS_RECVMSG => net::do_recvmsg(args[0] as i32, args[1], args[2] as i32),
         SYS_KILL => signal::do_kill(args[0] as i64, args[1] as i32),
         SYS_TKILL => signal::do_tkill(args[0] as i32, args[1] as i32),
         SYS_TGKILL => signal::do_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),

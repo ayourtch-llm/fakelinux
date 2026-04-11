@@ -3,6 +3,7 @@ mod epoll;
 mod eventfd;
 mod linux;
 mod loader;
+mod net;
 mod procfs;
 mod signal;
 mod syscall;
