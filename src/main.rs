@@ -1,4 +1,6 @@
 mod elf;
+mod epoll;
+mod eventfd;
 mod linux;
 mod loader;
 mod procfs;

@@ -1,3 +1,5 @@
+use crate::epoll;
+use crate::eventfd;
 use crate::linux::*;
 use crate::procfs;
 use crate::signal;
@@ -106,7 +108,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),
         SYS_PIPE2 => do_pipe2(args[0], args[1] as i32),
         SYS_GETDENTS64 => do_getdents64(args[0] as i32, args[1], args[2]),
-        SYS_PPOLL => (-38_i64) as u64, // ENOSYS stub
+        SYS_PPOLL => do_ppoll(args[0], args[1] as u32, args[2], args[3], args[4]),
+        SYS_EVENTFD2 => eventfd::do_eventfd2(args[0] as u32, args[1] as i32),
+        SYS_EPOLL_CREATE1 => epoll::do_epoll_create1(args[0] as i32),
+        SYS_EPOLL_CTL => epoll::do_epoll_ctl(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
+        SYS_EPOLL_PWAIT => epoll::do_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
         SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
         SYS_KILL => signal::do_kill(args[0] as i64, args[1] as i32),
         SYS_TKILL => signal::do_tkill(args[0] as i32, args[1] as i32),
@@ -178,12 +184,20 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
 // ─── File I/O ────────────────────────────────────────────────────────────────
 
 fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
-    let ret = unsafe { libc::write(fd as i32, buf as *const _, count as usize) };
+    let fd_i32 = fd as i32;
+    if eventfd::is_eventfd(fd_i32) {
+        return eventfd::do_write(fd_i32, buf, count);
+    }
+    let ret = unsafe { libc::write(fd_i32, buf as *const _, count as usize) };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
 fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
-    let ret = unsafe { libc::read(fd as i32, buf as *mut _, count as usize) };
+    let fd_i32 = fd as i32;
+    if eventfd::is_eventfd(fd_i32) {
+        return eventfd::do_read(fd_i32, buf, count);
+    }
+    let ret = unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
@@ -203,6 +217,9 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
 }
 
 fn do_close(fd: i32) -> u64 {
+    // Clean up eventfd/epoll state if this fd is one of those
+    eventfd::on_close(fd);
+    epoll::on_close(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -277,6 +294,32 @@ fn do_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
 
 fn do_readv(fd: u64, iov: u64, iovcnt: u64) -> u64 {
     let ret = unsafe { libc::readv(fd as i32, iov as *const libc::iovec, iovcnt as i32) };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, _sigmask: u64, _sigsetsize: u64) -> u64 {
+    // Linux pollfd layout: { int fd; short events; short revents; } = 8 bytes
+    // macOS pollfd layout: same structure and same size
+    // POLLIN/POLLOUT/POLLERR/POLLHUP values are the same on both platforms
+
+    // Convert timespec to millisecond timeout for macOS poll()
+    let timeout_ms: i32 = if timeout_ptr == 0 {
+        -1 // infinite timeout
+    } else {
+        unsafe {
+            let ts = timeout_ptr as *const i64;
+            let sec = *ts;
+            let nsec = *ts.add(1);
+            // Convert to ms, clamping to i32 range
+            let ms = sec * 1000 + nsec / 1_000_000;
+            if ms > i32::MAX as i64 { i32::MAX } else { ms as i32 }
+        }
+    };
+
+    // pollfd arrays have identical layout, so we can pass the guest buffer directly
+    let ret = unsafe {
+        libc::poll(fds_ptr as *mut libc::pollfd, nfds as libc::nfds_t, timeout_ms)
+    };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
