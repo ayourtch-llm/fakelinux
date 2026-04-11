@@ -230,12 +230,12 @@ fn do_fork(_flags: u64) -> u64 {
         return crate::translate::linux_errno();
     }
     if pid == 0 {
-        // Child: can't run guest code from signal handler context (macOS
-        // runtime is broken after fork-from-signal-handler).
-        // Just _exit — busybox sh will report the command failed and continue.
-        // Full fork support requires the BL trampoline architecture (see
-        // bl-rewriting branch) which avoids signal handlers entirely.
-        unsafe { libc::_exit(127); }
+        // Child: reinstall signal handler with fresh sigaltstack (parent's
+        // is marked SS_ONSTACK). Then return 0 — sigreturn will resume
+        // guest code. macOS clobbers TPIDR_EL0 on sigreturn, but we
+        // virtualize TPIDR via BRK interception so the guest doesn't care.
+        crate::trap::install_handler();
+        return 0;
 
         #[allow(unreachable_code)]
         unsafe {

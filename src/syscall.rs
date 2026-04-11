@@ -410,15 +410,40 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // This replaces the current process image entirely.
     let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
 
-    // Collect argv: the guest's argv becomes fakelinux's argv[1..]
+    // Re-exec as: fakelinux <pathname> <argv[0]> <argv[1]> ...
+    // fakelinux uses argv[1] as the binary path and argv[1..] as guest argv.
+    // For busybox: pathname="/path/to/busybox", argv=["uname","-m"]
+    // → exec fakelinux /path/to/busybox uname -m
+    // → busybox sees argv[0]="/path/to/busybox" (runs argv[1] applet)
     let mut new_argv: Vec<*const i8> = Vec::new();
 
-    // argv[0] = our own executable path
     let self_exe = std::env::current_exe().unwrap_or_default();
     let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap_or("fakelinux")).unwrap();
     new_argv.push(self_exe_c.as_ptr());
 
-    // argv[1..] = guest's argv (which starts with the guest binary path)
+    // Resolve the binary path. If the target is a macOS Mach-O (not ELF),
+    // use the parent's guest binary path instead (busybox applet re-exec).
+    let resolved_path = {
+        let path_bytes = path.to_bytes();
+        if path_bytes == b"/proc/self/exe" {
+            // Direct /proc/self/exe → use our guest binary
+            procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
+        } else {
+            // Check if the file is an ELF; if not, fall back to guest binary
+            // (busybox sh finds /usr/bin/uname on macOS, which is Mach-O)
+            let is_elf = std::fs::read(path.to_str().unwrap_or(""))
+                .map(|d| d.len() >= 4 && d[..4] == [0x7f, b'E', b'L', b'F'])
+                .unwrap_or(false);
+            if is_elf {
+                std::ffi::CString::new(path_bytes).unwrap()
+            } else {
+                procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
+            }
+        }
+    };
+    new_argv.push(resolved_path.as_ptr());
+
+    // Then the guest's original argv (applet name + args)
     let mut guest_argv = argv_ptr as *const *const i8;
     unsafe {
         while !(*guest_argv).is_null() {
@@ -426,7 +451,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             guest_argv = guest_argv.add(1);
         }
     }
-    new_argv.push(std::ptr::null()); // NULL terminator
+    new_argv.push(std::ptr::null());
 
     // Collect envp
     let mut new_envp: Vec<*const i8> = Vec::new();
@@ -438,6 +463,13 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
     new_envp.push(std::ptr::null());
+
+    // Debug: show what we're exec'ing
+    {
+        let path_str = unsafe { std::ffi::CStr::from_ptr(resolved_path.as_ptr()) };
+        let mut buf = [0u8; 256];
+        let n = raw_eprintln_fmt(format_args!("fakelinux: execve → fakelinux {:?}\n", path_str));
+    }
 
     // execve ourselves with the guest binary as first arg
     unsafe {
