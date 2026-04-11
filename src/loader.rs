@@ -311,8 +311,7 @@ fn get_interp(elf: &Elf, data: &[u8]) -> Option<String> {
     None
 }
 
-/// Scan executable memory and replace SVC #0 with BRK #0xF000,
-/// and MSR tpidr_el0 with BRK #0xF001 + register number.
+/// Scan executable memory and replace SVC #0 and MSR/MRS tpidr_el0 with UDF #0xF000.
 fn rewrite_svc_instructions(start: u64, size: u64) {
     let count = size / 4;
     let base = start as *mut u32;
@@ -322,57 +321,24 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
         unsafe {
             let instr = base.add(i).read();
             if instr == trap::SVC_0 {
-                // SVC #0 → BRK #0xF000
-                base.add(i).write(trap::BRK_MARKER);
+                // SVC #0 → UDF #0xF000
+                base.add(i).write(trap::UDF_MARKER);
                 svc_patched += 1;
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
-                // MSR/MRS tpidr_el0 → leave the original instruction in place.
-                // It will trap as SIGTRAP because macOS clobbers TPIDR_EL0 on
-                // every signal, so we need to intercept all accesses.
-                // We replace with BRK #0xF000 but keep the original instruction
-                // at the same PC — the handler reads it to determine the operation.
-                // Actually: DON'T replace. The handler reads *(pc) to detect MSR/MRS.
-                // If we replace with BRK, *(pc) = BRK, not MSR. So we need to store
-                // the original instruction somewhere. Simplest: use BRK with a different
-                // immediate that encodes "this was a TPIDR access", then let the handler
-                // decide based on the immediate. But we lose the register number.
-                //
-                // Better approach: DON'T patch MSR/MRS. Instead, make them trap by
-                // marking the code pages as non-executable, then... no, that's worse.
-                //
-                // Simplest approach: NOP out the MSR/MRS and insert the original
-                // instruction at pc+4... no, that shifts code.
-                //
-                // Actually the cleanest approach: leave MSR/MRS as-is. They will
-                // execute natively (reading/writing the macOS-clobbered value).
-                // We DON'T need to intercept them if we ensure TPIDR_EL0 has the
-                // guest value whenever guest code runs. We can do this by writing
-                // the guest TPIDR value just before sigreturn.
-                //
-                // But macOS restores TPIDR on sigreturn! So we can't.
-                //
-                // Final approach: patch to BRK, store original instruction in a side table.
-                // The handler looks up the original instruction from the side table.
-                //
-                // For simplicity, just leave the instruction in place at the PC.
-                // We DON'T replace it with BRK — instead, we'll use a different
-                // mechanism to trap. We'll mark the page as execute-only (no read)
-                // ... no, that's complex.
-                //
-                // OK: patch MSR/MRS to BRK #0xF000, BUT the handler checks *(pc)
-                // which will now be BRK, not MSR. We need to save the original.
-                // Let's use a global HashMap<u64, u32> mapping PC → original instruction.
+                // MSR/MRS tpidr_el0 → patch to UDF, store original in side table.
+                // The handler looks up the original instruction to determine the
+                // operation and register number.
                 let pc_addr = base.add(i) as u64;
                 crate::procfs::with(|_| {}); // ensure procfs is initialized
                 add_tpidr_patch(pc_addr, instr);
-                base.add(i).write(trap::BRK_MARKER);
+                base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
             }
         }
     }
     if svc_patched > 0 {
-        eprintln!("fakelinux: patched {} SVC→BRK instructions", svc_patched);
+        eprintln!("fakelinux: patched {} SVC→UDF instructions", svc_patched);
     }
     if tpidr_patched > 0 {
         eprintln!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
@@ -394,13 +360,13 @@ pub fn patch_new_code(start: u64, len: u64) {
         unsafe {
             let instr = base.add(i).read();
             if instr == trap::SVC_0 {
-                base.add(i).write(trap::BRK_MARKER);
+                base.add(i).write(trap::UDF_MARKER);
                 svc_patched += 1;
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
                 let pc_addr = base.add(i) as u64;
                 add_runtime_tpidr_patch(pc_addr, instr);
-                base.add(i).write(trap::BRK_MARKER);
+                base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
             }
         }

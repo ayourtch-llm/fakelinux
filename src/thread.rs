@@ -167,7 +167,7 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 
 /// Implement clone: fork (no CLONE_VM) or thread creation (CLONE_VM|CLONE_THREAD).
-/// Called from sigtrap_handler via syscall::emulate. The `regs` parameter contains
+/// Called from trap_handler via syscall::emulate. The `regs` parameter contains
 /// the guest's full register state at the point of the clone syscall.
 pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64, regs: &crate::trap::ThreadState64) -> u64 {
     // Fork: clone without CLONE_VM
@@ -258,7 +258,7 @@ struct CloneArgs {
     clear_tid_ptr: u64,
 }
 
-/// Set up a per-thread sigaltstack and install the SIGTRAP handler.
+/// Set up a per-thread sigaltstack and install the SIGILL trap handler.
 /// Must be called on each new thread before it executes guest code.
 fn setup_thread_signal_stack() {
     unsafe {
@@ -288,14 +288,14 @@ fn setup_thread_signal_stack() {
             libc::pthread_exit(std::ptr::null_mut());
         }
 
-        // Install SIGTRAP handler on this thread (macOS requires per-thread setup
+        // Install SIGILL handler on this thread (macOS requires per-thread setup
         // for sigaltstack, but sigaction is process-wide, so this is technically
         // redundant — but ensures the handler is installed).
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = crate::trap::sigtrap_handler_ptr();
+        sa.sa_sigaction = crate::trap::trap_handler_ptr();
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
 
         // Also install crash handlers
         let mut sa2: libc::sigaction = std::mem::zeroed();
@@ -387,7 +387,7 @@ pub fn init_trampolines(base_addr: u64) {
 
 fn do_fork(_flags: u64) -> u64 {
     // Don't fork here (signal context). Mark pending and return a sentinel.
-    // The SIGTRAP handler will redirect sigreturn to the fork trampoline.
+    // The trap handler will redirect sigreturn to the fork trampoline.
     FORK.mark_pending();
     0xFFFF_FFFF_0000_F0C0
 }
@@ -402,7 +402,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
 
     if pid == 0 {
         // Child: re-initialize signal handling (fresh alt stack, re-install
-        // SIGTRAP handler, unblock signals).
+        // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
     }
 

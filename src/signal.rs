@@ -94,6 +94,11 @@ macro_rules! atomic_sigaction_array {
 /// Lock-free table of guest signal handlers indexed by Linux signal number (1..64).
 static GUEST_SIGACTIONS: [AtomicSigaction; 65] = atomic_sigaction_array!(65);
 
+/// Get the guest's registered handler for a given Linux signal number.
+pub fn guest_sigaction(linux_sig: usize) -> GuestSigaction {
+    GUEST_SIGACTIONS[linux_sig].load()
+}
+
 /// Guest signal mask (bitmask of blocked signals, bit N = Linux signal N).
 pub static GUEST_SIGMASK: AtomicU64 = AtomicU64::new(0);
 
@@ -195,7 +200,7 @@ const RT_SIGFRAME_SIZE: usize = 816; // (296 + 512) rounded up to 16-byte alignm
 /// `linux_sig` is the Linux signal number.
 /// `handler` is the guest handler address.
 /// `handler_mask` is the sa_mask from the guest sigaction.
-unsafe fn build_sigframe_and_redirect(
+pub unsafe fn build_sigframe_and_redirect(
     mctx: &mut crate::trap::MContext64,
     linux_sig: i32,
     handler: u64,
@@ -234,7 +239,7 @@ unsafe fn build_sigframe_and_redirect(
     (p.add(288) as *mut u64).write_unaligned(old_sigmask);
 
     // Save NEON/FP registers q0-q31 from the mcontext (not from current CPU regs,
-    // which may have been clobbered by Rust code in the signal/SIGTRAP handler).
+    // which may have been clobbered by Rust code in the signal/trap handler).
     let neon_dst = p.add(NEON_SAVE_OFFSET) as *mut u128;
     for i in 0..32 {
         neon_dst.add(i).write_unaligned(mctx.ns.v[i]);
@@ -324,7 +329,7 @@ pub fn create_sigreturn_trampoline() {
     unsafe {
         let p = ptr as *mut u32;
         p.add(0).write(0xD280_1168); // mov x8, #139
-        p.add(1).write(0xD43E_0000); // brk #0xf000
+        p.add(1).write(0x0000_F000); // udf #0xf000 (triggers SIGILL → trap_handler)
         libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
         extern "C" {
             fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
@@ -347,9 +352,9 @@ unsafe extern "C" fn signal_forwarder(
     // Translate macOS signal to Linux signal
     let linux_sig = mac_to_linux(sig);
 
-    // If we're inside the SIGTRAP handler, the ucontext has the handler's
+    // If we're inside the trap handler, the ucontext has the handler's
     // native registers, NOT the guest's. We must defer delivery.
-    if crate::trap::IN_SIGTRAP.load(Ordering::SeqCst) {
+    if crate::trap::IN_TRAP.load(Ordering::SeqCst) {
         if linux_sig > 0 && linux_sig <= 64 {
             PENDING_SIGNALS.fetch_or(1u64 << (linux_sig - 1) as u64, Ordering::SeqCst);
         }
@@ -390,8 +395,8 @@ pub fn do_rt_sigaction(linux_sig: u64, act_ptr: u64, oldact_ptr: u64, _sigsetsiz
         return (-22_i64) as u64; // -EINVAL
     }
 
-    // Don't let the guest override our SIGTRAP handler
-    if sig == 5 {
+    // Don't let the guest override our SIGILL handler (we use UDF as trap instruction)
+    if sig == 4 {
         if oldact_ptr != 0 {
             write_guest_sigaction(
                 oldact_ptr,
@@ -464,7 +469,7 @@ pub fn do_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, _sigsetsize: u
 }
 
 /// Deliver pending signals directly by building sigframes on the guest stack.
-/// Called from the SIGTRAP handler after clearing IN_SIGTRAP, when we have
+/// Called from the trap handler after clearing IN_TRAP, when we have
 /// the guest's registers in the mcontext.
 pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
     let current_mask = GUEST_SIGMASK.load(Ordering::SeqCst);

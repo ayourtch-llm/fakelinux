@@ -928,7 +928,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let envp_to_use = unsafe { environ };
 
     // Use real execve to replace the current process. Even though we're
-    // inside a SIGTRAP handler, execve replaces the entire process image
+    // inside a SIGILL handler, execve replaces the entire process image
     // so signal context doesn't matter — it never returns on success.
     // This is critical for fork+exec in shells: the child must become the
     // new program directly, inheriting the exact fd table (pipe redirections,

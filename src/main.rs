@@ -57,7 +57,6 @@ fn main() {
 
     // Initialize per-thread pthread keys before anything else
     trap::init_tpidr_key();
-    trap::init_x18_key();
     thread::init_tid_key();
     thread::init_clear_tid_key();
 
@@ -69,14 +68,6 @@ fn main() {
         unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr); }
         trap::set_thread_tpidr(tpidr);
     }
-    // Initialize guest x18 — macOS zeroes x18 in the mcontext during signal
-    // delivery (it's the "platform register"), so we can never read the real
-    // value from inside the handler. We must capture it BEFORE the first BRK.
-    // At this point x18=0 (we zeroed all regs in jump_to_entry), but that's
-    // fine — musl's _dlstart will set x18 to the string table address before
-    // using it. The key is having a non-zero saved value so the handler knows
-    // to restore it. We read it just before jumping to guest code instead.
-    // For now, set to 0 — the real fix is below in jump_to_entry.
     signal::create_sigreturn_trampoline();
     trap::install_handler();
 

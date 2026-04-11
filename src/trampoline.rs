@@ -14,7 +14,7 @@
 //!   MY_TRAMP.init(page_addr, my_entry_fn);
 //!   // In syscall handler (signal context):
 //!   MY_TRAMP.mark_pending();
-//!   // After emulate() in SIGTRAP handler:
+//!   // After emulate() in trap handler:
 //!   trampoline::check_and_redirect(mctx, uctx, result, resume_pc);
 //!   // In entry_fn (outside signal context):
 //!   unsafe { MY_TRAMP.restore_and_resume(); }
