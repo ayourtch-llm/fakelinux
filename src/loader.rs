@@ -115,18 +115,32 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
     if let Some(interp_path) = get_interp(elf, data) {
         eprintln!("fakelinux: interpreter: {}", interp_path);
 
-        // Look for the interpreter in sysroot, then try bare path
-        let interp_full = if !sysroot.is_empty() {
-            format!("{}{}", sysroot, interp_path)
-        } else {
-            interp_path.clone()
+        // Look for the interpreter in order: FAKELINUX_ROOT, sysroot, bare path
+        let root = crate::rootfs::get_root();
+        let candidates: Vec<String> = {
+            let mut v = Vec::new();
+            if let Some(r) = root {
+                if !r.is_empty() {
+                    v.push(format!("{}{}", r, interp_path));
+                }
+            }
+            if !sysroot.is_empty() {
+                v.push(format!("{}{}", sysroot, interp_path));
+            }
+            v.push(interp_path.clone());
+            v
         };
+
+        let interp_full = candidates.iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .cloned()
+            .unwrap_or_else(|| candidates.first().unwrap().clone());
 
         let interp_data = std::fs::read(&interp_full).map_err(|e| {
             ElfError(format!(
-                "cannot read interpreter '{}' (sysroot='{}'): {}. \
-                 Use FAKELINUX_SYSROOT to point to an aarch64 Linux rootfs.",
-                interp_path, sysroot, e
+                "cannot read interpreter '{}' (tried: {:?}): {}. \
+                 Use FAKELINUX_ROOT or FAKELINUX_SYSROOT to point to an aarch64 Linux rootfs.",
+                interp_path, candidates, e
             ))
         })?;
 

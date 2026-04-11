@@ -94,6 +94,11 @@ pub const SYS_EPOLL_PWAIT: u64 = 22;
 pub const SYS_STATX: u64 = 291;
 pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
+pub const SYS_PSELECT6: u64 = 72;
+pub const SYS_SCHED_SETAFFINITY: u64 = 122;
+pub const SYS_PRCTL: u64 = 167;
+pub const SYS_SYSINFO: u64 = 179;
+pub const SYS_GETRUSAGE: u64 = 165;
 pub const SYS_MEMBARRIER: u64 = 283;
 
 // Auxiliary vector types

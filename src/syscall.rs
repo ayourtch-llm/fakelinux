@@ -140,7 +140,12 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_PRLIMIT64 => do_prlimit64(args[0], args[1] as i32, args[2], args[3]),
         SYS_RSEQ => (-38_i64) as u64, // ENOSYS
         SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
-        SYS_SCHED_GETAFFINITY => (-38_i64) as u64,
+        SYS_SCHED_SETAFFINITY => 0, // stub success
+        SYS_SCHED_GETAFFINITY => do_sched_getaffinity(args[0] as i32, args[1] as u32, args[2]),
+        SYS_PSELECT6 => do_pselect6(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
+        SYS_PRCTL => do_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
+        SYS_SYSINFO => do_sysinfo(args[0]),
+        SYS_GETRUSAGE => do_getrusage(args[0] as i32, args[1]),
         SYS_SCHED_YIELD => { unsafe { libc::sched_yield(); } 0 }
         SYS_READLINKAT => do_readlinkat(args[0] as i32, args[1], args[2], args[3]),
         SYS_IOCTL => do_ioctl(args[0] as i32, args[1], args[2]),
@@ -1109,6 +1114,219 @@ fn do_prlimit64(_pid: u64, _resource: i32, _new_limit: u64, old_limit: u64) -> u
             *ptr = u64::MAX;
             *ptr.add(1) = u64::MAX;
         }
+    }
+    0
+}
+
+fn do_sched_getaffinity(_pid: i32, cpusetsize: u32, mask_ptr: u64) -> u64 {
+    // Get number of CPUs via sysctl hw.ncpu
+    let ncpu: i32 = unsafe {
+        let mut ncpu: i32 = 1;
+        let mut len = std::mem::size_of::<i32>();
+        let name = b"hw.ncpu\0";
+        libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut ncpu as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        if ncpu < 1 { 1 } else { ncpu }
+    };
+
+    // Write a bitmask with `ncpu` bits set
+    let bytes_needed = ((ncpu as u32 + 7) / 8).max(1) as usize;
+    let write_len = std::cmp::min(cpusetsize as usize, bytes_needed);
+
+    if write_len == 0 || mask_ptr == 0 {
+        return (-22_i64) as u64; // -EINVAL
+    }
+
+    // Zero the entire buffer first
+    unsafe {
+        std::ptr::write_bytes(mask_ptr as *mut u8, 0, cpusetsize as usize);
+    }
+
+    // Set bits for each CPU
+    let mask = mask_ptr as *mut u8;
+    for cpu in 0..ncpu as usize {
+        let byte_idx = cpu / 8;
+        let bit_idx = cpu % 8;
+        if byte_idx < cpusetsize as usize {
+            unsafe { *mask.add(byte_idx) |= 1 << bit_idx; }
+        }
+    }
+
+    // Linux returns the number of bytes written (clamped to cpusetsize)
+    cpusetsize as u64
+}
+
+fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, _sig: u64) -> u64 {
+    // Convert Linux timespec to macOS timespec (same layout on aarch64)
+    // The 6th arg on Linux is a struct { sigset_t*, size_t } but we ignore it.
+    let timeout_ptr = if timeout == 0 {
+        std::ptr::null()
+    } else {
+        timeout as *const libc::timespec
+    };
+
+    let ret = unsafe {
+        libc::pselect(
+            nfds,
+            if readfds == 0 { std::ptr::null_mut() } else { readfds as *mut libc::fd_set },
+            if writefds == 0 { std::ptr::null_mut() } else { writefds as *mut libc::fd_set },
+            if exceptfds == 0 { std::ptr::null_mut() } else { exceptfds as *mut libc::fd_set },
+            timeout_ptr,
+            std::ptr::null(), // ignore sigmask
+        )
+    };
+    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    const PR_SET_VMA: i32 = 0x53564d41_u32 as i32;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+
+    match option {
+        PR_SET_NAME => {
+            // Set thread name — stub success (could call pthread_setname_np)
+            0
+        }
+        PR_GET_NAME => {
+            // Return "fakelinux" as thread name
+            if arg2 != 0 {
+                let name = b"fakelinux\0\0\0\0\0\0\0"; // 16 bytes
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        name.as_ptr(),
+                        arg2 as *mut u8,
+                        16,
+                    );
+                }
+            }
+            0
+        }
+        PR_SET_VMA => 0, // stub success (used for naming anonymous mappings)
+        PR_SET_NO_NEW_PRIVS => 0,
+        PR_GET_NO_NEW_PRIVS => 0,
+        PR_SET_PDEATHSIG => 0,
+        PR_GET_PDEATHSIG => {
+            if arg2 != 0 {
+                unsafe { *(arg2 as *mut i32) = 0; }
+            }
+            0
+        }
+        _ => {
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: prctl option={:#x} unimplemented, returning 0\n", option as u32
+            ));
+            0 // stub success for unknown prctl options
+        }
+    }
+}
+
+fn do_sysinfo(buf: u64) -> u64 {
+    // Linux struct sysinfo on aarch64 is 112 bytes:
+    //   offset  0: i64 uptime (seconds since boot)
+    //   offset  8: [u64; 3] loads (1, 5, 15 min load averages * 65536)
+    //   offset 32: u64 totalram
+    //   offset 40: u64 freeram
+    //   offset 48: u64 sharedram
+    //   offset 56: u64 bufferram
+    //   offset 64: u64 totalswap
+    //   offset 72: u64 freeswap
+    //   offset 80: u16 procs
+    //   offset 84: u64 totalhigh
+    //   offset 92: u64 freehigh
+    //   offset 100: u32 mem_unit
+    if buf == 0 {
+        return (-14_i64) as u64; // -EFAULT
+    }
+    let out = buf as *mut u8;
+    unsafe {
+        std::ptr::write_bytes(out, 0, 112);
+
+        // Uptime via sysctl kern.boottime
+        let mut boottime: libc::timeval = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let name = b"kern.boottime\0";
+        libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut boottime as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        let mut now: libc::timeval = std::mem::zeroed();
+        libc::gettimeofday(&mut now, std::ptr::null_mut());
+        let uptime = now.tv_sec - boottime.tv_sec;
+        (out as *mut i64).write_unaligned(uptime);
+
+        // Load averages
+        let mut loadavg = [0.0f64; 3];
+        libc::getloadavg(loadavg.as_mut_ptr(), 3);
+        let loads = out.add(8) as *mut u64;
+        for i in 0..3 {
+            loads.add(i).write_unaligned((loadavg[i] * 65536.0) as u64);
+        }
+
+        // Memory info via sysctl hw.memsize
+        let mut memsize: u64 = 0;
+        let mut mlen = std::mem::size_of::<u64>();
+        let mname = b"hw.memsize\0";
+        libc::sysctlbyname(
+            mname.as_ptr() as *const i8,
+            &mut memsize as *mut _ as *mut _,
+            &mut mlen,
+            std::ptr::null_mut(),
+            0,
+        );
+        (out.add(32) as *mut u64).write_unaligned(memsize); // totalram
+        (out.add(40) as *mut u64).write_unaligned(memsize / 2); // freeram (rough estimate)
+
+        // procs
+        let mut nprocs: i32 = 1;
+        let mut nplen = std::mem::size_of::<i32>();
+        let npname = b"hw.ncpu\0";
+        libc::sysctlbyname(
+            npname.as_ptr() as *const i8,
+            &mut nprocs as *mut _ as *mut _,
+            &mut nplen,
+            std::ptr::null_mut(),
+            0,
+        );
+        (out.add(80) as *mut u16).write_unaligned(nprocs as u16);
+
+        // mem_unit = 1
+        (out.add(100) as *mut u32).write_unaligned(1);
+    }
+    0
+}
+
+fn do_getrusage(who: i32, buf: u64) -> u64 {
+    if buf == 0 {
+        return (-14_i64) as u64; // -EFAULT
+    }
+    // Linux and macOS getrusage 'who' values are the same:
+    // RUSAGE_SELF=0, RUSAGE_CHILDREN=-1, RUSAGE_THREAD=1
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        let ret = libc::getrusage(who, &mut usage);
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        // Linux struct rusage on aarch64: same layout as macOS (timeval pairs + longs)
+        // Both are 144 bytes on 64-bit platforms. Copy directly.
+        std::ptr::copy_nonoverlapping(
+            &usage as *const _ as *const u8,
+            buf as *mut u8,
+            std::mem::size_of::<libc::rusage>(),
+        );
     }
     0
 }

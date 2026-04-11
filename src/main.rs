@@ -21,8 +21,14 @@ fn main() {
     }
 
     let elf_path = &args[1];
-    let sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
+    let mut sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
     let rootfs = std::env::var("FAKELINUX_ROOT").unwrap_or_default();
+
+    // When FAKELINUX_ROOT is set but FAKELINUX_SYSROOT is not, auto-set sysroot = root.
+    // This way FAKELINUX_ROOT alone is sufficient for rootfs usage.
+    if !rootfs.is_empty() && sysroot.is_empty() {
+        sysroot = rootfs.clone();
+    }
 
     let data = std::fs::read(elf_path).unwrap_or_else(|e| {
         eprintln!("fakelinux: cannot read '{}': {}", elf_path, e);

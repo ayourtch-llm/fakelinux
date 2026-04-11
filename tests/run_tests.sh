@@ -117,3 +117,29 @@ else
     echo
     echo "=== Skipping dynamic linking tests (no sysroot/) ==="
 fi
+
+# ─── Optional: Alpine rootfs test (FAKELINUX_ROOT only) ─────────────────────
+ALPINE_ROOT="$PROJECT_DIR/alpine-rootfs"
+if [ -d "$ALPINE_ROOT" ] && [ -f "$ALPINE_ROOT/bin/busybox" ]; then
+    echo
+    echo "=== Alpine rootfs test (FAKELINUX_ROOT only, no FAKELINUX_SYSROOT) ==="
+
+    echo "--- Running busybox cat /etc/alpine-release ---"
+    # Unset FAKELINUX_SYSROOT to test that FAKELINUX_ROOT alone works
+    if output=$(FAKELINUX_ROOT="$ALPINE_ROOT" FAKELINUX_SYSROOT= "$FAKELINUX" "$ALPINE_ROOT/bin/busybox" cat /etc/alpine-release 2>&1); then
+        echo "$output"
+        # Check output contains a version number (e.g. 3.21.0)
+        if echo "$output" | grep -qE '[0-9]+\.[0-9]+'; then
+            echo "PASS alpine-rootfs cat /etc/alpine-release"
+        else
+            echo "FAIL alpine-rootfs: output does not contain a version number"
+            echo "Output: $output"
+        fi
+    else
+        echo "$output"
+        echo "FAIL alpine-rootfs cat /etc/alpine-release (exit code $?)"
+    fi
+else
+    echo
+    echo "=== Skipping Alpine rootfs test (no alpine-rootfs/bin/busybox) ==="
+fi

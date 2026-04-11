@@ -2,4 +2,6 @@ fn main() {
     // On macOS, we'd ideally reduce PAGEZERO to allow mapping at 0x400000,
     // but Apple Silicon enforces a minimum PAGEZERO size.
     // Instead, we relocate ET_EXEC binaries above 4GB at load time.
+    println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=build.rs");
 }

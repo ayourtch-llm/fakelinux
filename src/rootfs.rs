@@ -14,6 +14,11 @@ static ROOT: OnceLock<String> = OnceLock::new();
 /// Library-only sysroot path (FAKELINUX_SYSROOT). Only library paths are translated.
 static SYSROOT: OnceLock<String> = OnceLock::new();
 
+/// Return the FAKELINUX_ROOT value if set.
+pub fn get_root() -> Option<&'static str> {
+    ROOT.get().map(|s| s.as_str())
+}
+
 /// Initialize the rootfs from environment variables.
 /// FAKELINUX_ROOT takes precedence over FAKELINUX_SYSROOT for full path translation.
 pub fn init(root: &str, sysroot: &str) {
