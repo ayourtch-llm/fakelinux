@@ -41,6 +41,7 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE").is_ok() {
         syscall::set_trace(true);
     }
+    syscall::init_sysroot(&sysroot);
     procfs::init(elf_path);
     thread::init_main_tid();
     // Initialize GUEST_TPIDR to macOS value — guest MRS tpidr_el0 needs a

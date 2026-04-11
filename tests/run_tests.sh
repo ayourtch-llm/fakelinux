@@ -71,3 +71,49 @@ if [ $FAILED -gt 0 ]; then
     echo -e "Failed tests:\n$ERRORS"
     exit 1
 fi
+
+# ─── Optional: Dynamic linking test ──────────────────────────────────────────
+# Requires sysroot/ directory with aarch64 Linux glibc libraries
+SYSROOT="$PROJECT_DIR/sysroot"
+if [ -d "$SYSROOT" ] && [ -f "$SYSROOT/lib/ld-linux-aarch64.so.1" ]; then
+    echo
+    echo "=== Dynamic linking tests (sysroot found) ==="
+
+    # Compile a dynamically-linked hello world in Docker
+    echo "  Compiling test_dynamic_hello (dynamic)..."
+    docker run --rm --platform linux/arm64 \
+        -v "$SCRIPT_DIR:/tests" \
+        ubuntu:22.04 \
+        sh -c '
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -qq -y gcc >/dev/null 2>&1
+            cat > /tmp/hello.c << "CEOF"
+#include <stdio.h>
+int main() {
+    printf("Hello from dynamic!\n");
+    return 0;
+}
+CEOF
+            gcc -o /tests/test_dynamic_hello /tmp/hello.c
+        ' 2>/dev/null
+
+    if [ -f "$SCRIPT_DIR/test_dynamic_hello" ]; then
+        echo "--- Running test_dynamic_hello (dynamic) ---"
+        if output=$(FAKELINUX_SYSROOT="$SYSROOT" "$FAKELINUX" "$SCRIPT_DIR/test_dynamic_hello" 2>&1); then
+            echo "$output"
+            if echo "$output" | grep -q "Hello from dynamic!"; then
+                echo "PASS test_dynamic_hello"
+            else
+                echo "FAIL test_dynamic_hello (wrong output)"
+            fi
+        else
+            echo "$output"
+            echo "FAIL test_dynamic_hello (exit code $?)"
+        fi
+        rm -f "$SCRIPT_DIR/test_dynamic_hello"
+    else
+        echo "SKIP test_dynamic_hello (compilation failed)"
+    fi
+else
+    echo
+    echo "=== Skipping dynamic linking tests (no sysroot/) ==="
+fi

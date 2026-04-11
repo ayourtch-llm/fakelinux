@@ -329,6 +329,7 @@ pub fn translate_mmap_flags(linux_flags: u64) -> i32 {
     if linux_flags & 0x02 != 0 { mac |= libc::MAP_PRIVATE; }
     if linux_flags & 0x10 != 0 { mac |= libc::MAP_FIXED; }
     if linux_flags & 0x20 != 0 { mac |= libc::MAP_ANON; }
+    // MAP_DENYWRITE (0x0800) — Linux-only, no macOS equivalent, ignore
     // MAP_NORESERVE (0x4000) — no macOS equivalent, ignore
     // MAP_STACK (0x20000) — hint only, ignore
     // MAP_HUGETLB (0x40000) — no macOS equivalent, ignore

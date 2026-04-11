@@ -1,6 +1,7 @@
 use crate::epoll;
 use crate::eventfd;
 use crate::linux::*;
+use crate::loader;
 use crate::net;
 use crate::procfs;
 use crate::signal;
@@ -8,6 +9,23 @@ use crate::thread;
 use crate::translate;
 use crate::trap::ThreadState64;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// Sysroot path for path translation (set once at startup from FAKELINUX_SYSROOT).
+static SYSROOT: OnceLock<String> = OnceLock::new();
+
+/// Initialize the sysroot from the environment variable.
+pub fn init_sysroot(sysroot: &str) {
+    if !sysroot.is_empty() {
+        // Strip trailing slash if present
+        let s = sysroot.trim_end_matches('/');
+        let _ = SYSROOT.set(s.to_string());
+    }
+}
+
+fn get_sysroot() -> Option<&'static str> {
+    SYSROOT.get().map(|s| s.as_str())
+}
 
 /// Write a diagnostic message to stderr using raw write() — safe after fork.
 /// eprintln! uses Rust's Mutex<Stderr> which deadlocks in forked children.
@@ -187,6 +205,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         }
         SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
         SYS_EXECVE => do_execve(args[0], args[1], args[2]),
+        SYS_MEMBARRIER => do_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
+        SYS_FSTATFS => do_fstatfs(args[0] as i32, args[1]),
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -227,6 +247,33 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
 
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_open_flags(linux_flags);
+
+    // Sysroot path translation for dynamic linker library paths
+    if let Some(sysroot) = get_sysroot() {
+        let path_bytes = path.to_bytes();
+        if let Ok(path_str) = std::str::from_utf8(path_bytes) {
+            // Intercept known library/config paths
+            if path_str == "/etc/ld.so.nohwcap" {
+                // Always return ENOENT for this
+                return (-2_i64) as u64; // -ENOENT
+            }
+            let should_translate = path_str.starts_with("/lib/")
+                || path_str.starts_with("/lib64/")
+                || path_str.starts_with("/usr/lib/")
+                || path_str.starts_with("/usr/lib64/")
+                || path_str.starts_with("/etc/ld.so.cache")
+                || path_str.starts_with("/etc/ld.so.conf");
+            if should_translate {
+                let translated = format!("{}{}\0", sysroot, path_str);
+                let translated_ptr = translated.as_ptr() as *const i8;
+                let ret = unsafe { libc::openat(mac_dirfd, translated_ptr, mac_flags, mode) };
+                if ret >= 0 {
+                    return ret as u64;
+                }
+                // Fall through to try the original path
+            }
+        }
+    }
 
     let ret = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
@@ -269,6 +316,31 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
 
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
+
+    // Try sysroot translation for library paths
+    if let Some(sysroot) = get_sysroot() {
+        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        if let Ok(path_str) = std::str::from_utf8(path.to_bytes()) {
+            let should_translate = path_str.starts_with("/lib/")
+                || path_str.starts_with("/lib64/")
+                || path_str.starts_with("/usr/lib/")
+                || path_str.starts_with("/usr/lib64/")
+                || path_str.starts_with("/etc/ld.so.");
+            if should_translate {
+                let translated = format!("{}{}\0", sysroot, path_str);
+                let translated_ptr = translated.as_ptr() as *const i8;
+                unsafe {
+                    let mut mac_stat: libc::stat = std::mem::zeroed();
+                    let ret = libc::fstatat(mac_dirfd, translated_ptr, &mut mac_stat, mac_flags);
+                    if ret == 0 {
+                        translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
+                        return 0;
+                    }
+                }
+                // Fall through to original path
+            }
+        }
+    }
 
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
@@ -641,45 +713,233 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     let mac_flags = translate::translate_mmap_flags(flags);
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
+    let has_exec = prot & 4 != 0; // PROT_EXEC
 
     // Handle 4KB/16KB page size mismatch for MAP_FIXED mappings.
     // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
     // adjacent data if applied at 16KB granularity. Skip these.
     let is_fixed = flags & 0x10 != 0; // MAP_FIXED
-    if is_fixed && (addr & (page - 1) != 0 || length < page) {
+    let addr_misaligned = addr & (page - 1) != 0;
+    if is_fixed && (addr_misaligned || length < page) {
         if prot == 0 {
             // PROT_NONE guard page smaller than a macOS page — skip it
             return addr;
         }
-        // For non-PROT_NONE sub-page MAP_FIXED, use mprotect instead to
-        // change protection of already-mapped pages without remapping.
         if flags & 0x20 != 0 {
             // MAP_ANONYMOUS + MAP_FIXED at sub-page granularity:
-            // Just zero the memory and change protection.
+            // Ensure the containing pages are writable, zero the memory.
+            let pg_start = addr & !(page - 1);
+            let pg_end = (addr + length + page - 1) & !(page - 1);
             unsafe {
+                libc::mprotect(pg_start as *mut _, (pg_end - pg_start) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE);
                 std::ptr::write_bytes(addr as *mut u8, 0, length as usize);
             }
             return addr;
         }
+        // File-backed MAP_FIXED at sub-page address: we can't use mmap.
+        // The address space is already mapped (from the anonymous reservation).
+        // Ensure the containing pages are writable, pread the data, then
+        // set the requested protection.
+        if fd >= 0 {
+            // Make the containing macOS pages writable
+            let pg_start = addr & !(page - 1);
+            let pg_end = (addr + length + page - 1) & !(page - 1);
+            unsafe {
+                libc::mprotect(pg_start as *mut _, (pg_end - pg_start) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE);
+            }
+
+            let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+            let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
+            let read_len = if stat_ret == 0 {
+                let file_size = file_stat.st_size as u64;
+                if offset < file_size {
+                    std::cmp::min(length, file_size - offset)
+                } else {
+                    0
+                }
+            } else {
+                length
+            };
+            if read_len > 0 {
+                unsafe {
+                    libc::pread(fd, addr as *mut _, read_len as usize, offset as i64);
+                }
+            }
+            // Patch SVC/TPIDR if executable
+            if has_exec && length > 0 {
+                loader::patch_new_code(addr, length);
+                extern "C" {
+                    fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
+                }
+                unsafe { sys_icache_invalidate(addr as *mut _, length as usize); }
+            }
+            // Note: we don't set final permissions here because the 16KB page
+            // might be shared with other 4KB segments that need different perms.
+            // The guest's subsequent mprotect calls will set permissions on
+            // fully-covered 16KB pages.
+            return addr;
+        }
+    }
+
+    // If mapping with PROT_EXEC from a file, we need to patch code.
+    // Map as RW first so we can patch, then set final permissions.
+    let effective_prot = if has_exec && fd >= 0 {
+        libc::PROT_READ | libc::PROT_WRITE
+    } else {
+        mac_prot
+    };
+
+    // Handle file-backed mmaps that extend beyond the file size.
+    // On Linux (4KB pages), the kernel zero-fills the remainder of the last page.
+    // On macOS (16KB pages), accessing past the file size causes SIGBUS.
+    // Split: map from file up to the file-aligned size, then anonymous for the rest.
+    let mut file_backed_length = length;
+    let mut needs_anon_tail = false;
+    let mut anon_tail_start: u64 = 0;
+    let mut anon_tail_len: u64 = 0;
+
+    if fd >= 0 && is_fixed {
+        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
+        if stat_ret == 0 {
+            let file_size = file_stat.st_size as u64;
+            let map_file_end = offset + length;
+            if map_file_end > file_size {
+                // Clamp file mapping to page-aligned file size
+                let file_map_len = if file_size > offset {
+                    let raw = file_size - offset;
+                    (raw + page - 1) & !(page - 1) // round up to macOS page
+                } else {
+                    0
+                };
+                if file_map_len < length {
+                    file_backed_length = file_map_len;
+                    needs_anon_tail = true;
+                    anon_tail_start = addr + file_map_len;
+                    anon_tail_len = length - file_map_len;
+                }
+            }
+        }
     }
 
     let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
-    let ret = unsafe { libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64) };
-    if ret == libc::MAP_FAILED {
-        translate::linux_errno()
+
+    // Check if offset is not macOS-page-aligned (16KB).
+    // Linux uses 4KB pages so offsets may be 4KB-aligned but not 16KB-aligned.
+    // For such file-backed mmaps, we must map anonymous and pread the data.
+    let offset_misaligned = fd >= 0 && (offset & (page - 1)) != 0;
+
+    let result_addr;
+    if offset_misaligned {
+        // Map anonymous memory, then read file content into it
+        let anon_flags = if is_fixed {
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED
+        } else {
+            libc::MAP_PRIVATE | libc::MAP_ANON
+        };
+        let ret = unsafe { libc::mmap(hint, length as usize, libc::PROT_READ | libc::PROT_WRITE, anon_flags, -1, 0) };
+        if ret == libc::MAP_FAILED {
+            return translate::linux_errno();
+        }
+        result_addr = ret as u64;
+
+        // Read file content (up to file size)
+        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
+        let read_len = if stat_ret == 0 {
+            let file_size = file_stat.st_size as u64;
+            if offset < file_size {
+                std::cmp::min(length, file_size - offset)
+            } else {
+                0
+            }
+        } else {
+            length
+        };
+        if read_len > 0 {
+            unsafe {
+                libc::pread(fd, result_addr as *mut _, read_len as usize, offset as i64);
+            }
+        }
+        // Don't need anon tail handling since we already mapped anonymous
+        needs_anon_tail = false;
+    } else if file_backed_length > 0 {
+        let ret = unsafe { libc::mmap(hint, file_backed_length as usize, effective_prot, mac_flags, fd, offset as i64) };
+        if ret == libc::MAP_FAILED {
+            return translate::linux_errno();
+        }
+        result_addr = ret as u64;
     } else {
-        ret as u64
+        // Entire mapping is beyond file — map anonymous
+        let ret = unsafe { libc::mmap(hint, length as usize, effective_prot,
+            mac_flags | libc::MAP_ANON, -1, 0) };
+        if ret == libc::MAP_FAILED {
+            return translate::linux_errno();
+        }
+        result_addr = ret as u64;
+        // No file content, no anon tail needed
+        needs_anon_tail = false;
     }
+
+    // Map anonymous tail for the portion beyond file size
+    if needs_anon_tail && anon_tail_len > 0 {
+        let anon_ret = unsafe { libc::mmap(
+            anon_tail_start as *mut _,
+            anon_tail_len as usize,
+            effective_prot,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            -1,
+            0,
+        ) };
+        if anon_ret == libc::MAP_FAILED {
+            // Non-fatal: the tail may just be unused BSS
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: warning: anon tail mmap at {:#x}+{:#x} failed\n",
+                anon_tail_start, anon_tail_len
+            ));
+        }
+    }
+
+    // Patch SVC/TPIDR in newly mapped executable code
+    if has_exec && length > 0 {
+        loader::patch_new_code(result_addr, length);
+        // Invalidate instruction cache
+        extern "C" {
+            fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
+        }
+        unsafe { sys_icache_invalidate(result_addr as *mut _, length as usize); }
+        // Set final permissions if we mapped as RW for patching
+        if effective_prot != mac_prot {
+            unsafe { libc::mprotect(result_addr as *mut _, length as usize, mac_prot); }
+        }
+    }
+
+    result_addr
 }
 
 fn do_munmap(addr: u64, length: u64) -> u64 {
-    let ret = unsafe { libc::munmap(addr as *mut _, length as usize) };
+    let page: u64 = 16384;
+    // macOS requires 16KB alignment. Linux guests use 4KB pages.
+    // Only unmap fully-covered 16KB pages; silently succeed for sub-page unmaps.
+    let aligned_addr = (addr + page - 1) & !(page - 1); // round UP
+    let aligned_end = (addr + length) & !(page - 1);      // round DOWN
+
+    if aligned_addr >= aligned_end {
+        // No full 16KB pages covered — silently succeed
+        return 0;
+    }
+
+    let aligned_len = aligned_end - aligned_addr;
+    let ret = unsafe { libc::munmap(aligned_addr as *mut _, aligned_len as usize) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
 fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
+    let has_exec = prot & 4 != 0; // PROT_EXEC
 
     // macOS requires 16KB page alignment; Linux guests use 4KB.
     // Only protect fully-covered 16KB pages to avoid making adjacent
@@ -694,6 +954,29 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     }
 
     let aligned_len = aligned_end - aligned_addr;
+
+    // When adding PROT_EXEC, scan and patch SVC/TPIDR instructions first.
+    // The page must be writable to patch, so ensure RW before scanning,
+    // then set the final permissions after patching.
+    if has_exec && aligned_len > 0 {
+        // Make the region writable so we can patch
+        let rw_prot = libc::PROT_READ | libc::PROT_WRITE;
+        let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, rw_prot) };
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+
+        // Patch SVC #0 and MSR/MRS tpidr_el0 instructions
+        loader::patch_new_code(aligned_addr, aligned_len);
+
+        // Invalidate instruction cache after writing instructions
+        extern "C" {
+            fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
+        }
+        unsafe { sys_icache_invalidate(aligned_addr as *mut _, aligned_len as usize); }
+    }
+
+    // Set final permissions
     let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -747,6 +1030,58 @@ fn do_prlimit64(_pid: u64, _resource: i32, _new_limit: u64, old_limit: u64) -> u
             *ptr = u64::MAX;
             *ptr.add(1) = u64::MAX;
         }
+    }
+    0
+}
+
+fn do_membarrier(cmd: i32, _flags: u32, _cpu_id: i32) -> u64 {
+    // cmd=0 is MEMBARRIER_CMD_QUERY — return supported commands bitmask
+    // For simplicity, return 0 (no commands supported beyond QUERY)
+    if cmd == 0 {
+        0 // QUERY: return bitmask of supported commands
+    } else {
+        (-38_i64) as u64 // -ENOSYS for all other commands
+    }
+}
+
+fn do_fstatfs(fd: i32, buf: u64) -> u64 {
+    // Linux struct statfs on aarch64 is 120 bytes:
+    //   offset  0: u64 f_type
+    //   offset  8: u64 f_bsize
+    //   offset 16: u64 f_blocks
+    //   offset 24: u64 f_bfree
+    //   offset 32: u64 f_bavail
+    //   offset 40: u64 f_files
+    //   offset 48: u64 f_ffree
+    //   offset 56: [i32; 2] f_fsid
+    //   offset 64: u64 f_namelen
+    //   offset 72: u64 f_frsize
+    //   offset 80: u64 f_flags
+    //   offset 88: [u64; 4] f_spare
+    unsafe {
+        let mut mac_statfs: libc::statfs = std::mem::zeroed();
+        let ret = libc::fstatfs(fd, &mut mac_statfs);
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        let out = buf as *mut u8;
+        std::ptr::write_bytes(out, 0, 120);
+        let w64 = |off: usize, val: u64| {
+            (out.add(off) as *mut u64).write_unaligned(val);
+        };
+        // EXT4_SUPER_MAGIC = 0xEF53 (pretend to be ext4)
+        w64(0, 0xEF53);
+        w64(8, mac_statfs.f_bsize as u64);
+        w64(16, mac_statfs.f_blocks as u64);
+        w64(24, mac_statfs.f_bfree as u64);
+        w64(32, mac_statfs.f_bavail as u64);
+        w64(40, mac_statfs.f_files as u64);
+        w64(48, mac_statfs.f_ffree as u64);
+        // f_fsid: zero it out (macOS fsid_t layout differs)
+        (out.add(56) as *mut u64).write_unaligned(0);
+        w64(64, 255); // f_namelen
+        w64(72, mac_statfs.f_bsize as u64); // f_frsize = f_bsize
+        w64(80, 0); // f_flags
     }
     0
 }

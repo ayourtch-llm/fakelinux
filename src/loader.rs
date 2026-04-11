@@ -4,8 +4,8 @@ use crate::procfs;
 use crate::syscall;
 use crate::trap;
 
-use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Side table mapping patched PC addresses to their original instructions.
 /// Written during loading, then frozen. Uses a sorted Vec for lock-free lookup
@@ -13,6 +13,10 @@ use std::sync::Mutex;
 static TPIDR_PATCHES: Mutex<Option<Vec<(u64, u32)>>> = Mutex::new(None);
 /// Frozen sorted copy for lock-free lookup at runtime.
 static mut TPIDR_PATCHES_FROZEN: Option<Vec<(u64, u32)>> = None;
+
+/// Runtime TPIDR patches added when dynamic linker loads new .so files.
+/// Kept sorted for binary search. Protected by RwLock for concurrent reads.
+static TPIDR_PATCHES_RUNTIME: RwLock<Vec<(u64, u32)>> = RwLock::new(Vec::new());
 
 pub fn freeze_tpidr_patches() {
     let mut lock = TPIDR_PATCHES.lock().unwrap();
@@ -28,11 +32,30 @@ fn add_tpidr_patch(pc: u64, instr: u32) {
         .push((pc, instr));
 }
 
+fn add_runtime_tpidr_patch(pc: u64, instr: u32) {
+    if let Ok(mut table) = TPIDR_PATCHES_RUNTIME.write() {
+        // Insert in sorted order for binary search
+        let pos = table.binary_search_by_key(&pc, |&(addr, _)| addr)
+            .unwrap_or_else(|e| e);
+        table.insert(pos, (pc, instr));
+    }
+}
+
 pub fn tpidr_lookup(pc: u64) -> Option<u32> {
-    let table = unsafe { TPIDR_PATCHES_FROZEN.as_ref()? };
-    table.binary_search_by_key(&pc, |&(addr, _)| addr)
-        .ok()
-        .map(|i| table[i].1)
+    // Check frozen table first (fast, lock-free)
+    let frozen = unsafe { TPIDR_PATCHES_FROZEN.as_ref() };
+    if let Some(table) = frozen {
+        if let Ok(i) = table.binary_search_by_key(&pc, |&(addr, _)| addr) {
+            return Some(table[i].1);
+        }
+    }
+    // Check runtime table (for dynamically loaded code)
+    if let Ok(table) = TPIDR_PATCHES_RUNTIME.read() {
+        if let Ok(i) = table.binary_search_by_key(&pc, |&(addr, _)| addr) {
+            return Some(table[i].1);
+        }
+    }
+    None
 }
 
 const PAGE_SIZE: u64 = 16384; // macOS aarch64
@@ -338,6 +361,40 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
     }
     if tpidr_patched > 0 {
         eprintln!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
+    }
+}
+
+/// Patch newly-executable code pages at runtime (called from mprotect/mmap).
+/// Scans the given address range for SVC #0 and MSR/MRS tpidr_el0, patches them,
+/// and adds TPIDR patches to the runtime table.
+///
+/// The caller must ensure the memory is writable before calling this.
+/// After patching, the caller should set the final permissions and invalidate icache.
+pub fn patch_new_code(start: u64, len: u64) {
+    let count = len / 4;
+    let base = start as *mut u32;
+    let mut svc_patched = 0u64;
+    let mut tpidr_patched = 0u64;
+    for i in 0..count as usize {
+        unsafe {
+            let instr = base.add(i).read();
+            if instr == trap::SVC_0 {
+                base.add(i).write(trap::BRK_MARKER);
+                svc_patched += 1;
+            } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
+                   || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
+                let pc_addr = base.add(i) as u64;
+                add_runtime_tpidr_patch(pc_addr, instr);
+                base.add(i).write(trap::BRK_MARKER);
+                tpidr_patched += 1;
+            }
+        }
+    }
+    if svc_patched > 0 || tpidr_patched > 0 {
+        eprintln!(
+            "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR",
+            start, len, svc_patched, tpidr_patched
+        );
     }
 }
 

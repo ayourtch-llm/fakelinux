@@ -92,6 +92,8 @@ pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
 pub const SYS_EPOLL_PWAIT: u64 = 22;
 pub const SYS_STATX: u64 = 291;
+pub const SYS_FSTATFS: u64 = 44;
+pub const SYS_MEMBARRIER: u64 = 283;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;
