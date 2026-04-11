@@ -230,14 +230,13 @@ fn do_fork(_flags: u64) -> u64 {
         return crate::translate::linux_errno();
     }
     if pid == 0 {
-        // Child: re-install signal handler with a fresh sigaltstack.
-        crate::trap::install_handler();
-
-        // TODO: For now, just exit the child. Full guest code execution
-        // after fork needs more work (signal handler context issues).
+        // Child: can't run guest code from signal handler context (macOS
+        // runtime is broken after fork-from-signal-handler).
+        // Just _exit — busybox sh will report the command failed and continue.
+        // Full fork support requires the BL trampoline architecture (see
+        // bl-rewriting branch) which avoids signal handlers entirely.
         unsafe { libc::_exit(127); }
 
-        // Restore callee-saved registers and jump to guest code.
         #[allow(unreachable_code)]
         unsafe {
             let r = &FORK_REGS;

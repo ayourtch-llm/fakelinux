@@ -157,7 +157,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
-        SYS_EXECVE => (-38_i64) as u64, // ENOSYS for now
+        SYS_EXECVE => do_execve(args[0], args[1], args[2]),
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -403,6 +403,52 @@ fn do_getcwd(buf: u64, size: u64) -> u64 {
         let len = unsafe { std::ffi::CStr::from_ptr(ret).to_bytes_with_nul().len() };
         len as u64
     }
+}
+
+fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    // Re-exec ourselves (fakelinux) with the guest binary as argument.
+    // This replaces the current process image entirely.
+    let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+
+    // Collect argv: the guest's argv becomes fakelinux's argv[1..]
+    let mut new_argv: Vec<*const i8> = Vec::new();
+
+    // argv[0] = our own executable path
+    let self_exe = std::env::current_exe().unwrap_or_default();
+    let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap_or("fakelinux")).unwrap();
+    new_argv.push(self_exe_c.as_ptr());
+
+    // argv[1..] = guest's argv (which starts with the guest binary path)
+    let mut guest_argv = argv_ptr as *const *const i8;
+    unsafe {
+        while !(*guest_argv).is_null() {
+            new_argv.push(*guest_argv);
+            guest_argv = guest_argv.add(1);
+        }
+    }
+    new_argv.push(std::ptr::null()); // NULL terminator
+
+    // Collect envp
+    let mut new_envp: Vec<*const i8> = Vec::new();
+    let mut guest_envp = envp_ptr as *const *const i8;
+    unsafe {
+        while !(*guest_envp).is_null() {
+            new_envp.push(*guest_envp);
+            guest_envp = guest_envp.add(1);
+        }
+    }
+    new_envp.push(std::ptr::null());
+
+    // execve ourselves with the guest binary as first arg
+    unsafe {
+        libc::execve(
+            self_exe_c.as_ptr(),
+            new_argv.as_ptr(),
+            new_envp.as_ptr(),
+        );
+    }
+    // If execve returns, it failed
+    translate::linux_errno()
 }
 
 // ─── Memory management ──────────────────────────────────────────────────────
