@@ -374,10 +374,10 @@ unsafe extern "C" fn crash_handler(
     let signame = if sig == libc::SIGSEGV { "SIGSEGV" } else { "SIGBUS" };
     let mut buf = [0u8; 256];
     let n = raw_fmt(&mut buf, format_args!(
-        "\nfakelinux: {} at pc={:#x} fault_addr={:#x}\n  x0={:#x}  x1={:#x}  x2={:#x}  x3={:#x}\n  x8={:#x}  sp={:#x}  lr={:#x}  guest_tpidr={:#x}\n",
+        "\nfakelinux: {} at pc={:#x} fault_addr={:#x}\n  x0={:#x}  x1={:#x}  x2={:#x}  x3={:#x}\n  x8={:#x}  x18={:#x}  sp={:#x}  lr={:#x}  guest_tpidr={:#x}\n",
         signame, regs.pc, fault_addr,
         regs.x[0], regs.x[1], regs.x[2], regs.x[3],
-        regs.x[8], regs.sp, regs.lr, guest_tpidr
+        regs.x[8], regs.x[18], regs.sp, regs.lr, guest_tpidr
     ));
     libc::write(2, buf.as_ptr() as *const _, n);
     libc::_exit(128 + sig);
