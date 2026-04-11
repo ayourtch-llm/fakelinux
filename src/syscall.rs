@@ -453,16 +453,11 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
     new_argv.push(std::ptr::null());
 
-    // Collect envp
-    let mut new_envp: Vec<*const i8> = Vec::new();
-    let mut guest_envp = envp_ptr as *const *const i8;
-    unsafe {
-        while !(*guest_envp).is_null() {
-            new_envp.push(*guest_envp);
-            guest_envp = guest_envp.add(1);
-        }
-    }
-    new_envp.push(std::ptr::null());
+    // Use the HOST environment (not guest's) so env vars like FAKELINUX_TRACE propagate
+    let new_envp_marker: *const *const i8 = std::ptr::null();
+    // Actually, just use environ from libc
+    extern "C" { static environ: *const *const i8; }
+    let envp_to_use = unsafe { environ };
 
     // Debug: show what we're exec'ing
     {
@@ -476,7 +471,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         libc::execve(
             self_exe_c.as_ptr(),
             new_argv.as_ptr(),
-            new_envp.as_ptr(),
+            envp_to_use,
         );
     }
     // If execve returns, it failed

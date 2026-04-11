@@ -28,7 +28,7 @@ pub const MRS_TPIDR_BASE: u32 = 0xD53B_D040;
 /// Guest's TPIDR_EL0 value. macOS clobbers TPIDR_EL0 on every signal
 /// entry/return (restoring it to ~0x1004), so we must track the guest's
 /// value ourselves and intercept all MSR/MRS tpidr_el0 instructions.
-static GUEST_TPIDR: AtomicU64 = AtomicU64::new(0);
+pub static GUEST_TPIDR: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_guest_tpidr() -> u64 {
     GUEST_TPIDR.load(Ordering::SeqCst)

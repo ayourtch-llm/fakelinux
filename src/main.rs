@@ -40,6 +40,13 @@ fn main() {
     }
     procfs::init(elf_path);
     thread::init_main_tid();
+    // Initialize GUEST_TPIDR to macOS value — guest MRS tpidr_el0 needs a
+    // non-zero value before __set_thread_area runs.
+    {
+        let tpidr: u64;
+        unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr); }
+        trap::GUEST_TPIDR.store(tpidr, std::sync::atomic::Ordering::SeqCst);
+    }
     trap::install_handler();
 
     // Load segments, patch SVCs, set up stack
