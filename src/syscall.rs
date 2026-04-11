@@ -392,6 +392,20 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         return ret as u64;
     }
 
+    // In rootfs mode, if O_NOFOLLOW caused ELOOP, retry without it.
+    // Symlinks within the rootfs are safe to follow.
+    if _hold.is_some() && (mac_flags & libc::O_NOFOLLOW != 0) {
+        let errno = unsafe { *libc::__error() };
+        if errno == libc::ELOOP {
+            let ret2 = unsafe {
+                libc::openat(mac_dirfd, eff_path, mac_flags & !libc::O_NOFOLLOW, mode)
+            };
+            if ret2 >= 0 {
+                return ret2 as u64;
+            }
+        }
+    }
+
     // If translation was applied and the translated path failed, try the original
     if _hold.is_some() {
         let ret2 = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };

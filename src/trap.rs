@@ -264,6 +264,57 @@ unsafe extern "C" fn sigtrap_handler(
     crate::signal::deliver_pending_to_guest(mctx);
 }
 
+/// Full signal environment re-init for child after fork().
+/// Re-installs SIGTRAP handler, allocates a fresh signal alt stack, and unblocks signals.
+pub fn init_child_after_fork() {
+    unsafe {
+        // Allocate a fresh signal alt stack for the child
+        let stack_size: usize = 128 * 1024;
+        let stack = libc::mmap(
+            std::ptr::null_mut(),
+            stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if stack != libc::MAP_FAILED {
+            let ss = libc::stack_t {
+                ss_sp: stack,
+                ss_flags: 0,
+                ss_size: stack_size,
+            };
+            libc::sigaltstack(&ss, std::ptr::null_mut());
+        }
+
+        // Re-install SIGTRAP handler
+        install_sigtrap_handler();
+
+        // Unblock all signals
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+
+        // Reset IN_SIGTRAP (should already be false, but be safe)
+        IN_SIGTRAP.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Re-install the SIGTRAP handler. Called after fork() in child processes.
+pub fn install_sigtrap_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigtrap_handler as *const () as libc::sighandler_t;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut()) != 0 {
+            let msg = "fakelinux: sigaction(SIGTRAP) failed\n";
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+            libc::_exit(127);
+        }
+    }
+}
+
 /// Get the handler function pointer (for use in forked children).
 pub fn sigtrap_handler_ptr() -> libc::sighandler_t {
     sigtrap_handler as *const () as libc::sighandler_t
@@ -295,13 +346,7 @@ pub fn install_handler() {
 
         // Install SIGTRAP handler FIRST (before unblocking — if SIGTRAP is
         // pending, unblocking would fire it with SIG_DFL=terminate!)
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigtrap_handler as *const () as libc::sighandler_t;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa.sa_mask);
-        if libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut()) != 0 {
-            panic!("sigaction(SIGTRAP) failed");
-        }
+        install_sigtrap_handler();
 
         // NOW unblock all signals (safe — our handler is installed)
         let mut empty: libc::sigset_t = std::mem::zeroed();

@@ -480,8 +480,15 @@ extern "C" fn fork_trampoline_entry() -> ! {
         unsafe { libc::_exit(127); }
     }
 
+    if pid == 0 {
+        // Child: fully re-initialize the signal handling environment.
+        // Allocates a fresh alt stack, re-installs SIGTRAP handler,
+        // and unblocks all signals before returning to guest code.
+        crate::trap::init_child_after_fork();
+    }
+
     unsafe {
-        let r = &FORK_REGS;
+        let r = &*(&raw const FORK_REGS);
         let x0_val = if pid == 0 { 0u64 } else { pid as u64 };
 
         // Restore all callee-saved registers and jump to guest PC
