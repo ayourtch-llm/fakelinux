@@ -1,1 +1,8 @@
 /target
+/alpine-rootfs
+/python-rootfs
+/sysroot
+*.o
+busybox
+hello_*
+test_suite

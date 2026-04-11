@@ -371,6 +371,11 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
 fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u64 {
     let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
 
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        raw_eprintln_fmt(format_args!("fakelinux: openat({}, {:?}, {:#x})\n",
+            linux_dirfd, path, linux_flags));
+    }
+
     // Check if this is a /proc path we handle virtually
     if let Some(fd) = procfs::try_open(path.to_bytes()) {
         return fd as u64;
