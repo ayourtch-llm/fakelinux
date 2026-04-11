@@ -977,15 +977,14 @@ fn do_brk(addr: u64) -> u64 {
 }
 
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
-    let mac_flags = translate::translate_mmap_flags(flags);
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
     let has_exec = prot & 4 != 0; // PROT_EXEC
+    let is_fixed = flags & 0x10 != 0; // MAP_FIXED
 
     // Handle 4KB/16KB page size mismatch for MAP_FIXED mappings.
     // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
     // adjacent data if applied at 16KB granularity. Skip these.
-    let is_fixed = flags & 0x10 != 0; // MAP_FIXED
     let addr_misaligned = addr & (page - 1) != 0;
     if is_fixed && (addr_misaligned || length < page) {
         if prot == 0 {
@@ -1005,185 +1004,93 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
             return addr;
         }
         // File-backed MAP_FIXED at sub-page address: we can't use mmap.
-        // The address space is already mapped (from the anonymous reservation).
-        // Ensure the containing pages are writable, pread the data, then
-        // set the requested protection.
+        // The address space is already mapped (anonymous — we never create
+        // file-backed pages). Make the containing pages writable, pread
+        // the data, then patch if executable. All safe in signal context
+        // because pages are anonymous.
         if fd >= 0 {
-            // Make the containing macOS pages writable
             let pg_start = addr & !(page - 1);
             let pg_end = (addr + length + page - 1) & !(page - 1);
             unsafe {
                 libc::mprotect(pg_start as *mut _, (pg_end - pg_start) as usize,
                     libc::PROT_READ | libc::PROT_WRITE);
             }
-
-            let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
-            let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
-            let read_len = if stat_ret == 0 {
-                let file_size = file_stat.st_size as u64;
-                if offset < file_size {
-                    std::cmp::min(length, file_size - offset)
-                } else {
-                    0
-                }
-            } else {
-                length
-            };
+            let read_len = file_read_len(fd, offset, length);
             if read_len > 0 {
-                unsafe {
-                    libc::pread(fd, addr as *mut _, read_len as usize, offset as i64);
-                }
+                unsafe { libc::pread(fd, addr as *mut _, read_len as usize, offset as i64); }
             }
-            // Patch SVC/TPIDR if executable
             if has_exec && length > 0 {
                 loader::patch_new_code(addr, length);
-                extern "C" {
-                    fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
-                }
+                extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
                 unsafe { sys_icache_invalidate(addr as *mut _, length as usize); }
             }
-            // Note: we don't set final permissions here because the 16KB page
-            // might be shared with other 4KB segments that need different perms.
-            // The guest's subsequent mprotect calls will set permissions on
-            // fully-covered 16KB pages.
             return addr;
         }
     }
 
-    // If mapping with PROT_EXEC from a file, we need to patch code.
-    // Map as RW first so we can patch, then set final permissions.
-    let effective_prot = if has_exec && fd >= 0 {
-        libc::PROT_READ | libc::PROT_WRITE
-    } else {
-        mac_prot
-    };
-
-    // Handle file-backed mmaps that extend beyond the file size.
-    // On Linux (4KB pages), the kernel zero-fills the remainder of the last page.
-    // On macOS (16KB pages), accessing past the file size causes SIGBUS.
-    // Split: map from file up to the file-aligned size, then anonymous for the rest.
-    let mut file_backed_length = length;
-    let mut needs_anon_tail = false;
-    let mut anon_tail_start: u64 = 0;
-    let mut anon_tail_len: u64 = 0;
-
-    if fd >= 0 && is_fixed {
-        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
-        let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
-        if stat_ret == 0 {
-            let file_size = file_stat.st_size as u64;
-            let map_file_end = offset + length;
-            if map_file_end > file_size {
-                // Clamp file mapping to page-aligned file size
-                let file_map_len = if file_size > offset {
-                    let raw = file_size - offset;
-                    (raw + page - 1) & !(page - 1) // round up to macOS page
-                } else {
-                    0
-                };
-                if file_map_len < length {
-                    file_backed_length = file_map_len;
-                    needs_anon_tail = true;
-                    anon_tail_start = addr + file_map_len;
-                    anon_tail_len = length - file_map_len;
-                }
-            }
-        }
-    }
-
-    let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
-
-    // Check if offset is not macOS-page-aligned (16KB).
-    // Linux uses 4KB pages so offsets may be 4KB-aligned but not 16KB-aligned.
-    // For such file-backed mmaps, we must map anonymous and pread the data.
-    let offset_misaligned = fd >= 0 && (offset & (page - 1)) != 0;
-
-    let result_addr;
-    if offset_misaligned {
-        // Map anonymous memory, then read file content into it
+    // ── File-backed mmap (fd >= 0): always map anonymous + pread ─────────
+    // Never create file-backed pages. On macOS, mmap(fd) and mprotect on
+    // file-backed pages from inside a signal handler causes an uninterruptible
+    // kernel deadlock. pread is async-signal-safe and avoids this entirely.
+    if fd >= 0 && flags & 0x20 == 0 {
         let anon_flags = if is_fixed {
             libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED
         } else {
             libc::MAP_PRIVATE | libc::MAP_ANON
         };
-        let ret = unsafe { libc::mmap(hint, length as usize, libc::PROT_READ | libc::PROT_WRITE, anon_flags, -1, 0) };
-        if ret == libc::MAP_FAILED {
-            return translate::linux_errno();
-        }
-        result_addr = ret as u64;
+        let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
 
-        // Read file content (up to file size)
-        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
-        let stat_ret = unsafe { libc::fstat(fd, &mut file_stat) };
-        let read_len = if stat_ret == 0 {
-            let file_size = file_stat.st_size as u64;
-            if offset < file_size {
-                std::cmp::min(length, file_size - offset)
-            } else {
-                0
-            }
-        } else {
-            length
+        // Map as RW so we can pread into it and patch if needed
+        let ret = unsafe {
+            libc::mmap(hint, length as usize, libc::PROT_READ | libc::PROT_WRITE, anon_flags, -1, 0)
         };
+        if ret == libc::MAP_FAILED {
+            return translate::linux_errno();
+        }
+        let result_addr = ret as u64;
+
+        // Read file content (clamped to file size)
+        let read_len = file_read_len(fd, offset, length);
         if read_len > 0 {
-            unsafe {
-                libc::pread(fd, result_addr as *mut _, read_len as usize, offset as i64);
-            }
+            unsafe { libc::pread(fd, result_addr as *mut _, read_len as usize, offset as i64); }
         }
-        // Don't need anon tail handling since we already mapped anonymous
-        needs_anon_tail = false;
-    } else if file_backed_length > 0 {
-        let ret = unsafe { libc::mmap(hint, file_backed_length as usize, effective_prot, mac_flags, fd, offset as i64) };
-        if ret == libc::MAP_FAILED {
-            return translate::linux_errno();
+
+        // Patch SVC/TPIDR if executable
+        if has_exec && length > 0 {
+            loader::patch_new_code(result_addr, length);
+            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+            unsafe { sys_icache_invalidate(result_addr as *mut _, length as usize); }
         }
-        result_addr = ret as u64;
+
+        // Set final permissions (anonymous pages — mprotect is safe)
+        unsafe { libc::mprotect(result_addr as *mut _, length as usize, mac_prot); }
+
+        return result_addr;
+    }
+
+    // ── Anonymous mmap — pass through to macOS directly ──────────────────
+    let mac_flags = translate::translate_mmap_flags(flags);
+    let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
+    let ret = unsafe { libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64) };
+    if ret == libc::MAP_FAILED {
+        return translate::linux_errno();
+    }
+    ret as u64
+}
+
+/// Helper: compute how many bytes to pread from fd at offset, clamped to file size.
+fn file_read_len(fd: i32, offset: u64, length: u64) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } == 0 {
+        let file_size = st.st_size as u64;
+        if offset < file_size {
+            std::cmp::min(length, file_size - offset)
+        } else {
+            0
+        }
     } else {
-        // Entire mapping is beyond file — map anonymous
-        let ret = unsafe { libc::mmap(hint, length as usize, effective_prot,
-            mac_flags | libc::MAP_ANON, -1, 0) };
-        if ret == libc::MAP_FAILED {
-            return translate::linux_errno();
-        }
-        result_addr = ret as u64;
-        // No file content, no anon tail needed
-        needs_anon_tail = false;
+        length
     }
-
-    // Map anonymous tail for the portion beyond file size
-    if needs_anon_tail && anon_tail_len > 0 {
-        let anon_ret = unsafe { libc::mmap(
-            anon_tail_start as *mut _,
-            anon_tail_len as usize,
-            effective_prot,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
-            -1,
-            0,
-        ) };
-        if anon_ret == libc::MAP_FAILED {
-            // Non-fatal: the tail may just be unused BSS
-            raw_eprintln_fmt(format_args!(
-                "fakelinux: warning: anon tail mmap at {:#x}+{:#x} failed\n",
-                anon_tail_start, anon_tail_len
-            ));
-        }
-    }
-
-    // Patch SVC/TPIDR in newly mapped executable code
-    if has_exec && length > 0 {
-        loader::patch_new_code(result_addr, length);
-        // Invalidate instruction cache
-        extern "C" {
-            fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
-        }
-        unsafe { sys_icache_invalidate(result_addr as *mut _, length as usize); }
-        // Set final permissions if we mapped as RW for patching
-        if effective_prot != mac_prot {
-            unsafe { libc::mprotect(result_addr as *mut _, length as usize, mac_prot); }
-        }
-    }
-
-    result_addr
 }
 
 fn do_munmap(addr: u64, length: u64) -> u64 {
@@ -1223,27 +1130,21 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let aligned_len = aligned_end - aligned_addr;
 
     // When adding PROT_EXEC, scan and patch SVC/TPIDR instructions first.
-    // The page must be writable to patch, so ensure RW before scanning,
-    // then set the final permissions after patching.
+    // The page must be writable to patch, so we need mprotect→RW, patch,
+    // then mprotect→final. But mprotect on file-backed pages from signal
+    // context causes a macOS kernel deadlock, so defer to the trampoline.
     if has_exec && aligned_len > 0 {
-        // Make the region writable so we can patch
-        let rw_prot = libc::PROT_READ | libc::PROT_WRITE;
-        let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, rw_prot) };
-        if ret < 0 {
-            return translate::linux_errno();
-        }
-
-        // Patch SVC #0 and MSR/MRS tpidr_el0 instructions
-        loader::patch_new_code(aligned_addr, aligned_len);
-
-        // Invalidate instruction cache after writing instructions
-        extern "C" {
-            fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
-        }
-        unsafe { sys_icache_invalidate(aligned_addr as *mut _, aligned_len as usize); }
+        thread::set_pending_patch(thread::PendingPatchWork {
+            kind: thread::PendingPatchKind::MprotectExec {
+                aligned_addr,
+                aligned_len,
+                mac_prot,
+            },
+        });
+        return 0;
     }
 
-    // Set final permissions
+    // Non-exec mprotect: safe to do inline (no patching needed)
     let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }

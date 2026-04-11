@@ -216,6 +216,15 @@ unsafe extern "C" fn sigtrap_handler(
             mctx.ss.pc = crate::thread::fork_trampoline_addr();
             // Clear signal mask so SIGTRAP is unblocked after sigreturn
             uctx.uc_sigmask = 0;
+        } else if crate::thread::PATCH_PENDING.load(Ordering::SeqCst) {
+            // mmap/mprotect needs deferred work (mprotect on file-backed pages
+            // from signal context deadlocks macOS). Save guest registers and
+            // redirect sigreturn to the patch trampoline.
+            let guest_resume_pc = pc + 4;
+            crate::thread::save_patch_regs(&mctx.ss, guest_resume_pc);
+            crate::thread::set_patch_regs_x0(result);
+            mctx.ss.pc = crate::thread::patch_trampoline_addr();
+            uctx.uc_sigmask = 0;
         } else if result == crate::signal::SIGRETURN_SENTINEL {
             // rt_sigreturn: registers were already restored directly into mctx.
             // Don't overwrite x0 or pc.

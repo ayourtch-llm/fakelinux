@@ -534,6 +534,124 @@ fn do_fork(_flags: u64) -> u64 {
     0xFFFF_FFFF_0000_F0C0
 }
 
+// ─── Patch trampoline (deferred mprotect/pread/patch outside signal context) ──
+//
+// On macOS, calling mprotect on file-backed pages from inside a signal handler
+// causes a kernel deadlock (uninterruptible sleep). We use the same trampoline
+// pattern as fork: store the pending work, redirect sigreturn to a trampoline
+// page that runs outside signal context, do the mprotect+pread+patch there.
+
+pub static PATCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub enum PendingPatchKind {
+    /// mprotect adding PROT_EXEC: mprotect→RW, patch, icache, mprotect→final
+    MprotectExec {
+        aligned_addr: u64,
+        aligned_len: u64,
+        mac_prot: i32,
+    },
+}
+
+pub struct PendingPatchWork {
+    pub kind: PendingPatchKind,
+}
+
+static mut PENDING_PATCH: Option<PendingPatchWork> = None;
+
+static mut PATCH_REGS: SavedRegs = SavedRegs {
+    x: [0; 29], fp: 0, lr: 0, sp: 0, pc: 0,
+};
+
+static PATCH_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+
+pub fn patch_trampoline_addr() -> u64 {
+    PATCH_TRAMPOLINE.load(Ordering::SeqCst)
+}
+
+pub fn set_pending_patch(work: PendingPatchWork) {
+    unsafe { *(&raw mut PENDING_PATCH) = Some(work); }
+    PATCH_PENDING.store(true, Ordering::SeqCst);
+}
+
+pub fn save_patch_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
+    unsafe {
+        PATCH_REGS.x = regs.x;
+        PATCH_REGS.fp = regs.fp;
+        PATCH_REGS.lr = regs.lr;
+        PATCH_REGS.sp = regs.sp;
+        PATCH_REGS.pc = resume_pc;
+    }
+}
+
+pub fn set_patch_regs_x0(val: u64) {
+    unsafe { PATCH_REGS.x[0] = val; }
+}
+
+/// Create a patch trampoline page. Called from loader during init.
+pub fn create_patch_trampoline(near_addr: u64) {
+    let page_size: usize = 16384;
+    let ptr = unsafe {
+        libc::mmap(
+            near_addr as *mut _, page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        panic!("failed to allocate patch trampoline page");
+    }
+    let addr = ptr as u64;
+
+    let handler_addr = patch_trampoline_entry as *const () as u64;
+
+    let code: [u32; 2] = [
+        0x5800_0049, // ldr x9, [pc, #8]
+        0xD63F_0120, // blr x9
+    ];
+
+    unsafe {
+        let p = addr as *mut u32;
+        p.add(0).write(code[0]);
+        p.add(1).write(code[1]);
+        ((addr + 8) as *mut u64).write(handler_addr);
+        libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
+        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+        sys_icache_invalidate(ptr, page_size);
+    }
+
+    PATCH_TRAMPOLINE.store(addr, Ordering::SeqCst);
+}
+
+/// Called from the patch trampoline (outside signal context!). Does the deferred
+/// mprotect + pread + patch_new_code, restores registers, jumps to guest code.
+extern "C" fn patch_trampoline_entry() -> ! {
+    PATCH_PENDING.store(false, Ordering::SeqCst);
+    let work = unsafe { (*(&raw mut PENDING_PATCH)).take() }.expect("PATCH_PENDING but no work stored");
+
+    match work.kind {
+        PendingPatchKind::MprotectExec { aligned_addr, aligned_len, mac_prot } => {
+            unsafe {
+                libc::mprotect(
+                    aligned_addr as *mut _, aligned_len as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
+            }
+            crate::loader::patch_new_code(aligned_addr, aligned_len);
+            unsafe {
+                extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+                sys_icache_invalidate(aligned_addr as *mut _, aligned_len as usize);
+                libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot);
+            }
+        }
+    }
+
+    // Restore guest registers and resume execution
+    unsafe {
+        let r = &*(&raw const PATCH_REGS);
+        restore_all_regs(r as *const SavedRegs as u64, r.pc);
+    }
+}
+
 /// wait4(pid, wstatus, options, rusage)
 pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     let mut status: i32 = 0;
