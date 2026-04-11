@@ -919,38 +919,22 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         libc::write(2, msg.as_ptr() as *const _, msg.len());
     }
 
-    // If we're in a forked child (from signal handler), we can't execve
-    // directly because sigreturn is broken. Instead, this execve replaces
-    // the current process entirely — which works for the "last command"
-    // optimization in shells (exec without fork).
-    //
-    // For fork+exec: the fork child _exit'd(127), so the parent's wait4
-    // already reaped it. We're the PARENT now. We need to fork a fresh
-    // child (outside signal handler context) and exec there.
-    // But we're IN the signal handler... so let's try posix_spawn instead.
-    let mut pid: libc::pid_t = 0;
-    let ret = unsafe {
-        libc::posix_spawn(
-            &mut pid,
+    // Use real execve to replace the current process. Even though we're
+    // inside a SIGTRAP handler, execve replaces the entire process image
+    // so signal context doesn't matter — it never returns on success.
+    // This is critical for fork+exec in shells: the child must become the
+    // new program directly, inheriting the exact fd table (pipe redirections,
+    // dup2'd fds, etc.). Using posix_spawn would create an unnecessary
+    // grandchild process that doesn't inherit the child's fd setup.
+    unsafe {
+        libc::execve(
             self_exe_c.as_ptr(),
-            std::ptr::null(),   // file_actions
-            std::ptr::null(),   // attrp
             new_argv.as_ptr() as *const *mut i8,
             envp_to_use as *const *mut i8,
-        )
-    };
-    if ret != 0 {
-        return (-38_i64) as u64; // ENOSYS
+        );
     }
-    // Wait for the spawned child
-    let mut status: i32 = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0); }
-    // Return the child's exit status encoded as _exit would
-    if libc::WIFEXITED(status) {
-        // Child exited normally — call _exit with its status
-        unsafe { libc::_exit(libc::WEXITSTATUS(status)); }
-    }
-    unsafe { libc::_exit(127); }
+    // execve only returns on failure
+    translate::linux_errno()
 }
 
 // ─── Memory management ──────────────────────────────────────────────────────
