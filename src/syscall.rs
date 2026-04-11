@@ -605,6 +605,15 @@ fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
 }
 
 fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
+    // Linux-specific fcntl commands (>=1024) have no macOS equivalent.
+    // F_SETPIPE_SZ=1031, F_GETPIPE_SZ=1032, F_ADD_SEALS=1033, etc.
+    // Return -EINVAL — returning success with bogus values can confuse callers.
+    if linux_cmd >= 1024 {
+        return (-22_i64) as u64; // -EINVAL
+    }
+    // F_SETOWN_EX / F_GETOWN_EX
+    if linux_cmd == 15 { return 0; }
+    if linux_cmd == 16 { return (-22_i64) as u64; }
     if let Some(mac_cmd) = translate::translate_fcntl_cmd(linux_cmd) {
         let ret = unsafe { libc::fcntl(fd, mac_cmd, arg as i32) };
         if ret < 0 { translate::linux_errno() } else { ret as u64 }
