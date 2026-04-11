@@ -92,6 +92,7 @@ pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
 pub const SYS_EPOLL_PWAIT: u64 = 22;
 pub const SYS_STATX: u64 = 291;
+pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_MEMBARRIER: u64 = 283;
 

@@ -5,6 +5,7 @@ mod linux;
 mod loader;
 mod net;
 mod procfs;
+mod rootfs;
 mod signal;
 mod syscall;
 mod thread;
@@ -21,6 +22,7 @@ fn main() {
 
     let elf_path = &args[1];
     let sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
+    let rootfs = std::env::var("FAKELINUX_ROOT").unwrap_or_default();
 
     let data = std::fs::read(elf_path).unwrap_or_else(|e| {
         eprintln!("fakelinux: cannot read '{}': {}", elf_path, e);
@@ -41,6 +43,7 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE").is_ok() {
         syscall::set_trace(true);
     }
+    rootfs::init(&rootfs, &sysroot);
     syscall::init_sysroot(&sysroot);
     procfs::init(elf_path);
 

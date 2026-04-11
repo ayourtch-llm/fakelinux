@@ -102,6 +102,10 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/self/status" => Some(generate_status()),
         "/proc/self/stat" => Some(generate_stat()),
         "/proc/self/cmdline" => Some(generate_cmdline()),
+        "/proc/cpuinfo" => Some(generate_cpuinfo()),
+        "/proc/sys/kernel/osrelease" => Some(b"6.1.0-fakelinux\n".to_vec()),
+        "/proc/self/mountinfo" => Some(generate_mountinfo()),
+        "/proc/meminfo" => Some(generate_meminfo()),
         _ => {
             // /proc/self/fd/N → not a regular file open, ignore
             None
@@ -174,6 +178,85 @@ fn generate_cmdline() -> Vec<u8> {
         v.push(0);
         v
     })
+}
+
+fn generate_cpuinfo() -> Vec<u8> {
+    // Query the number of CPUs from macOS sysctl
+    let ncpus = {
+        let mut n: libc::c_int = 1;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let name = b"hw.ncpu\0";
+        unsafe {
+            libc::sysctlbyname(
+                name.as_ptr() as *const i8,
+                &mut n as *mut _ as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+        n.max(1) as u32
+    };
+
+    let mut out = String::new();
+    for i in 0..ncpus {
+        out.push_str(&format!(
+            "processor\t: {}\n\
+             BogoMIPS\t: 48.00\n\
+             Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics\n\
+             CPU implementer\t: 0x61\n\
+             CPU architecture: 8\n\
+             CPU variant\t: 0x0\n\
+             CPU part\t: 0xd00\n\
+             CPU revision\t: 0\n\n",
+            i
+        ));
+    }
+    out.into_bytes()
+}
+
+fn generate_mountinfo() -> Vec<u8> {
+    // Minimal /proc/self/mountinfo for programs that parse it
+    b"1 0 0:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+      2 1 0:2 / /proc rw,relatime - proc proc rw\n\
+      3 1 0:3 / /dev rw,relatime - devtmpfs devtmpfs rw\n\
+      4 1 0:4 / /tmp rw,relatime - tmpfs tmpfs rw\n"
+        .to_vec()
+}
+
+fn generate_meminfo() -> Vec<u8> {
+    // Query memory info from macOS sysctl
+    let mut memsize: u64 = 8 * 1024 * 1024 * 1024; // default 8GB
+    let mut len = std::mem::size_of::<u64>();
+    let name = b"hw.memsize\0";
+    unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut memsize as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+
+    let total_kb = memsize / 1024;
+    // Estimate free/available (rough approximation)
+    let free_kb = total_kb / 4;
+    let available_kb = total_kb / 2;
+    let buffers_kb = total_kb / 16;
+    let cached_kb = total_kb / 4;
+
+    format!(
+        "MemTotal:       {} kB\n\
+         MemFree:        {} kB\n\
+         MemAvailable:   {} kB\n\
+         Buffers:        {} kB\n\
+         Cached:         {} kB\n\
+         SwapTotal:      0 kB\n\
+         SwapFree:       0 kB\n",
+        total_kb, free_kb, available_kb, buffers_kb, cached_kb,
+    )
+    .into_bytes()
 }
 
 /// Handle readlink on /proc paths.

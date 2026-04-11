@@ -4,6 +4,7 @@ use crate::linux::*;
 use crate::loader;
 use crate::net;
 use crate::procfs;
+use crate::rootfs;
 use crate::signal;
 use crate::thread;
 use crate::translate;
@@ -25,6 +26,25 @@ pub fn init_sysroot(sysroot: &str) {
 
 fn get_sysroot() -> Option<&'static str> {
     SYSROOT.get().map(|s| s.as_str())
+}
+
+/// Translate a guest path pointer through the rootfs layer.
+/// Returns Some(CString) with the translated path if translation applies,
+/// or None if the original path should be used as-is.
+fn translate_guest_path(path_ptr: u64) -> Option<std::ffi::CString> {
+    let path = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const i8) };
+    rootfs::translate_path(path.to_bytes())
+        .map(|v| unsafe { std::ffi::CString::from_vec_with_nul_unchecked(v) })
+}
+
+/// Get the effective path pointer: translated if rootfs applies, otherwise original.
+fn effective_path_ptr(path_ptr: u64) -> (*const i8, Option<std::ffi::CString>) {
+    if let Some(translated) = translate_guest_path(path_ptr) {
+        let ptr = translated.as_ptr();
+        (ptr, Some(translated))
+    } else {
+        (path_ptr as *const i8, None)
+    }
 }
 
 /// Write a diagnostic message to stderr using raw write() — safe after fork.
@@ -174,26 +194,43 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_SETITIMER => 0, // stub success
         SYS_GETCWD => do_getcwd(args[0], args[1]),
         SYS_CHDIR => {
-            let ret = unsafe { libc::chdir(args[0] as *const i8) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            let (eff_path, _hold) = effective_path_ptr(args[0]);
+            let ret = unsafe { libc::chdir(eff_path) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() {
+                let ret2 = unsafe { libc::chdir(args[0] as *const i8) };
+                if ret2 < 0 { translate::linux_errno() } else { 0 }
+            } else { translate::linux_errno() }
         }
         SYS_FCHDIR => {
             let ret = unsafe { libc::fchdir(args[0] as i32) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         SYS_MKDIRAT => {
-            let ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            let (eff_path, _hold) = effective_path_ptr(args[1]);
+            let ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() {
+                let ret2 = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
+                if ret2 < 0 { translate::linux_errno() } else { 0 }
+            } else { translate::linux_errno() }
         }
         SYS_UNLINKAT => {
             let mac_flags = if args[2] & 0x200 != 0 { libc::AT_REMOVEDIR } else { 0 };
-            let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, mac_flags) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            let (eff_path, _hold) = effective_path_ptr(args[1]);
+            let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), eff_path, mac_flags) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() {
+                let ret2 = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, mac_flags) };
+                if ret2 < 0 { translate::linux_errno() } else { 0 }
+            } else { translate::linux_errno() }
         }
         SYS_RENAMEAT => {
+            let (eff_old, _hold_old) = effective_path_ptr(args[1]);
+            let (eff_new, _hold_new) = effective_path_ptr(args[3]);
             let ret = unsafe { libc::renameat(
-                translate::translate_dirfd(args[0] as i32), args[1] as *const i8,
-                translate::translate_dirfd(args[2] as i32), args[3] as *const i8,
+                translate::translate_dirfd(args[0] as i32), eff_old,
+                translate::translate_dirfd(args[2] as i32), eff_new,
             ) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
@@ -202,20 +239,31 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         SYS_FCHMODAT => {
-            let ret = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t, args[3] as i32) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            let (eff_path, _hold) = effective_path_ptr(args[1]);
+            let ret = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t, args[3] as i32) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() {
+                let ret2 = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t, args[3] as i32) };
+                if ret2 < 0 { translate::linux_errno() } else { 0 }
+            } else { translate::linux_errno() }
         }
         SYS_FCHOWN => {
             let ret = unsafe { libc::fchown(args[0] as i32, args[1] as u32, args[2] as u32) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         SYS_FCHOWNAT => {
-            let ret = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            let (eff_path, _hold) = effective_path_ptr(args[1]);
+            let ret = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as u32, args[3] as u32, args[4] as i32) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() {
+                let ret2 = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
+                if ret2 < 0 { translate::linux_errno() } else { 0 }
+            } else { translate::linux_errno() }
         }
         SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
         SYS_EXECVE => do_execve(args[0], args[1], args[2]),
         SYS_MEMBARRIER => do_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
+        SYS_STATFS => do_statfs(args[0], args[1]),
         SYS_FSTATFS => do_fstatfs(args[0] as i32, args[1]),
         _ => {
             raw_eprintln_fmt(format_args!(
@@ -255,38 +303,31 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         return fd as u64;
     }
 
+    // Always intercept /etc/ld.so.nohwcap — return ENOENT
+    if path.to_bytes() == b"/etc/ld.so.nohwcap" {
+        return (-2_i64) as u64; // -ENOENT
+    }
+
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_open_flags(linux_flags);
 
-    // Sysroot path translation for dynamic linker library paths
-    if let Some(sysroot) = get_sysroot() {
-        let path_bytes = path.to_bytes();
-        if let Ok(path_str) = std::str::from_utf8(path_bytes) {
-            // Intercept known library/config paths
-            if path_str == "/etc/ld.so.nohwcap" {
-                // Always return ENOENT for this
-                return (-2_i64) as u64; // -ENOENT
-            }
-            let should_translate = path_str.starts_with("/lib/")
-                || path_str.starts_with("/lib64/")
-                || path_str.starts_with("/usr/lib/")
-                || path_str.starts_with("/usr/lib64/")
-                || path_str.starts_with("/etc/ld.so.cache")
-                || path_str.starts_with("/etc/ld.so.conf");
-            if should_translate {
-                let translated = format!("{}{}\0", sysroot, path_str);
-                let translated_ptr = translated.as_ptr() as *const i8;
-                let ret = unsafe { libc::openat(mac_dirfd, translated_ptr, mac_flags, mode) };
-                if ret >= 0 {
-                    return ret as u64;
-                }
-                // Fall through to try the original path
-            }
+    // Translate path through rootfs layer
+    let (eff_path, _hold) = effective_path_ptr(pathname);
+
+    let ret = unsafe { libc::openat(mac_dirfd, eff_path, mac_flags, mode) };
+    if ret >= 0 {
+        return ret as u64;
+    }
+
+    // If translation was applied and the translated path failed, try the original
+    if _hold.is_some() {
+        let ret2 = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };
+        if ret2 >= 0 {
+            return ret2 as u64;
         }
     }
 
-    let ret = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    translate::linux_errno()
 }
 
 fn do_close(fd: i32) -> u64 {
@@ -327,40 +368,31 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
 
-    // Try sysroot translation for library paths
-    if let Some(sysroot) = get_sysroot() {
-        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
-        if let Ok(path_str) = std::str::from_utf8(path.to_bytes()) {
-            let should_translate = path_str.starts_with("/lib/")
-                || path_str.starts_with("/lib64/")
-                || path_str.starts_with("/usr/lib/")
-                || path_str.starts_with("/usr/lib64/")
-                || path_str.starts_with("/etc/ld.so.");
-            if should_translate {
-                let translated = format!("{}{}\0", sysroot, path_str);
-                let translated_ptr = translated.as_ptr() as *const i8;
-                unsafe {
-                    let mut mac_stat: libc::stat = std::mem::zeroed();
-                    let ret = libc::fstatat(mac_dirfd, translated_ptr, &mut mac_stat, mac_flags);
-                    if ret == 0 {
-                        translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
-                        return 0;
-                    }
-                }
-                // Fall through to original path
+    // Translate path through rootfs layer
+    let (eff_path, _hold) = effective_path_ptr(pathname);
+
+    unsafe {
+        let mut mac_stat: libc::stat = std::mem::zeroed();
+        let ret = libc::fstatat(mac_dirfd, eff_path, &mut mac_stat, mac_flags);
+        if ret == 0 {
+            translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
+            return 0;
+        }
+    }
+
+    // If translation was applied and failed, try original path
+    if _hold.is_some() {
+        unsafe {
+            let mut mac_stat: libc::stat = std::mem::zeroed();
+            let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
+            if ret == 0 {
+                translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
+                return 0;
             }
         }
     }
 
-    unsafe {
-        let mut mac_stat: libc::stat = std::mem::zeroed();
-        let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
-        if ret < 0 {
-            return translate::linux_errno();
-        }
-        translate::mac_stat_to_linux(&mac_stat, statbuf as *mut u8);
-    }
-    0
+    translate::linux_errno()
 }
 
 fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
@@ -435,32 +467,55 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
 
+    // AT_EMPTY_PATH (0x1000): operate on dirfd itself when pathname is empty
+    if linux_flags & 0x1000 != 0 {
+        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        if path.to_bytes().is_empty() {
+            unsafe {
+                let mut mac_stat: libc::stat = std::mem::zeroed();
+                let ret = libc::fstat(mac_dirfd, &mut mac_stat);
+                if ret < 0 { return translate::linux_errno(); }
+                translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
+            }
+            return 0;
+        }
+    }
+
+    let (eff_path, _hold) = effective_path_ptr(pathname);
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
-        // AT_EMPTY_PATH (0x1000): operate on dirfd itself when pathname is empty
-        let ret = if linux_flags & 0x1000 != 0 {
-            let path = std::ffi::CStr::from_ptr(pathname as *const i8);
-            if path.to_bytes().is_empty() {
-                libc::fstat(mac_dirfd, &mut mac_stat)
-            } else {
-                libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags)
-            }
-        } else {
-            libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags)
-        };
-        if ret < 0 {
-            return translate::linux_errno();
+        let ret = libc::fstatat(mac_dirfd, eff_path, &mut mac_stat, mac_flags);
+        if ret == 0 {
+            translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
+            return 0;
         }
-        translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
     }
-    0
+    // Fallback to original path if translated path failed
+    if _hold.is_some() {
+        unsafe {
+            let mut mac_stat: libc::stat = std::mem::zeroed();
+            let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
+            if ret == 0 {
+                translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
+                return 0;
+            }
+        }
+    }
+    translate::linux_errno()
 }
 
 fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) -> u64 {
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
-    let ret = unsafe { libc::faccessat(mac_dirfd, pathname as *const i8, mode, mac_flags) };
-    if ret < 0 { translate::linux_errno() } else { 0 }
+    let (eff_path, _hold) = effective_path_ptr(pathname);
+    let ret = unsafe { libc::faccessat(mac_dirfd, eff_path, mode, mac_flags) };
+    if ret == 0 { return 0; }
+    // Fallback to original if translated path failed
+    if _hold.is_some() {
+        let ret2 = unsafe { libc::faccessat(mac_dirfd, pathname as *const i8, mode, mac_flags) };
+        if ret2 == 0 { return 0; }
+    }
+    translate::linux_errno()
 }
 
 fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 {
@@ -472,10 +527,18 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
     }
 
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+    let (eff_path, _hold) = effective_path_ptr(pathname);
     let ret = unsafe {
-        libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
+        libc::readlinkat(mac_dirfd, eff_path, buf as *mut i8, bufsiz as usize)
     };
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    if ret >= 0 { return ret as u64; }
+    if _hold.is_some() {
+        let ret2 = unsafe {
+            libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
+        };
+        if ret2 >= 0 { return ret2 as u64; }
+    }
+    translate::linux_errno()
 }
 
 fn do_dup(fd: i32) -> u64 {
@@ -617,13 +680,19 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             // Direct /proc/self/exe → use our guest binary
             procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
         } else {
+            // Try rootfs-translated path first, then original
+            let check_path = if let Some(translated) = translate_guest_path(pathname) {
+                translated
+            } else {
+                std::ffi::CString::new(path_bytes).unwrap()
+            };
             // Check if the file is an ELF; if not, fall back to guest binary
             // (busybox sh finds /usr/bin/uname on macOS, which is Mach-O)
-            let is_elf = std::fs::read(path.to_str().unwrap_or(""))
+            let is_elf = std::fs::read(check_path.to_str().unwrap_or(""))
                 .map(|d| d.len() >= 4 && d[..4] == [0x7f, b'E', b'L', b'F'])
                 .unwrap_or(false);
             if is_elf {
-                std::ffi::CString::new(path_bytes).unwrap()
+                check_path
             } else {
                 procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
             }
@@ -1052,6 +1121,60 @@ fn do_membarrier(cmd: i32, _flags: u32, _cpu_id: i32) -> u64 {
     } else {
         (-38_i64) as u64 // -ENOSYS for all other commands
     }
+}
+
+fn do_statfs(pathname: u64, buf: u64) -> u64 {
+    let (eff_path, _hold) = effective_path_ptr(pathname);
+    unsafe {
+        let mut mac_statfs: libc::statfs = std::mem::zeroed();
+        let ret = libc::statfs(eff_path, &mut mac_statfs);
+        if ret == 0 {
+            let out = buf as *mut u8;
+            std::ptr::write_bytes(out, 0, 120);
+            let w64 = |off: usize, val: u64| {
+                (out.add(off) as *mut u64).write_unaligned(val);
+            };
+            w64(0, 0xEF53); // EXT4_SUPER_MAGIC
+            w64(8, mac_statfs.f_bsize as u64);
+            w64(16, mac_statfs.f_blocks as u64);
+            w64(24, mac_statfs.f_bfree as u64);
+            w64(32, mac_statfs.f_bavail as u64);
+            w64(40, mac_statfs.f_files as u64);
+            w64(48, mac_statfs.f_ffree as u64);
+            (out.add(56) as *mut u64).write_unaligned(0); // f_fsid
+            w64(64, 255); // f_namelen
+            w64(72, mac_statfs.f_bsize as u64); // f_frsize
+            w64(80, 0); // f_flags
+            return 0;
+        }
+    }
+    // Fallback to original path if translation failed
+    if _hold.is_some() {
+        unsafe {
+            let mut mac_statfs: libc::statfs = std::mem::zeroed();
+            let ret = libc::statfs(pathname as *const i8, &mut mac_statfs);
+            if ret == 0 {
+                let out = buf as *mut u8;
+                std::ptr::write_bytes(out, 0, 120);
+                let w64 = |off: usize, val: u64| {
+                    (out.add(off) as *mut u64).write_unaligned(val);
+                };
+                w64(0, 0xEF53);
+                w64(8, mac_statfs.f_bsize as u64);
+                w64(16, mac_statfs.f_blocks as u64);
+                w64(24, mac_statfs.f_bfree as u64);
+                w64(32, mac_statfs.f_bavail as u64);
+                w64(40, mac_statfs.f_files as u64);
+                w64(48, mac_statfs.f_ffree as u64);
+                (out.add(56) as *mut u64).write_unaligned(0);
+                w64(64, 255);
+                w64(72, mac_statfs.f_bsize as u64);
+                w64(80, 0);
+                return 0;
+            }
+        }
+    }
+    translate::linux_errno()
 }
 
 fn do_fstatfs(fd: i32, buf: u64) -> u64 {
