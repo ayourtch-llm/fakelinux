@@ -335,34 +335,11 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
     // Set up per-thread sigaltstack
     setup_thread_signal_stack();
 
-    // Jump to guest code with the saved registers.
-    // We use a pointer-based approach to avoid running out of registers:
-    // load a base pointer to the SavedRegs struct, then use LDP instructions
-    // to restore registers from memory offsets.
-    //
-    // SavedRegs layout: x[0..29] at offset 0, fp at 232, lr at 240, sp at 248, pc at 256
-    let regs_ptr = &args.saved_regs as *const SavedRegs as u64;
+    // Jump to guest code with all saved registers restored.
+    let regs_ptr = &args.saved_regs as *const SavedRegs;
+    let pc = args.saved_regs.pc;
     unsafe {
-        std::arch::asm!(
-            // x9 = base pointer to SavedRegs
-            // First restore callee-saved registers (x19-x28, fp, lr) from memory
-            "ldp x19, x20, [{base}, #152]", // x[19], x[20] at offsets 19*8=152, 20*8=160
-            "ldp x21, x22, [{base}, #168]",
-            "ldp x23, x24, [{base}, #184]",
-            "ldp x25, x26, [{base}, #200]",
-            "ldp x27, x28, [{base}, #216]",
-            // Load fp (offset 232) and lr (offset 240)
-            "ldp x29, x30, [{base}, #232]",
-            // Load sp (offset 248) and pc (offset 256) into temporaries
-            "ldr x10, [{base}, #248]",      // sp
-            "ldr x11, [{base}, #256]",      // pc
-            // Set SP and jump
-            "mov sp, x10",
-            "mov x0, #0",  // child return value = 0
-            "br x11",
-            base = in(reg) regs_ptr,
-            options(noreturn)
-        );
+        restore_all_regs(regs_ptr as u64, pc);
     }
 }
 
@@ -401,6 +378,52 @@ pub struct SavedRegs {
 static mut FORK_REGS: SavedRegs = SavedRegs {
     x: [0; 29], fp: 0, lr: 0, sp: 0, pc: 0,
 };
+
+/// Restore ALL guest registers from a SavedRegs struct and branch to `pc`.
+/// x0 = pointer to SavedRegs, x1 = branch target (guest pc).
+///
+/// Naked function — no prologue/epilogue, pure asm.
+/// SavedRegs layout: x[0..29] at offsets 0..228, fp@232, lr@240, sp@248, pc@256
+///
+/// Note: x16 (IP0) is used as the branch target and is NOT restored to its
+/// guest value. x16/x17 are intra-procedure-call scratch registers per AAPCS
+/// that are only used by PLT stubs and linker veneers, never by user code
+/// across function boundaries. All other registers (x0-x15, x17-x28, fp, lr, sp)
+/// are restored exactly.
+#[unsafe(naked)]
+unsafe extern "C" fn restore_all_regs(_regs_ptr: u64, _pc: u64) -> ! {
+    core::arch::naked_asm!(
+        // x0 = base (SavedRegs*), x1 = branch target (pc)
+        // Stash pc and guest_x17 below guest sp (32 bytes, 16-aligned)
+        "ldr x2, [x0, #248]",          // guest sp
+        "ldr x3, [x0, #136]",          // guest x17 at offset 17*8=136
+        "stp x1, x3, [x2, #-32]!",     // push [pc, guest_x17], x2 = sp-32
+        "mov sp, x2",                   // set sp to stash area
+        // Restore callee-saved x19-x28
+        "ldp x19, x20, [x0, #152]",
+        "ldp x21, x22, [x0, #168]",
+        "ldp x23, x24, [x0, #184]",
+        "ldp x25, x26, [x0, #200]",
+        "ldp x27, x28, [x0, #216]",
+        // Restore fp and lr
+        "ldp x29, x30, [x0, #232]",
+        // Restore caller-saved x1-x15, x18 (skip x16=branch scratch, x17=on stack)
+        "ldp x1, x2, [x0, #8]",
+        "ldp x3, x4, [x0, #24]",
+        "ldp x5, x6, [x0, #40]",
+        "ldp x7, x8, [x0, #56]",
+        "ldp x9, x10, [x0, #72]",
+        "ldp x11, x12, [x0, #88]",
+        "ldp x13, x14, [x0, #104]",
+        "ldr x15, [x0, #120]",         // x15 at 15*8=120
+        "ldr x18, [x0, #144]",         // x18 at 18*8=144
+        // Restore x0 last (clobbers base pointer)
+        "ldr x0, [x0]",
+        // Pop pc into x16 (branch scratch) and guest x17
+        "ldp x16, x17, [sp], #32",     // x16=pc, x17=guest_x17, sp+=32 (original guest sp)
+        "br x16",
+    );
+}
 
 /// Save guest registers for fork. Called from the signal handler.
 pub fn save_fork_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
@@ -489,35 +512,13 @@ extern "C" fn fork_trampoline_entry() -> ! {
 
     unsafe {
         let r = &*(&raw const FORK_REGS);
-        let x0_val = if pid == 0 { 0u64 } else { pid as u64 };
 
-        // Restore all callee-saved registers and jump to guest PC
-        std::arch::asm!(
-            "mov x19, {x19}",
-            "mov x20, {x20}",
-            "mov x21, {x21}",
-            "mov x22, {x22}",
-            "mov x23, {x23}",
-            "mov x24, {x24}",
-            "mov x25, {x25}",
-            "mov x26, {x26}",
-            "mov x27, {x27}",
-            "mov x28, {x28}",
-            "mov x29, {fp}",
-            "mov x30, {lr}",
-            "mov sp, {sp_val}",
-            "mov x0, {x0_val}",
-            "br {pc_val}",
-            x19 = in(reg) r.x[19], x20 = in(reg) r.x[20],
-            x21 = in(reg) r.x[21], x22 = in(reg) r.x[22],
-            x23 = in(reg) r.x[23], x24 = in(reg) r.x[24],
-            x25 = in(reg) r.x[25], x26 = in(reg) r.x[26],
-            x27 = in(reg) r.x[27], x28 = in(reg) r.x[28],
-            fp = in(reg) r.fp, lr = in(reg) r.lr,
-            sp_val = in(reg) r.sp, pc_val = in(reg) r.pc,
-            x0_val = in(reg) x0_val,
-            options(noreturn)
-        );
+        // Override x0 with fork return value directly in the saved regs.
+        // After fork, FORK_REGS is per-process so the parent won't use it again.
+        let regs_ptr = r as *const SavedRegs as *mut SavedRegs;
+        (*regs_ptr).x[0] = if pid == 0 { 0u64 } else { pid as u64 };
+
+        restore_all_regs(regs_ptr as u64, r.pc);
     }
 }
 

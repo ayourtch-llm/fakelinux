@@ -913,24 +913,17 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     extern "C" { static environ: *const *const i8; }
     let envp_to_use = unsafe { environ };
 
-    // Debug
-    unsafe {
-        let msg = format!("fakelinux: execve pid={} → {:?}\n", libc::getpid(), resolved_path);
-        libc::write(2, msg.as_ptr() as *const _, msg.len());
-    }
-
     // Use real execve to replace the current process. Even though we're
     // inside a SIGTRAP handler, execve replaces the entire process image
     // so signal context doesn't matter — it never returns on success.
     // This is critical for fork+exec in shells: the child must become the
     // new program directly, inheriting the exact fd table (pipe redirections,
-    // dup2'd fds, etc.). Using posix_spawn would create an unnecessary
-    // grandchild process that doesn't inherit the child's fd setup.
+    // dup2'd fds, etc.).
     unsafe {
         libc::execve(
             self_exe_c.as_ptr(),
-            new_argv.as_ptr() as *const *mut i8,
-            envp_to_use as *const *mut i8,
+            new_argv.as_ptr() as *const *const i8,
+            envp_to_use as *const *const i8,
         );
     }
     // execve only returns on failure
