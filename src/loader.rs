@@ -158,8 +158,7 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
 
     // Create fork and patch trampoline pages after the last segment
     let tramp_base = page_align_up(brk_end);
-    crate::thread::create_fork_trampoline(tramp_base);
-    crate::thread::create_patch_trampoline(tramp_base + PAGE_SIZE);
+    crate::thread::init_trampolines(tramp_base);
 
     // Initialize brk at the end of the last segment + both trampolines
     let brk_start = page_align_up(tramp_base + PAGE_SIZE * 2);

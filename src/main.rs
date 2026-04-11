@@ -11,6 +11,7 @@ mod signal;
 mod syscall;
 mod thread;
 mod translate;
+mod trampoline;
 mod trap;
 
 fn main() {

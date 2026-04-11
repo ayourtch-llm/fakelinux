@@ -198,33 +198,11 @@ unsafe extern "C" fn sigtrap_handler(
             mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];
 
-        // For fork (clone without CLONE_VM), save guest registers so the
-        // forked child can jump directly to guest code without sigreturn.
-        use crate::linux::SYS_CLONE;
-        if nr == SYS_CLONE && args[0] & 0x100 == 0 {
-            crate::thread::save_fork_regs(&mctx.ss, pc + 4);
-        }
-
         let result = syscall::emulate(nr, &args, mctx);
 
-        // Check if fork was requested — redirect sigreturn to trampoline
-        if crate::thread::FORK_PENDING.swap(false, Ordering::SeqCst) {
-            // Save the guest's return PC (after the clone SVC)
-            let guest_resume_pc = pc + 4;
-            crate::thread::save_fork_regs(&mctx.ss, guest_resume_pc);
-            // Redirect sigreturn to the fork trampoline
-            mctx.ss.pc = crate::thread::fork_trampoline_addr();
-            // Clear signal mask so SIGTRAP is unblocked after sigreturn
-            uctx.uc_sigmask = 0;
-        } else if crate::thread::PATCH_PENDING.load(Ordering::SeqCst) {
-            // mmap/mprotect needs deferred work (mprotect on file-backed pages
-            // from signal context deadlocks macOS). Save guest registers and
-            // redirect sigreturn to the patch trampoline.
-            let guest_resume_pc = pc + 4;
-            crate::thread::save_patch_regs(&mctx.ss, guest_resume_pc);
-            crate::thread::set_patch_regs_x0(result);
-            mctx.ss.pc = crate::thread::patch_trampoline_addr();
-            uctx.uc_sigmask = 0;
+        // Check if any trampoline was requested (fork, patch, etc.)
+        if crate::trampoline::check_and_redirect(mctx, uctx, result, pc + 4) {
+            // Trampoline activated — skip normal x0/pc update
         } else if result == crate::signal::SIGRETURN_SENTINEL {
             // rt_sigreturn: registers were already restored directly into mctx.
             // Don't overwrite x0 or pc.

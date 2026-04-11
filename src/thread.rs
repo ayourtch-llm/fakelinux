@@ -339,7 +339,7 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
     let regs_ptr = &args.saved_regs as *const SavedRegs;
     let pc = args.saved_regs.pc;
     unsafe {
-        restore_all_regs(regs_ptr as u64, pc);
+        trampoline::restore_all_regs(regs_ptr as u64, pc);
     }
 }
 
@@ -363,140 +363,37 @@ pub fn thread_exit(status: i32) -> ! {
     }
 }
 
-/// Saved guest register state for fork/clone. The signal handler copies the
-/// mcontext registers here before calling clone, so the forked child
-/// can jump to guest code with the correct register state.
-#[repr(C)]
-pub struct SavedRegs {
-    pub x: [u64; 29],
-    pub fp: u64,
-    pub lr: u64,
-    pub sp: u64,
-    pub pc: u64,
+// ─── Trampoline instances ────────────────────────────────────────────────────
+
+use crate::trampoline::{self, Trampoline, SavedRegs};
+
+/// Fork trampoline: defers fork() to outside signal context.
+pub static FORK: Trampoline = Trampoline::new();
+
+/// Patch trampoline: defers mprotect+patch on executable pages to outside
+/// signal context (mprotect from signal context deadlocks macOS).
+pub static PATCH: Trampoline = Trampoline::new();
+
+const PAGE_SIZE: u64 = 16384;
+
+/// Create both trampoline pages starting at `base_addr` and register them.
+/// Called from loader after mapping guest segments.
+pub fn init_trampolines(base_addr: u64) {
+    FORK.init(base_addr, fork_trampoline_entry);
+    PATCH.init(base_addr + PAGE_SIZE, patch_trampoline_entry);
 }
 
-static mut FORK_REGS: SavedRegs = SavedRegs {
-    x: [0; 29], fp: 0, lr: 0, sp: 0, pc: 0,
-};
+// ─── Fork trampoline ────────────────────────────────────────────────────────
 
-/// Restore ALL guest registers from a SavedRegs struct and branch to `pc`.
-/// x0 = pointer to SavedRegs, x1 = branch target (guest pc).
-///
-/// Naked function — no prologue/epilogue, pure asm.
-/// SavedRegs layout: x[0..29] at offsets 0..228, fp@232, lr@240, sp@248, pc@256
-///
-/// Note: x16 (IP0) is used as the branch target and is NOT restored to its
-/// guest value. x16/x17 are intra-procedure-call scratch registers per AAPCS
-/// that are only used by PLT stubs and linker veneers, never by user code
-/// across function boundaries. All other registers (x0-x15, x17-x28, fp, lr, sp)
-/// are restored exactly.
-#[unsafe(naked)]
-unsafe extern "C" fn restore_all_regs(_regs_ptr: u64, _pc: u64) -> ! {
-    core::arch::naked_asm!(
-        // x0 = base (SavedRegs*), x1 = branch target (pc)
-        // Stash pc and guest_x17 below guest sp (32 bytes, 16-aligned)
-        "ldr x2, [x0, #248]",          // guest sp
-        "ldr x3, [x0, #136]",          // guest x17 at offset 17*8=136
-        "stp x1, x3, [x2, #-32]!",     // push [pc, guest_x17], x2 = sp-32
-        "mov sp, x2",                   // set sp to stash area
-        // Restore callee-saved x19-x28
-        "ldp x19, x20, [x0, #152]",
-        "ldp x21, x22, [x0, #168]",
-        "ldp x23, x24, [x0, #184]",
-        "ldp x25, x26, [x0, #200]",
-        "ldp x27, x28, [x0, #216]",
-        // Restore fp and lr
-        "ldp x29, x30, [x0, #232]",
-        // Restore caller-saved x1-x15, x18 (skip x16=branch scratch, x17=on stack)
-        "ldp x1, x2, [x0, #8]",
-        "ldp x3, x4, [x0, #24]",
-        "ldp x5, x6, [x0, #40]",
-        "ldp x7, x8, [x0, #56]",
-        "ldp x9, x10, [x0, #72]",
-        "ldp x11, x12, [x0, #88]",
-        "ldp x13, x14, [x0, #104]",
-        "ldr x15, [x0, #120]",         // x15 at 15*8=120
-        "ldr x18, [x0, #144]",         // x18 at 18*8=144
-        // Restore x0 last (clobbers base pointer)
-        "ldr x0, [x0]",
-        // Pop pc into x16 (branch scratch) and guest x17
-        "ldp x16, x17, [sp], #32",     // x16=pc, x17=guest_x17, sp+=32 (original guest sp)
-        "br x16",
-    );
+fn do_fork(_flags: u64) -> u64 {
+    // Don't fork here (signal context). Mark pending and return a sentinel.
+    // The SIGTRAP handler will redirect sigreturn to the fork trampoline.
+    FORK.mark_pending();
+    0xFFFF_FFFF_0000_F0C0
 }
 
-/// Save guest registers for fork. Called from the signal handler.
-pub fn save_fork_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
-    unsafe {
-        FORK_REGS.x = regs.x;
-        FORK_REGS.fp = regs.fp;
-        FORK_REGS.lr = regs.lr;
-        FORK_REGS.sp = regs.sp;
-        FORK_REGS.pc = resume_pc;
-    }
-}
-
-/// Address of the fork trampoline (set during init).
-static FORK_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
-
-pub fn fork_trampoline_addr() -> u64 {
-    FORK_TRAMPOLINE.load(Ordering::SeqCst)
-}
-
-/// Create a fork trampoline page. Called from loader after mapping guest code.
-/// The trampoline does fork() via macOS SVC #0x80 (not our intercepted SVC #0),
-/// then restores guest registers and jumps to the saved guest PC.
-pub fn create_fork_trampoline(near_addr: u64) {
-    let page_size: usize = 16384;
-    let ptr = unsafe {
-        libc::mmap(
-            near_addr as *mut _, page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        panic!("failed to allocate fork trampoline page");
-    }
-    let addr = ptr as u64;
-
-    // The trampoline calls our Rust fork_trampoline_entry via BLR,
-    // which does the actual fork and register restore.
-    let handler_addr = fork_trampoline_entry as *const () as u64;
-
-    // Code: ldr x9, [pc, #8]; blr x9; (never returns)
-    // Data: .quad handler_addr
-    let code: [u32; 3] = [
-        0x5800_0049, // ldr x9, [pc, #8]  -> loads from byte 12... not aligned!
-        0xD63F_0120, // blr x9
-        0xD503_201F, // nop (padding)
-    ];
-    // Wait, data at byte 12 is not 8-aligned. Use:
-    //   0: ldr x9, [pc, #8] -> byte 8
-    //   4: blr x9
-    //   8: .quad handler_addr
-    // ldr at 0, data at 8: offset=8, imm19=2 -> 0x58000040 | 9 = 0x58000049
-    let code: [u32; 2] = [
-        0x5800_0049, // ldr x9, [pc, #8]
-        0xD63F_0120, // blr x9
-    ];
-    let _ = code;
-
-    unsafe {
-        let p = addr as *mut u32;
-        p.add(0).write(code[0]);
-        p.add(1).write(code[1]);
-        ((addr + 8) as *mut u64).write(handler_addr);
-        libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
-        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
-        sys_icache_invalidate(ptr, page_size);
-    }
-
-    FORK_TRAMPOLINE.store(addr, Ordering::SeqCst);
-}
-
-/// Called from the fork trampoline (outside signal context!). Does fork,
-/// restores registers, jumps to guest code.
+/// Runs outside signal context. Does the actual fork, sets x0 to the pid,
+/// restores guest registers, and jumps back to guest code.
 extern "C" fn fork_trampoline_entry() -> ! {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -504,44 +401,16 @@ extern "C" fn fork_trampoline_entry() -> ! {
     }
 
     if pid == 0 {
-        // Child: fully re-initialize the signal handling environment.
-        // Allocates a fresh alt stack, re-installs SIGTRAP handler,
-        // and unblocks all signals before returning to guest code.
+        // Child: re-initialize signal handling (fresh alt stack, re-install
+        // SIGTRAP handler, unblock signals).
         crate::trap::init_child_after_fork();
     }
 
-    unsafe {
-        let r = &*(&raw const FORK_REGS);
-
-        // Override x0 with fork return value directly in the saved regs.
-        // After fork, FORK_REGS is per-process so the parent won't use it again.
-        let regs_ptr = r as *const SavedRegs as *mut SavedRegs;
-        (*regs_ptr).x[0] = if pid == 0 { 0u64 } else { pid as u64 };
-
-        restore_all_regs(regs_ptr as u64, r.pc);
-    }
+    FORK.set_x0(if pid == 0 { 0 } else { pid as u64 });
+    unsafe { FORK.restore_and_resume(); }
 }
 
-/// Signal the trap handler that a fork is pending. The handler will
-/// redirect sigreturn to a trampoline that calls fork() outside signal context.
-pub static FORK_PENDING: AtomicBool = AtomicBool::new(false);
-
-fn do_fork(_flags: u64) -> u64 {
-    // Don't fork here (signal context). Set a flag and return a sentinel.
-    // The signal handler will redirect to the fork trampoline.
-    FORK_PENDING.store(true, Ordering::SeqCst);
-    // Return value doesn't matter -- the handler will override x0
-    0xFFFF_FFFF_0000_F0C0
-}
-
-// ─── Patch trampoline (deferred mprotect/pread/patch outside signal context) ──
-//
-// On macOS, calling mprotect on file-backed pages from inside a signal handler
-// causes a kernel deadlock (uninterruptible sleep). We use the same trampoline
-// pattern as fork: store the pending work, redirect sigreturn to a trampoline
-// page that runs outside signal context, do the mprotect+pread+patch there.
-
-pub static PATCH_PENDING: AtomicBool = AtomicBool::new(false);
+// ─── Patch trampoline ────────────────────────────────────────────────────────
 
 pub enum PendingPatchKind {
     /// mprotect adding PROT_EXEC: mprotect→RW, patch, icache, mprotect→final
@@ -558,75 +427,16 @@ pub struct PendingPatchWork {
 
 static mut PENDING_PATCH: Option<PendingPatchWork> = None;
 
-static mut PATCH_REGS: SavedRegs = SavedRegs {
-    x: [0; 29], fp: 0, lr: 0, sp: 0, pc: 0,
-};
-
-static PATCH_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
-
-pub fn patch_trampoline_addr() -> u64 {
-    PATCH_TRAMPOLINE.load(Ordering::SeqCst)
-}
-
 pub fn set_pending_patch(work: PendingPatchWork) {
     unsafe { *(&raw mut PENDING_PATCH) = Some(work); }
-    PATCH_PENDING.store(true, Ordering::SeqCst);
+    PATCH.mark_pending();
 }
 
-pub fn save_patch_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
-    unsafe {
-        PATCH_REGS.x = regs.x;
-        PATCH_REGS.fp = regs.fp;
-        PATCH_REGS.lr = regs.lr;
-        PATCH_REGS.sp = regs.sp;
-        PATCH_REGS.pc = resume_pc;
-    }
-}
-
-pub fn set_patch_regs_x0(val: u64) {
-    unsafe { PATCH_REGS.x[0] = val; }
-}
-
-/// Create a patch trampoline page. Called from loader during init.
-pub fn create_patch_trampoline(near_addr: u64) {
-    let page_size: usize = 16384;
-    let ptr = unsafe {
-        libc::mmap(
-            near_addr as *mut _, page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        panic!("failed to allocate patch trampoline page");
-    }
-    let addr = ptr as u64;
-
-    let handler_addr = patch_trampoline_entry as *const () as u64;
-
-    let code: [u32; 2] = [
-        0x5800_0049, // ldr x9, [pc, #8]
-        0xD63F_0120, // blr x9
-    ];
-
-    unsafe {
-        let p = addr as *mut u32;
-        p.add(0).write(code[0]);
-        p.add(1).write(code[1]);
-        ((addr + 8) as *mut u64).write(handler_addr);
-        libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
-        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
-        sys_icache_invalidate(ptr, page_size);
-    }
-
-    PATCH_TRAMPOLINE.store(addr, Ordering::SeqCst);
-}
-
-/// Called from the patch trampoline (outside signal context!). Does the deferred
-/// mprotect + pread + patch_new_code, restores registers, jumps to guest code.
+/// Runs outside signal context. Does the deferred mprotect + patch_new_code,
+/// restores guest registers, and jumps back to guest code.
 extern "C" fn patch_trampoline_entry() -> ! {
-    PATCH_PENDING.store(false, Ordering::SeqCst);
-    let work = unsafe { (*(&raw mut PENDING_PATCH)).take() }.expect("PATCH_PENDING but no work stored");
+    let work = unsafe { (*(&raw mut PENDING_PATCH)).take() }
+        .expect("patch trampoline but no work stored");
 
     match work.kind {
         PendingPatchKind::MprotectExec { aligned_addr, aligned_len, mac_prot } => {
@@ -645,11 +455,7 @@ extern "C" fn patch_trampoline_entry() -> ! {
         }
     }
 
-    // Restore guest registers and resume execution
-    unsafe {
-        let r = &*(&raw const PATCH_REGS);
-        restore_all_regs(r as *const SavedRegs as u64, r.pc);
-    }
+    unsafe { PATCH.restore_and_resume(); }
 }
 
 /// wait4(pid, wstatus, options, rusage)
