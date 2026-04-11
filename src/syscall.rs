@@ -194,7 +194,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_GETGROUPS => creds::do_getgroups(args[0] as u32, args[1]),
         SYS_SETPRIORITY => 0, // stub success
         SYS_GETPRIORITY => 20, // default nice value
-        SYS_SETITIMER => 0, // stub success
+        SYS_SETITIMER => do_setitimer(args[0] as i32, args[1], args[2]),
         SYS_GETCWD => do_getcwd(args[0], args[1]),
         SYS_CHDIR => {
             let (eff_path, _hold) = effective_path_ptr(args[0]);
@@ -304,6 +304,40 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let ret = unsafe { libc::getsid(args[0] as i32) };
             if ret < 0 { translate::linux_errno() } else { ret as u64 }
         }
+        SYS_FSYNC => {
+            let ret = unsafe { libc::fsync(args[0] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FDATASYNC => {
+            // macOS doesn't have fdatasync; use fsync
+            let ret = unsafe { libc::fsync(args[0] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_SYNC => {
+            unsafe { libc::sync() };
+            0
+        }
+        SYS_FALLOCATE => do_fallocate(args[0] as i32, args[1] as i32, args[2] as i64, args[3] as i64),
+        SYS_MSYNC => {
+            let ret = unsafe { libc::msync(args[0] as *mut libc::c_void, args[1] as usize, args[2] as i32) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_MLOCK => {
+            let ret = unsafe { libc::mlock(args[0] as *const libc::c_void, args[1] as usize) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_MUNLOCK => {
+            let ret = unsafe { libc::munlock(args[0] as *const libc::c_void, args[1] as usize) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_PERSONALITY => {
+            // personality(PER_LINUX=0) — just return current (0)
+            if args[0] == 0xFFFFFFFF { 0 } else { 0 }
+        }
+        SYS_SIGALTSTACK => do_guest_sigaltstack(args[0], args[1]),
+        SYS_RENAMEAT2 => do_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
+        SYS_MEMFD_CREATE => do_memfd_create(args[0], args[1] as u32),
+        SYS_COPY_FILE_RANGE => do_copy_file_range(args[0] as i32, args[1], args[2] as i32, args[3], args[4], args[5] as u32),
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -1882,4 +1916,217 @@ fn translate_clock_id(linux_clk: i32) -> libc::clockid_t {
         7 => libc::CLOCK_MONOTONIC,       // CLOCK_BOOTTIME → MONOTONIC
         _ => libc::CLOCK_REALTIME,
     }
+}
+
+fn do_setitimer(which: i32, new_value_ptr: u64, old_value_ptr: u64) -> u64 {
+    // Linux and macOS itimerval have identical layout on 64-bit:
+    // struct itimerval { struct timeval it_interval; struct timeval it_value; }
+    // struct timeval { long tv_sec; long tv_usec; }
+    // ITIMER_REAL=0, ITIMER_VIRTUAL=1, ITIMER_PROF=2 are the same on both.
+    let new_ptr = if new_value_ptr != 0 {
+        new_value_ptr as *const libc::itimerval
+    } else {
+        std::ptr::null()
+    };
+    let old_ptr = if old_value_ptr != 0 {
+        old_value_ptr as *mut libc::itimerval
+    } else {
+        std::ptr::null_mut()
+    };
+    let ret = unsafe { libc::setitimer(which, new_ptr, old_ptr) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> u64 {
+    // macOS doesn't have fallocate. Mode 0 = allocate space.
+    // Use ftruncate for basic allocation, or just succeed for FALLOC_FL_KEEP_SIZE.
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+
+    if mode == 0 {
+        // Extend file if needed
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstat(fd, &mut st) };
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        let end = offset + len;
+        if end > st.st_size as i64 {
+            let ret = unsafe { libc::ftruncate(fd, end as libc::off_t) };
+            if ret < 0 { return translate::linux_errno(); }
+        }
+        0
+    } else if mode & FALLOC_FL_KEEP_SIZE != 0 && mode & FALLOC_FL_PUNCH_HOLE == 0 {
+        // Pre-allocate but don't change size — best-effort success
+        0
+    } else {
+        // PUNCH_HOLE etc. not supported
+        (-95_i64) as u64 // -EOPNOTSUPP
+    }
+}
+
+fn do_guest_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+    // Linux sigaltstack: struct { void *ss_sp; int ss_flags; size_t ss_size; }
+    // We store the guest's sigaltstack in thread-local state.
+    // For now, just report "not active" and accept the set.
+    use crate::signal;
+
+    if old_ss_ptr != 0 {
+        let old = old_ss_ptr as *mut u8;
+        unsafe {
+            let (sp, flags, size) = signal::get_guest_sigaltstack();
+            (old as *mut u64).write_unaligned(sp);
+            (old.add(8) as *mut i32).write_unaligned(flags);
+            // pad 4 bytes
+            (old.add(16) as *mut u64).write_unaligned(size);
+        }
+    }
+    if ss_ptr != 0 {
+        let ss = ss_ptr as *const u8;
+        unsafe {
+            let sp = (ss as *const u64).read_unaligned();
+            let flags = (ss.add(8) as *const i32).read_unaligned();
+            let size = (ss.add(16) as *const u64).read_unaligned();
+            signal::set_guest_sigaltstack(sp, flags, size);
+        }
+    }
+    0
+}
+
+fn do_renameat2(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags: u32) -> u64 {
+    const RENAME_NOREPLACE: u32 = 1;
+    const RENAME_EXCHANGE: u32 = 2;
+
+    let old_cstr = oldpath as *const libc::c_char;
+    let new_cstr = newpath as *const libc::c_char;
+    let mac_olddir = translate::translate_dirfd(olddirfd);
+    let mac_newdir = translate::translate_dirfd(newdirfd);
+
+    if flags == 0 {
+        // Plain rename
+        let ret = unsafe { libc::renameat(mac_olddir, old_cstr, mac_newdir, new_cstr) };
+        if ret < 0 { translate::linux_errno() } else { 0 }
+    } else if flags == RENAME_NOREPLACE {
+        // Check destination doesn't exist first, then rename
+        let ret = unsafe { libc::faccessat(mac_newdir, new_cstr, libc::F_OK, 0) };
+        if ret == 0 {
+            return (-17_i64) as u64; // -EEXIST
+        }
+        let ret = unsafe { libc::renameat(mac_olddir, old_cstr, mac_newdir, new_cstr) };
+        if ret < 0 { translate::linux_errno() } else { 0 }
+    } else if flags == RENAME_EXCHANGE {
+        // macOS has renamex_np with RENAME_SWAP
+        #[cfg(target_os = "macos")]
+        {
+            const RENAME_SWAP: u32 = 2;
+            extern "C" {
+                fn renamex_np(from: *const libc::c_char, to: *const libc::c_char, flags: u32) -> libc::c_int;
+            }
+            // renamex_np doesn't support *at variants, so resolve paths
+            // For now, only support AT_FDCWD
+            if olddirfd != libc::AT_FDCWD || newdirfd != libc::AT_FDCWD {
+                return (-38_i64) as u64; // -ENOSYS
+            }
+            let ret = unsafe { renamex_np(old_cstr, new_cstr, RENAME_SWAP) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (-38_i64) as u64 // -ENOSYS
+        }
+    } else {
+        (-22_i64) as u64 // -EINVAL
+    }
+}
+
+fn do_memfd_create(name: u64, flags: u32) -> u64 {
+    // macOS doesn't have memfd_create. Emulate with a temp file, unlinked immediately.
+    // shm_open doesn't auto-extend on write, so use a real tmpfile instead.
+    let _ = name;
+
+    let template = std::ffi::CString::new("/tmp/fakelinux_memfd_XXXXXX").unwrap();
+    let buf = template.into_bytes_with_nul();
+    let mut buf = buf.to_vec();
+
+    let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
+    if fd < 0 {
+        return translate::linux_errno();
+    }
+    // Unlink immediately — fd stays valid, file becomes anonymous
+    unsafe { libc::unlink(buf.as_ptr() as *const libc::c_char); }
+
+    // Set FD_CLOEXEC if MFD_CLOEXEC (1)
+    if flags & 1 != 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC); }
+    }
+
+    fd as u64
+}
+
+fn do_copy_file_range(fd_in: i32, off_in_ptr: u64, fd_out: i32, off_out_ptr: u64, len: u64, flags: u32) -> u64 {
+    if flags != 0 {
+        return (-22_i64) as u64; // -EINVAL
+    }
+
+    // Read offset_in
+    let mut off_in: i64 = -1;
+    if off_in_ptr != 0 {
+        off_in = unsafe { (off_in_ptr as *const i64).read_unaligned() };
+    }
+
+    let mut off_out: i64 = -1;
+    if off_out_ptr != 0 {
+        off_out = unsafe { (off_out_ptr as *const i64).read_unaligned() };
+    }
+
+    // Use sendfile on macOS as a fallback, or just read+write
+    let buf_size = std::cmp::min(len as usize, 64 * 1024);
+    let mut buf = vec![0u8; buf_size];
+    let mut total: usize = 0;
+    let mut remaining = len as usize;
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(remaining, buf_size);
+        let nread = if off_in >= 0 {
+            let r = unsafe { libc::pread(fd_in, buf.as_mut_ptr() as *mut libc::c_void, chunk, off_in as libc::off_t) };
+            if r > 0 { off_in += r as i64; }
+            r
+        } else {
+            unsafe { libc::read(fd_in, buf.as_mut_ptr() as *mut libc::c_void, chunk) }
+        };
+
+        if nread < 0 {
+            if total > 0 { break; }
+            return translate::linux_errno();
+        }
+        if nread == 0 { break; }
+
+        let mut written = 0usize;
+        while written < nread as usize {
+            let nwritten = if off_out >= 0 {
+                let w = unsafe { libc::pwrite(fd_out, buf[written..].as_ptr() as *const libc::c_void, nread as usize - written, off_out as libc::off_t) };
+                if w > 0 { off_out += w as i64; }
+                w
+            } else {
+                unsafe { libc::write(fd_out, buf[written..].as_ptr() as *const libc::c_void, nread as usize - written) }
+            };
+            if nwritten < 0 {
+                if total > 0 { break; }
+                return translate::linux_errno();
+            }
+            written += nwritten as usize;
+        }
+        total += nread as usize;
+        remaining -= nread as usize;
+    }
+
+    // Write back offsets
+    if off_in_ptr != 0 {
+        unsafe { (off_in_ptr as *mut i64).write_unaligned(off_in); }
+    }
+    if off_out_ptr != 0 {
+        unsafe { (off_out_ptr as *mut i64).write_unaligned(off_out); }
+    }
+
+    total as u64
 }

@@ -9,6 +9,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Address of the sigreturn trampoline (executable page with mov x8,#139; brk #0xf000).
 static SIGRETURN_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
 
+// Guest sigaltstack state (per-thread via thread_local)
+use std::cell::Cell;
+thread_local! {
+    static GUEST_ALTSTACK_SP: Cell<u64> = const { Cell::new(0) };
+    static GUEST_ALTSTACK_FLAGS: Cell<i32> = const { Cell::new(2) }; // SS_DISABLE
+    static GUEST_ALTSTACK_SIZE: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn get_guest_sigaltstack() -> (u64, i32, u64) {
+    GUEST_ALTSTACK_SP.with(|sp| {
+        GUEST_ALTSTACK_FLAGS.with(|flags| {
+            GUEST_ALTSTACK_SIZE.with(|size| {
+                (sp.get(), flags.get(), size.get())
+            })
+        })
+    })
+}
+
+pub fn set_guest_sigaltstack(sp: u64, flags: i32, size: u64) {
+    GUEST_ALTSTACK_SP.with(|s| s.set(sp));
+    GUEST_ALTSTACK_FLAGS.with(|f| f.set(flags));
+    GUEST_ALTSTACK_SIZE.with(|s| s.set(size));
+}
+
 /// Guest signal handler entry.
 #[derive(Clone, Copy)]
 pub struct GuestSigaction {

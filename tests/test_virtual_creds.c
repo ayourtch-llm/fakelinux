@@ -137,49 +137,38 @@ static void test_gid_family(void) {
 // Test 6: setgroups / getgroups
 static void test_groups(void) {
     long ret;
-    unsigned int groups[4] = {10, 27, 100, 1000}; // wheel, sudo, users, staff
 
-    // As virtual root for gid (well, gid is 500 now but euid controls caps)
-    // Actually euid is 1000 (non-root), but we allow setgroups based on
-    // virtual egid... let's just test that the syscall exists and works
-    // when starting from a root-like state.
-    // Since our uid is non-root now, setgroups might fail. Let's just test getgroups.
+    // euid is 1000 (non-root) at this point, so setgroups will fail (-EPERM).
+    // Just verify getgroups works and setgroups rejects gracefully.
 
     // getgroups with size=0 returns count
     ret = syscall(SYS_GETGROUPS, 0, (void*)0);
     check("getgroups(0) returns >= 0", ret >= 0);
 
-    // If we're virtual root for groups, setgroups should work
-    // (depends on implementation - might check euid)
-    ret = syscall(SYS_SETGROUPS, 4, groups);
-    // Don't check return - might fail if non-root. Just verify it doesn't crash.
-
-    if (ret == 0) {
-        unsigned int got[4] = {0};
-        ret = syscall(SYS_GETGROUPS, 4, got);
-        check("getgroups returns 4 after setgroups", ret == 4);
-        check("group[0] == 10", got[0] == 10);
-        check("group[1] == 27", got[1] == 27);
-        check("group[2] == 100", got[2] == 100);
-        check("group[3] == 1000", got[3] == 1000);
-    }
+    // setgroups should fail with -EPERM since euid != 0
+    unsigned int groups[2] = {10, 27};
+    ret = syscall(SYS_SETGROUPS, 2, groups);
+    check("setgroups fails when non-root", ret == -1);
 }
 
 // Test 7: setfsuid / setfsgid
 static void test_fsuid(void) {
     long ret;
 
-    // setfsuid returns the PREVIOUS fsuid
-    ret = syscall(SYS_SETFSUID, 2000);
+    // setfsuid returns the PREVIOUS fsuid (always, even if change is denied)
+    // After setuid(1000), fsuid=1000. euid=1000, so we can only set fsuid to
+    // {uid=1000, euid=1000, suid=1000, fsuid=1000}.
+    ret = syscall(SYS_SETFSUID, 1000);
     // Previous fsuid should be our euid (1000 from earlier tests)
     check("setfsuid returns previous fsuid", ret == 1000);
 
-    // Call again - should return the value we just set
-    ret = syscall(SYS_SETFSUID, 2000);
-    check("setfsuid(same) returns 2000", ret == 2000);
+    // Call again with same value - should return 1000
+    ret = syscall(SYS_SETFSUID, 1000);
+    check("setfsuid(same) returns 1000", ret == 1000);
 
-    // setfsgid similarly
-    ret = syscall(SYS_SETFSGID, 3000);
+    // setfsgid: after setgid_family, egid=fsgid=500. But euid is 1000 (non-root),
+    // so we can only set fsgid to {gid, egid, sgid, fsgid} = {500, 500, 500, 500}.
+    ret = syscall(SYS_SETFSGID, 500);
     // Previous fsgid should be our egid (500 from test_gid_family)
     check("setfsgid returns previous fsgid", ret == 500);
 }
@@ -201,9 +190,9 @@ static void test_setreuid(void) {
 int main(void) {
     test_virtual_root();
     test_getres();
-    test_setuid_setgid();
+    test_gid_family();   // Must run before uid-dropping tests (needs euid==0)
+    test_setuid_setgid(); // Drops euid to 1000
     test_setresuid();
-    test_gid_family();
     test_groups();
     test_fsuid();
     test_setreuid();
