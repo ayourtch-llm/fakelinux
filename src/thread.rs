@@ -222,19 +222,127 @@ pub fn save_fork_regs(regs: &crate::trap::ThreadState64, resume_pc: u64) {
     }
 }
 
-/// Fork using macOS fork(). The child jumps directly to guest code
-/// bypassing sigreturn (which crashes in forked children from signal handlers).
+/// Address of the fork trampoline (set during init).
+static FORK_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+
+pub fn fork_trampoline_addr() -> u64 {
+    FORK_TRAMPOLINE.load(Ordering::SeqCst)
+}
+
+/// Create a fork trampoline page. Called from loader after mapping guest code.
+/// The trampoline does fork() via macOS SVC #0x80 (not our intercepted SVC #0),
+/// then restores guest registers and jumps to the saved guest PC.
+pub fn create_fork_trampoline(near_addr: u64) {
+    let page_size: usize = 16384;
+    let ptr = unsafe {
+        libc::mmap(
+            near_addr as *mut _, page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        panic!("failed to allocate fork trampoline page");
+    }
+    let addr = ptr as u64;
+
+    // The trampoline calls our Rust fork_trampoline_entry via BLR,
+    // which does the actual fork and register restore.
+    let handler_addr = fork_trampoline_entry as *const () as u64;
+
+    // Code: ldr x9, [pc, #8]; blr x9; (never returns)
+    // Data: .quad handler_addr
+    let code: [u32; 3] = [
+        0x5800_0049, // ldr x9, [pc, #8]  → loads from byte 12... not aligned!
+        0xD63F_0120, // blr x9
+        0xD503_201F, // nop (padding)
+    ];
+    // Wait, data at byte 12 is not 8-aligned. Use:
+    //   0: ldr x9, [pc, #8] → byte 8
+    //   4: blr x9
+    //   8: .quad handler_addr
+    // ldr at 0, data at 8: offset=8, imm19=2 → 0x58000040 | 9 = 0x58000049
+    let code: [u32; 2] = [
+        0x5800_0049, // ldr x9, [pc, #8]
+        0xD63F_0120, // blr x9
+    ];
+
+    unsafe {
+        let p = addr as *mut u32;
+        p.add(0).write(code[0]);
+        p.add(1).write(code[1]);
+        ((addr + 8) as *mut u64).write(handler_addr);
+        libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
+        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+        sys_icache_invalidate(ptr, page_size);
+    }
+
+    FORK_TRAMPOLINE.store(addr, Ordering::SeqCst);
+}
+
+/// Called from the fork trampoline (outside signal context!). Does fork,
+/// restores registers, jumps to guest code.
+extern "C" fn fork_trampoline_entry() -> ! {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::_exit(127); }
+    }
+
+    unsafe {
+        let r = &FORK_REGS;
+        let x0_val = if pid == 0 { 0u64 } else { pid as u64 };
+
+        // Restore all callee-saved registers and jump to guest PC
+        std::arch::asm!(
+            "mov x19, {x19}",
+            "mov x20, {x20}",
+            "mov x21, {x21}",
+            "mov x22, {x22}",
+            "mov x23, {x23}",
+            "mov x24, {x24}",
+            "mov x25, {x25}",
+            "mov x26, {x26}",
+            "mov x27, {x27}",
+            "mov x28, {x28}",
+            "mov x29, {fp}",
+            "mov x30, {lr}",
+            "mov sp, {sp_val}",
+            "mov x0, {x0_val}",
+            "br {pc_val}",
+            x19 = in(reg) r.x[19], x20 = in(reg) r.x[20],
+            x21 = in(reg) r.x[21], x22 = in(reg) r.x[22],
+            x23 = in(reg) r.x[23], x24 = in(reg) r.x[24],
+            x25 = in(reg) r.x[25], x26 = in(reg) r.x[26],
+            x27 = in(reg) r.x[27], x28 = in(reg) r.x[28],
+            fp = in(reg) r.fp, lr = in(reg) r.lr,
+            sp_val = in(reg) r.sp, pc_val = in(reg) r.pc,
+            x0_val = in(reg) x0_val,
+            options(noreturn)
+        );
+    }
+}
+
+/// Signal the trap handler that a fork is pending. The handler will
+/// redirect sigreturn to a trampoline that calls fork() outside signal context.
+pub static FORK_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn do_fork(_flags: u64) -> u64 {
+    // Don't fork here (signal context). Set a flag and return a sentinel.
+    // The signal handler will redirect to the fork trampoline.
+    FORK_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Return value doesn't matter — the handler will override x0
+    0xFFFF_FFFF_0000_F0C0
+}
+
+#[allow(dead_code)]
+fn do_fork_old(_flags: u64) -> u64 {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return crate::translate::linux_errno();
     }
     if pid == 0 {
-        // Child: can't run guest code after fork-from-signal-handler
-        // (SIGTRAP delivery broken despite handler reinstall + unblock).
-        // _exit(127) — parent wait4 picks it up, shell continues.
-        // Single-command `sh -c 'cmd'` works via exec optimization.
-        unsafe { libc::_exit(127); }
+        // This code should never run — fork is handled via trampoline now
+        unreachable!("fork child reached old code path");
 
         #[allow(unreachable_code)]
         unsafe {

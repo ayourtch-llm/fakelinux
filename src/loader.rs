@@ -119,8 +119,11 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         eprintln!("fakelinux: interpreter loaded at {:#x}, entry={:#x}", interp_base, interp_entry);
     }
 
-    // Initialize brk at the end of the last segment, page-aligned
-    let brk_start = page_align_up(brk_end);
+    // Create fork trampoline page after the last segment
+    crate::thread::create_fork_trampoline(page_align_up(brk_end));
+
+    // Initialize brk at the end of the last segment + trampoline
+    let brk_start = page_align_up(page_align_up(brk_end) + 16384);
     syscall::BRK_CURRENT.store(brk_start, std::sync::atomic::Ordering::SeqCst);
 
     // Record the heap in procfs mappings

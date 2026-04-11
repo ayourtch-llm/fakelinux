@@ -139,8 +139,20 @@ unsafe extern "C" fn sigtrap_handler(
         }
 
         let result = syscall::emulate(nr, &args, regs);
-        regs.x[0] = result as u64;
-        regs.pc = pc + 4;
+
+        // Check if fork was requested — redirect sigreturn to trampoline
+        if crate::thread::FORK_PENDING.swap(false, Ordering::SeqCst) {
+            // Save the guest's return PC (after the clone SVC)
+            let guest_resume_pc = pc + 4;
+            crate::thread::save_fork_regs(regs, guest_resume_pc);
+            // Redirect sigreturn to the fork trampoline
+            regs.pc = crate::thread::fork_trampoline_addr();
+            // Clear signal mask so SIGTRAP is unblocked after sigreturn
+            uctx.uc_sigmask = 0;
+        } else {
+            regs.x[0] = result as u64;
+            regs.pc = pc + 4;
+        }
     } else if instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
         // MSR tpidr_el0, Xn — guest is writing to TPIDR_EL0
         // macOS clobbers TPIDR_EL0 on signal return, so we save the value
@@ -174,6 +186,11 @@ unsafe extern "C" fn sigtrap_handler(
         libc::write(2, buf.as_ptr() as *const _, n);
         libc::_exit(128 + libc::SIGTRAP);
     }
+}
+
+/// Get the handler function pointer (for use in forked children).
+pub fn sigtrap_handler_ptr() -> libc::sighandler_t {
+    sigtrap_handler as *const () as libc::sighandler_t
 }
 
 pub fn install_handler() {
