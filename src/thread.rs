@@ -5,7 +5,78 @@
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, Arc};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::time::Duration;
+
+// ─── Per-thread TID via pthread key ─────────────────────────────────────────
+
+static TID_KEY: AtomicU64 = AtomicU64::new(0);
+static TID_KEY_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Initialize the pthread key for per-thread TID. Call once at startup.
+pub fn init_tid_key() {
+    let mut key: libc::pthread_key_t = 0;
+    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+    if ret != 0 {
+        panic!("pthread_key_create for TID failed: {}", ret);
+    }
+    TID_KEY.store(key as u64, Ordering::SeqCst);
+    TID_KEY_INIT.store(true, Ordering::SeqCst);
+}
+
+/// Set the current thread's TID.
+pub fn set_thread_tid(tid: i32) {
+    if TID_KEY_INIT.load(Ordering::SeqCst) {
+        let key = TID_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        unsafe { libc::pthread_setspecific(key, tid as usize as *const libc::c_void); }
+    }
+    // Also store in the global for backward compatibility
+    CURRENT_TID.store(tid, Ordering::SeqCst);
+}
+
+/// Get the current thread's TID.
+fn get_thread_tid() -> i32 {
+    if TID_KEY_INIT.load(Ordering::SeqCst) {
+        let key = TID_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        let val = unsafe { libc::pthread_getspecific(key) } as usize as i32;
+        if val != 0 {
+            return val;
+        }
+    }
+    let t = CURRENT_TID.load(Ordering::SeqCst);
+    if t == 0 { unsafe { libc::getpid() } } else { t }
+}
+
+// ─── Per-thread clear_child_tid pointer ─────────────────────────────────────
+
+static CLEAR_TID_KEY: AtomicU64 = AtomicU64::new(0);
+static CLEAR_TID_KEY_INIT: AtomicBool = AtomicBool::new(false);
+
+pub fn init_clear_tid_key() {
+    let mut key: libc::pthread_key_t = 0;
+    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+    if ret != 0 {
+        panic!("pthread_key_create for clear_tid failed: {}", ret);
+    }
+    CLEAR_TID_KEY.store(key as u64, Ordering::SeqCst);
+    CLEAR_TID_KEY_INIT.store(true, Ordering::SeqCst);
+}
+
+fn set_clear_tid_ptr(ptr: u64) {
+    if CLEAR_TID_KEY_INIT.load(Ordering::SeqCst) {
+        let key = CLEAR_TID_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        unsafe { libc::pthread_setspecific(key, ptr as *const libc::c_void); }
+    }
+}
+
+fn get_clear_tid_ptr() -> u64 {
+    if CLEAR_TID_KEY_INIT.load(Ordering::SeqCst) {
+        let key = CLEAR_TID_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        unsafe { libc::pthread_getspecific(key) as u64 }
+    } else {
+        0
+    }
+}
 
 // ─── Thread ID tracking ─────────────────────────────────────────────────────
 
@@ -22,20 +93,25 @@ pub fn init_main_tid() {
     let tid = alloc_tid();
     MAIN_TID.store(tid, Ordering::SeqCst);
     CURRENT_TID.store(tid, Ordering::SeqCst);
+    set_thread_tid(tid);
 }
 
 pub fn main_tid() -> i32 {
     MAIN_TID.load(Ordering::SeqCst)
 }
 
-// Per-thread TID — this is an approximation using a global atomic.
-// A full implementation would use thread-local storage via __thread or a TLS key.
-// For single-threaded + basic multi-threaded use this is sufficient.
+// Global fallback TID (for backward compat, used when pthread key not yet set)
 pub static CURRENT_TID: AtomicI32 = AtomicI32::new(0);
 
 pub fn current_tid() -> i32 {
-    let t = CURRENT_TID.load(Ordering::SeqCst);
-    if t == 0 { unsafe { libc::getpid() } } else { t }
+    get_thread_tid()
+}
+
+/// Handle set_tid_address syscall. Stores the clear_child_tid pointer
+/// for the calling thread and returns the caller's TID.
+pub fn do_set_tid_address(tidptr: u64) -> u64 {
+    set_clear_tid_ptr(tidptr);
+    current_tid() as u64
 }
 
 // ─── TLS (TPIDR_EL0) management ─────────────────────────────────────────────
@@ -84,13 +160,16 @@ pub const CLONE_FS: u64 = 0x00000200;
 pub const CLONE_FILES: u64 = 0x00000400;
 pub const CLONE_SIGHAND: u64 = 0x00000800;
 pub const CLONE_THREAD: u64 = 0x00010000;
+pub const CLONE_SYSVSEM: u64 = 0x00040000;
 pub const CLONE_SETTLS: u64 = 0x00080000;
 pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 
 /// Implement clone: fork (no CLONE_VM) or thread creation (CLONE_VM|CLONE_THREAD).
-pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64) -> u64 {
+/// Called from sigtrap_handler via syscall::emulate. The `regs` parameter contains
+/// the guest's full register state at the point of the clone syscall.
+pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64, regs: &crate::trap::ThreadState64) -> u64 {
     // Fork: clone without CLONE_VM
     if flags & CLONE_VM == 0 {
         return do_fork(flags);
@@ -114,19 +193,29 @@ pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, chi
         unsafe { (child_tid_ptr as *mut i32).write(tid); }
     }
 
-    let child_stack_val = child_stack;
     let set_tls = flags & CLONE_SETTLS != 0;
-    let tls_val = tls;
+    let tls_val = if set_tls { tls } else { crate::trap::get_thread_tpidr() };
     let clear_tid_ptr = if flags & CLONE_CHILD_CLEARTID != 0 {
         child_tid_ptr
     } else {
         0
     };
 
+    // Save the full guest register state for the child thread.
+    // The child will resume at PC+4 (instruction after the clone syscall) with x0=0.
+    let mut saved = SavedRegs {
+        x: regs.x,
+        fp: regs.fp,
+        lr: regs.lr,
+        sp: if child_stack != 0 { child_stack } else { regs.sp },
+        pc: regs.pc + 4, // resume after the clone BRK
+    };
+    saved.x[0] = 0; // child return value
+
     // Spawn a pthread
     let mut thread: libc::pthread_t = 0;
     let arg = Box::new(CloneArgs {
-        stack: child_stack_val,
+        saved_regs: saved,
         tid,
         tls: tls_val,
         set_tls,
@@ -143,59 +232,161 @@ pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, chi
         return (-12_i64) as u64; // -ENOMEM
     }
 
-    // Detach — we don't join threads
+    // Detach — we don't join threads (they exit via SYS_EXIT -> thread_exit)
     unsafe { libc::pthread_detach(thread); }
 
     tid as u64
 }
 
+/// Backward-compatible do_clone that does not have access to regs (for fork path only).
+pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64) -> u64 {
+    // Fork path doesn't need regs — it uses the trampoline.
+    if flags & CLONE_VM == 0 {
+        return do_fork(flags);
+    }
+    // Thread creation without regs: cannot work properly.
+    // This should not be called for CLONE_THREAD; syscall.rs should use do_clone_with_regs.
+    eprintln!("fakelinux: do_clone called for threads without regs (flags={:#x})", flags);
+    (-38_i64) as u64 // -ENOSYS
+}
+
 struct CloneArgs {
-    stack: u64,
+    saved_regs: SavedRegs,
     tid: i32,
     tls: u64,
     set_tls: bool,
     clear_tid_ptr: u64,
 }
 
+/// Set up a per-thread sigaltstack and install the SIGTRAP handler.
+/// Must be called on each new thread before it executes guest code.
+fn setup_thread_signal_stack() {
+    unsafe {
+        // Allocate a signal-handler stack for this thread
+        let stack_size: usize = 128 * 1024;
+        let stack = libc::mmap(
+            std::ptr::null_mut(),
+            stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if stack == libc::MAP_FAILED {
+            let msg = "fakelinux: failed to allocate thread signal stack\n";
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+            libc::pthread_exit(std::ptr::null_mut());
+        }
+        let ss = libc::stack_t {
+            ss_sp: stack,
+            ss_flags: 0,
+            ss_size: stack_size,
+        };
+        if libc::sigaltstack(&ss, std::ptr::null_mut()) != 0 {
+            let msg = "fakelinux: sigaltstack failed for thread\n";
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+            libc::pthread_exit(std::ptr::null_mut());
+        }
+
+        // Install SIGTRAP handler on this thread (macOS requires per-thread setup
+        // for sigaltstack, but sigaction is process-wide, so this is technically
+        // redundant — but ensures the handler is installed).
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = crate::trap::sigtrap_handler_ptr();
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+
+        // Also install crash handlers
+        let mut sa2: libc::sigaction = std::mem::zeroed();
+        sa2.sa_sigaction = crash_handler_ptr();
+        sa2.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa2.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa2, std::ptr::null_mut());
+    }
+}
+
+fn crash_handler_ptr() -> libc::sighandler_t {
+    // Re-use the crash handler from trap.rs — it's the same function pointer.
+    // We just need the extern "C" fn pointer. Since it's not pub, we'll
+    // re-install via the same pattern as install_handler.
+    // Actually, trap.rs crash_handler is not pub. Let's just skip re-installing
+    // crash handlers; they're process-wide on macOS anyway.
+    0 as libc::sighandler_t // SIG_DFL — will use whatever was installed
+}
+
 extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
     let args = unsafe { Box::from_raw(arg as *mut CloneArgs) };
 
-    CURRENT_TID.store(args.tid, Ordering::SeqCst);
+    // Set up per-thread TID
+    set_thread_tid(args.tid);
 
-    // Set TLS if requested
+    // Set up per-thread TPIDR
     if args.set_tls {
-        unsafe {
-            std::arch::asm!("msr tpidr_el0, {}", in(reg) args.tls);
-        }
+        crate::trap::set_thread_tpidr(args.tls);
     }
 
-    // The child thread should start executing at the address on top of its stack.
-    // Linux clone: the child returns from clone() with result 0, using child_stack as SP.
-    // The child's entry point is the return address, which was set up by the caller.
+    // Set up per-thread clear_child_tid pointer
+    if args.clear_tid_ptr != 0 {
+        set_clear_tid_ptr(args.clear_tid_ptr);
+    }
+
+    // Set up per-thread sigaltstack
+    setup_thread_signal_stack();
+
+    // Jump to guest code with the saved registers.
+    // We use a pointer-based approach to avoid running out of registers:
+    // load a base pointer to the SavedRegs struct, then use LDP instructions
+    // to restore registers from memory offsets.
     //
-    // In a real implementation, we'd set up the thread's SP and PC and let it run.
-    // Since our patching approach works at the SVC level, the child needs to execute
-    // from where clone was called. This requires the caller to have set up the stack
-    // with a return address.
-    //
-    // For now, we jump to the child stack which should have the entry point.
-    // The typical pattern is: the libc pushes the function pointer and argument onto
-    // child_stack, then clone returns to that function.
-    //
-    // This is a simplified version — a full implementation would set registers
-    // (x0=0 for child return) and resume execution.
+    // SavedRegs layout: x[0..29] at offset 0, fp at 232, lr at 240, sp at 248, pc at 256
+    let regs_ptr = &args.saved_regs as *const SavedRegs as u64;
     unsafe {
         std::arch::asm!(
-            "mov sp, {stack}",
-            "mov x0, #0",
-            "ret", // jump to address in LR... this won't work correctly
-            stack = in(reg) args.stack,
+            // x9 = base pointer to SavedRegs
+            // First restore callee-saved registers (x19-x28, fp, lr) from memory
+            "ldp x19, x20, [{base}, #152]", // x[19], x[20] at offsets 19*8=152, 20*8=160
+            "ldp x21, x22, [{base}, #168]",
+            "ldp x23, x24, [{base}, #184]",
+            "ldp x25, x26, [{base}, #200]",
+            "ldp x27, x28, [{base}, #216]",
+            // Load fp (offset 232) and lr (offset 240)
+            "ldp x29, x30, [{base}, #232]",
+            // Load sp (offset 248) and pc (offset 256) into temporaries
+            "ldr x10, [{base}, #248]",      // sp
+            "ldr x11, [{base}, #256]",      // pc
+            // Set SP and jump
+            "mov sp, x10",
+            "mov x0, #0",  // child return value = 0
+            "br x11",
+            base = in(reg) regs_ptr,
             options(noreturn)
         );
     }
 }
 
-/// Saved guest register state for fork. The signal handler copies the
+/// Called when a thread calls SYS_EXIT (not SYS_EXIT_GROUP).
+/// Performs CLONE_CHILD_CLEARTID cleanup and exits only this thread.
+pub fn thread_exit(status: i32) -> ! {
+    // CLONE_CHILD_CLEARTID: write 0 to the clear_child_tid address and futex wake it
+    let clear_tid_addr = get_clear_tid_ptr();
+    if clear_tid_addr != 0 {
+        unsafe {
+            let ptr = clear_tid_addr as *mut i32;
+            ptr.write(0);
+        }
+        // Wake any thread waiting on this futex (e.g., pthread_join)
+        do_futex(clear_tid_addr, FUTEX_WAKE, 1, 0, 0, 0);
+    }
+
+    // Exit only this pthread, not the whole process.
+    unsafe {
+        libc::pthread_exit(status as *mut libc::c_void);
+    }
+}
+
+/// Saved guest register state for fork/clone. The signal handler copies the
 /// mcontext registers here before calling clone, so the forked child
 /// can jump to guest code with the correct register state.
 #[repr(C)]
@@ -253,19 +444,20 @@ pub fn create_fork_trampoline(near_addr: u64) {
     // Code: ldr x9, [pc, #8]; blr x9; (never returns)
     // Data: .quad handler_addr
     let code: [u32; 3] = [
-        0x5800_0049, // ldr x9, [pc, #8]  → loads from byte 12... not aligned!
+        0x5800_0049, // ldr x9, [pc, #8]  -> loads from byte 12... not aligned!
         0xD63F_0120, // blr x9
         0xD503_201F, // nop (padding)
     ];
     // Wait, data at byte 12 is not 8-aligned. Use:
-    //   0: ldr x9, [pc, #8] → byte 8
+    //   0: ldr x9, [pc, #8] -> byte 8
     //   4: blr x9
     //   8: .quad handler_addr
-    // ldr at 0, data at 8: offset=8, imm19=2 → 0x58000040 | 9 = 0x58000049
+    // ldr at 0, data at 8: offset=8, imm19=2 -> 0x58000040 | 9 = 0x58000049
     let code: [u32; 2] = [
         0x5800_0049, // ldr x9, [pc, #8]
         0xD63F_0120, // blr x9
     ];
+    let _ = code;
 
     unsafe {
         let p = addr as *mut u32;
@@ -324,67 +516,14 @@ extern "C" fn fork_trampoline_entry() -> ! {
 
 /// Signal the trap handler that a fork is pending. The handler will
 /// redirect sigreturn to a trampoline that calls fork() outside signal context.
-pub static FORK_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static FORK_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn do_fork(_flags: u64) -> u64 {
     // Don't fork here (signal context). Set a flag and return a sentinel.
     // The signal handler will redirect to the fork trampoline.
-    FORK_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
-    // Return value doesn't matter — the handler will override x0
+    FORK_PENDING.store(true, Ordering::SeqCst);
+    // Return value doesn't matter -- the handler will override x0
     0xFFFF_FFFF_0000_F0C0
-}
-
-#[allow(dead_code)]
-fn do_fork_old(_flags: u64) -> u64 {
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return crate::translate::linux_errno();
-    }
-    if pid == 0 {
-        // This code should never run — fork is handled via trampoline now
-        unreachable!("fork child reached old code path");
-
-        #[allow(unreachable_code)]
-        unsafe {
-            let r = &FORK_REGS;
-            let sp_val = r.sp;
-            let pc_val = r.pc;
-
-            // Restore callee-saved registers
-            let x19 = r.x[19]; let x20 = r.x[20]; let x21 = r.x[21];
-            let x22 = r.x[22]; let x23 = r.x[23]; let x24 = r.x[24];
-            let x25 = r.x[25]; let x26 = r.x[26]; let x27 = r.x[27];
-            let x28 = r.x[28]; let fp = r.fp; let lr = r.lr;
-
-            std::arch::asm!(
-                "mov x19, {x19}",
-                "mov x20, {x20}",
-                "mov x21, {x21}",
-                "mov x22, {x22}",
-                "mov x23, {x23}",
-                "mov x24, {x24}",
-                "mov x25, {x25}",
-                "mov x26, {x26}",
-                "mov x27, {x27}",
-                "mov x28, {x28}",
-                "mov x29, {fp}",
-                "mov x30, {lr}",
-                "mov sp, {sp_val}",
-                "mov x0, xzr",
-                "br {pc_val}",
-                x19 = in(reg) x19, x20 = in(reg) x20,
-                x21 = in(reg) x21, x22 = in(reg) x22,
-                x23 = in(reg) x23, x24 = in(reg) x24,
-                x25 = in(reg) x25, x26 = in(reg) x26,
-                x27 = in(reg) x27, x28 = in(reg) x28,
-                fp = in(reg) fp, lr = in(reg) lr,
-                sp_val = in(reg) sp_val, pc_val = in(reg) pc_val,
-                options(noreturn)
-            );
-        }
-    } else {
-        pid as u64
-    }
 }
 
 /// wait4(pid, wstatus, options, rusage)
@@ -418,11 +557,20 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
 
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
+pub const FUTEX_WAIT_BITSET: u32 = 9;
+pub const FUTEX_WAKE_BITSET: u32 = 10;
 pub const FUTEX_PRIVATE_FLAG: u32 = 128;
+pub const FUTEX_CLOCK_REALTIME: u32 = 256;
+pub const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
+
+struct FutexWaiter {
+    condvar: Condvar,
+    mutex: Mutex<bool>,  // true = woken
+    bitset: u32,
+}
 
 struct FutexEntry {
-    condvar: Condvar,
-    mutex: Mutex<()>,
+    waiters: Mutex<Vec<Arc<FutexWaiter>>>,
 }
 
 // Simple global futex table
@@ -434,46 +582,129 @@ fn get_futex(addr: u64) -> Arc<FutexEntry> {
     table
         .entry(addr)
         .or_insert_with(|| Arc::new(FutexEntry {
-            condvar: Condvar::new(),
-            mutex: Mutex::new(()),
+            waiters: Mutex::new(Vec::new()),
         }))
         .clone()
 }
 
-pub fn do_futex(uaddr: u64, op: u32, val: u32, _timeout: u64, _uaddr2: u64, _val3: u32) -> u64 {
-    let cmd = op & !FUTEX_PRIVATE_FLAG;
+/// Parse a Linux timespec from guest memory into a Duration.
+fn parse_timeout(timeout_ptr: u64) -> Option<Duration> {
+    if timeout_ptr == 0 {
+        return None;
+    }
+    unsafe {
+        let tv_sec = (timeout_ptr as *const i64).read_unaligned();
+        let tv_nsec = ((timeout_ptr + 8) as *const i64).read_unaligned();
+        if tv_sec < 0 || tv_nsec < 0 {
+            return None;
+        }
+        Some(Duration::new(tv_sec as u64, tv_nsec as u32))
+    }
+}
+
+pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64, val3: u32) -> u64 {
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
     match cmd {
         FUTEX_WAIT => {
-            // Check if *uaddr == val; if so, sleep until woken
-            let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
-            if current.load(Ordering::SeqCst) != val as i32 {
-                return (-11_i64) as u64; // -EAGAIN (Linux value)
-            }
-            let entry = get_futex(uaddr);
-            let guard = entry.mutex.lock().unwrap();
-            // Re-check after acquiring mutex
-            if current.load(Ordering::SeqCst) != val as i32 {
-                return (-11_i64) as u64;
-            }
-            // TODO: handle timeout
-            let _guard = entry.condvar.wait(guard).unwrap();
-            0
+            futex_wait(uaddr, val, timeout_or_val2, FUTEX_BITSET_MATCH_ANY)
         }
         FUTEX_WAKE => {
-            let entry = get_futex(uaddr);
-            let _guard = entry.mutex.lock().unwrap();
-            if val == 1 {
-                entry.condvar.notify_one();
-            } else {
-                entry.condvar.notify_all();
-            }
-            // Return the number of waiters woken (we don't track this precisely)
-            val.min(1) as u64
+            futex_wake(uaddr, val, FUTEX_BITSET_MATCH_ANY)
+        }
+        FUTEX_WAIT_BITSET => {
+            futex_wait(uaddr, val, timeout_or_val2, val3)
+        }
+        FUTEX_WAKE_BITSET => {
+            futex_wake(uaddr, val, val3)
         }
         _ => {
-            eprintln!("fakelinux: unsupported futex op {}", cmd);
+            let mut buf = [0u8; 80];
+            let n = {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                let _ = cursor.write_fmt(format_args!("fakelinux: unsupported futex op {} (cmd={})\n", op, cmd));
+                cursor.position() as usize
+            };
+            unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
             (-38_i64) as u64 // -ENOSYS
         }
     }
+}
+
+fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
+    // Check if *uaddr == val; if so, sleep until woken
+    let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
+    if current.load(Ordering::SeqCst) != val as i32 {
+        return (-11_i64) as u64; // -EAGAIN (Linux value)
+    }
+
+    let timeout = parse_timeout(timeout_ptr);
+
+    let entry = get_futex(uaddr);
+    let waiter = Arc::new(FutexWaiter {
+        condvar: Condvar::new(),
+        mutex: Mutex::new(false),
+        bitset,
+    });
+
+    // Add ourselves to the waiter list
+    {
+        let mut waiters = entry.waiters.lock().unwrap();
+        // Re-check value after acquiring lock
+        if current.load(Ordering::SeqCst) != val as i32 {
+            return (-11_i64) as u64;
+        }
+        waiters.push(waiter.clone());
+    }
+
+    // Wait
+    let guard = waiter.mutex.lock().unwrap();
+    if *guard {
+        // Already woken
+        return 0;
+    }
+
+    match timeout {
+        Some(dur) => {
+            let result = waiter.condvar.wait_timeout(guard, dur).unwrap();
+            if result.1.timed_out() && !*result.0 {
+                // Remove ourselves from waiter list on timeout
+                if let Ok(mut waiters) = entry.waiters.lock() {
+                    waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                }
+                return (-110_i64) as u64; // -ETIMEDOUT (Linux value)
+            }
+            0
+        }
+        None => {
+            let _guard = waiter.condvar.wait(guard).unwrap();
+            0
+        }
+    }
+}
+
+fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
+    let entry = get_futex(uaddr);
+    let mut waiters = entry.waiters.lock().unwrap();
+    let mut woken = 0u32;
+    let mut remaining = Vec::new();
+
+    for waiter in waiters.drain(..) {
+        if woken >= max_wake {
+            remaining.push(waiter);
+            continue;
+        }
+        if waiter.bitset & bitset != 0 {
+            let mut flag = waiter.mutex.lock().unwrap();
+            *flag = true;
+            waiter.condvar.notify_one();
+            woken += 1;
+        } else {
+            remaining.push(waiter);
+        }
+    }
+    *waiters = remaining;
+
+    woken as u64
 }

@@ -131,7 +131,7 @@ unsafe fn build_sigframe_and_redirect(
     handler_mask: u64,
 ) {
     let guest_sp = regs.sp;
-    let guest_tpidr = crate::trap::GUEST_TPIDR.load(Ordering::SeqCst);
+    let guest_tpidr = crate::trap::get_thread_tpidr();
     let old_sigmask = GUEST_SIGMASK.load(Ordering::SeqCst);
 
     // Allocate frame on guest stack (stack grows down)
@@ -209,7 +209,7 @@ pub unsafe fn do_rt_sigreturn(regs: &mut crate::trap::ThreadState64) -> bool {
     regs.cpsr = (p.add(272) as *const u32).read_unaligned();
     // Restore tpidr
     let saved_tpidr = (p.add(280) as *const u64).read_unaligned();
-    crate::trap::GUEST_TPIDR.store(saved_tpidr, Ordering::SeqCst);
+    crate::trap::set_thread_tpidr(saved_tpidr);
     // Restore sigmask
     let saved_mask = (p.add(288) as *const u64).read_unaligned();
     GUEST_SIGMASK.store(saved_mask, Ordering::SeqCst);

@@ -43,13 +43,19 @@ fn main() {
     }
     syscall::init_sysroot(&sysroot);
     procfs::init(elf_path);
+
+    // Initialize per-thread pthread keys before anything else
+    trap::init_tpidr_key();
+    thread::init_tid_key();
+    thread::init_clear_tid_key();
+
     thread::init_main_tid();
     // Initialize GUEST_TPIDR to macOS value — guest MRS tpidr_el0 needs a
     // non-zero value before __set_thread_area runs.
     {
         let tpidr: u64;
         unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr); }
-        trap::GUEST_TPIDR.store(tpidr, std::sync::atomic::Ordering::SeqCst);
+        trap::set_thread_tpidr(tpidr);
     }
     signal::create_sigreturn_trampoline();
     trap::install_handler();

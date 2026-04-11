@@ -77,7 +77,17 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_LSEEK => do_lseek(args[0] as i32, args[1] as i64, args[2] as i32),
         SYS_FSTAT => do_fstat(args[0] as i32, args[1]),
         SYS_NEWFSTATAT => do_newfstatat(args[0] as i32, args[1], args[2], args[3] as i32),
-        SYS_EXIT | SYS_EXIT_GROUP => unsafe { libc::_exit(args[0] as i32) },
+        SYS_EXIT_GROUP => unsafe { libc::_exit(args[0] as i32) },
+        SYS_EXIT => {
+            // SYS_EXIT only terminates the calling thread, not the whole process.
+            // If this is the main thread (or there's only one thread), it acts like exit_group.
+            // For child threads, call thread_exit() which does CLEARTID + pthread_exit.
+            if thread::current_tid() == thread::main_tid() {
+                unsafe { libc::_exit(args[0] as i32) }
+            } else {
+                thread::thread_exit(args[0] as i32);
+            }
+        }
         SYS_BRK => do_brk(args[0]),
         SYS_MMAP => do_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYS_MUNMAP => do_munmap(args[0], args[1]),
@@ -90,7 +100,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_GETGID => unsafe { libc::getgid() as u64 },
         SYS_GETEGID => unsafe { libc::getegid() as u64 },
         SYS_GETTID => thread::current_tid() as u64,
-        SYS_SET_TID_ADDRESS => thread::current_tid() as u64,
+        SYS_SET_TID_ADDRESS => thread::do_set_tid_address(args[0]),
         SYS_SET_ROBUST_LIST => 0,
         SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
@@ -121,7 +131,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_PWRITE64 => do_pwrite64(args[0] as i32, args[1], args[2], args[3] as i64),
         SYS_STATX => do_statx(args[0] as i32, args[1], args[2] as i32, args[3] as u32, args[4]),
         SYS_FACCESSAT => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
-        SYS_CLONE => thread::do_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYS_CLONE => thread::do_clone_with_regs(args[0], args[1], args[2], args[3], args[4], _regs),
         SYS_FUTEX => thread::do_futex(args[0], args[1] as u32, args[2] as u32, args[3], args[4], args[5] as u32),
         SYS_DUP => do_dup(args[0] as i32),
         SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),

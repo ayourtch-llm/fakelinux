@@ -33,10 +33,61 @@ pub const MRS_TPIDR_BASE: u32 = 0xD53B_D040;
 /// Guest's TPIDR_EL0 value. macOS clobbers TPIDR_EL0 on every signal
 /// entry/return (restoring it to ~0x1004), so we must track the guest's
 /// value ourselves and intercept all MSR/MRS tpidr_el0 instructions.
+/// This global is used as fallback and for the main thread's initial value.
 pub static GUEST_TPIDR: AtomicU64 = AtomicU64::new(0);
 
+// ─── Per-thread TPIDR via pthread keys ──────────────────────────────────────
+
+/// pthread_key_t for per-thread guest TPIDR storage.
+static TPIDR_KEY: AtomicU64 = AtomicU64::new(0);
+/// Whether init_tpidr_key() has been called.
+static TPIDR_KEY_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Initialize the pthread key for per-thread TPIDR. Call once before loading the ELF.
+pub fn init_tpidr_key() {
+    let mut key: libc::pthread_key_t = 0;
+    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+    if ret != 0 {
+        panic!("pthread_key_create for TPIDR failed: {}", ret);
+    }
+    TPIDR_KEY.store(key as u64, Ordering::SeqCst);
+    TPIDR_KEY_INIT.store(true, Ordering::SeqCst);
+}
+
+/// Set the per-thread guest TPIDR value.
+pub fn set_thread_tpidr(val: u64) {
+    if !TPIDR_KEY_INIT.load(Ordering::SeqCst) {
+        // Fallback to global before key is initialized
+        GUEST_TPIDR.store(val, Ordering::SeqCst);
+        return;
+    }
+    let key = TPIDR_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+    // Store val+1 so we can distinguish "not set" (NULL=0) from "set to 0"
+    // Actually, just use the raw value; 0 is unlikely for TPIDR.
+    // We also store a marker in a second key to know if it was set.
+    unsafe { libc::pthread_setspecific(key, val as *const libc::c_void); }
+    // Also update global for compatibility
+    GUEST_TPIDR.store(val, Ordering::SeqCst);
+}
+
+/// Get the per-thread guest TPIDR value.
+pub fn get_thread_tpidr() -> u64 {
+    if !TPIDR_KEY_INIT.load(Ordering::SeqCst) {
+        return GUEST_TPIDR.load(Ordering::SeqCst);
+    }
+    let key = TPIDR_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+    let val = unsafe { libc::pthread_getspecific(key) } as u64;
+    // If this thread never called set_thread_tpidr, val will be 0 (NULL).
+    // Fall back to the global in that case.
+    if val == 0 {
+        GUEST_TPIDR.load(Ordering::SeqCst)
+    } else {
+        val
+    }
+}
+
 pub fn get_guest_tpidr() -> u64 {
-    GUEST_TPIDR.load(Ordering::SeqCst)
+    get_thread_tpidr()
 }
 
 // macOS aarch64 mcontext structures
@@ -119,14 +170,14 @@ unsafe extern "C" fn sigtrap_handler(
                 // MSR tpidr_el0, Xn
                 let rn = (orig_instr & 0x1F) as usize;
                 let val = read_reg(regs, rn);
-                GUEST_TPIDR.store(val, Ordering::SeqCst);
+                set_thread_tpidr(val);
                 regs.pc = pc + 4;
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
                 let rn = (orig_instr & 0x1F) as usize;
-                let val = GUEST_TPIDR.load(Ordering::SeqCst);
+                let val = get_thread_tpidr();
                 write_reg(regs, rn, val);
                 regs.pc = pc + 4;
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
@@ -171,13 +222,13 @@ unsafe extern "C" fn sigtrap_handler(
         // and serve it via intercepted MRS instructions.
         let rn = (instr & 0x1F) as usize;
         let val = read_reg(regs, rn);
-        GUEST_TPIDR.store(val, Ordering::SeqCst);
+        set_thread_tpidr(val);
         regs.pc = pc + 4;
     } else if instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
         // MRS Xn, tpidr_el0 — guest is reading TPIDR_EL0
         // Return our saved value instead of the macOS-clobbered one.
         let rn = (instr & 0x1F) as usize;
-        let val = GUEST_TPIDR.load(Ordering::SeqCst);
+        let val = get_thread_tpidr();
         write_reg(regs, rn, val);
         regs.pc = pc + 4;
     } else if instr & 0xFFE0_001F == 0xD420_0000 {
@@ -270,7 +321,7 @@ unsafe extern "C" fn crash_handler(
     let mctx = &*uctx.uc_mcontext;
     let regs = &mctx.ss;
     let fault_addr = mctx.es.far;
-    let guest_tpidr = GUEST_TPIDR.load(Ordering::SeqCst);
+    let guest_tpidr = get_thread_tpidr();
     let signame = if sig == libc::SIGSEGV { "SIGSEGV" } else { "SIGBUS" };
     let mut buf = [0u8; 256];
     let n = raw_fmt(&mut buf, format_args!(
