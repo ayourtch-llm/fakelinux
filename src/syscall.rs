@@ -1,3 +1,4 @@
+use crate::creds;
 use crate::epoll;
 use crate::eventfd;
 use crate::linux::*;
@@ -8,7 +9,7 @@ use crate::rootfs;
 use crate::signal;
 use crate::thread;
 use crate::translate;
-use crate::trap::ThreadState64;
+use crate::trap::MContext64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -73,7 +74,7 @@ pub fn set_trace(on: bool) {
 }
 
 /// Emulate a single Linux aarch64 syscall. Returns the result value for x0.
-pub fn emulate(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
+pub fn emulate(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
     let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
     if trace {
         raw_eprintln_fmt(format_args!(
@@ -81,14 +82,14 @@ pub fn emulate(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
             nr, args[0], args[1], args[2], args[3], args[4], args[5]
         ));
     }
-    let result = emulate_inner(nr, args, _regs);
+    let result = emulate_inner(nr, args, _mctx);
     if trace {
         raw_eprintln_fmt(format_args!("fakelinux:   → {:#x} ({})\n", result, result as i64));
     }
     result
 }
 
-fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
+fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
     match nr {
         SYS_WRITE => do_write(args[0], args[1], args[2]),
         SYS_READ => do_read(args[0], args[1], args[2]),
@@ -115,10 +116,10 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_MADVISE => 0,
         SYS_GETPID => unsafe { libc::getpid() as u64 },
         SYS_GETPPID => unsafe { libc::getppid() as u64 },
-        SYS_GETUID => unsafe { libc::getuid() as u64 },
-        SYS_GETEUID => unsafe { libc::geteuid() as u64 },
-        SYS_GETGID => unsafe { libc::getgid() as u64 },
-        SYS_GETEGID => unsafe { libc::getegid() as u64 },
+        SYS_GETUID => creds::do_getuid(),
+        SYS_GETEUID => creds::do_geteuid(),
+        SYS_GETGID => creds::do_getgid(),
+        SYS_GETEGID => creds::do_getegid(),
         SYS_GETTID => thread::current_tid() as u64,
         SYS_SET_TID_ADDRESS => thread::do_set_tid_address(args[0]),
         SYS_SET_ROBUST_LIST => 0,
@@ -126,9 +127,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGRETURN => {
             // rt_sigreturn restores ALL registers from the sigframe on the stack.
-            // It does NOT return a value in x0. We restore directly into _regs
+            // It does NOT return a value in x0. We restore directly into _mctx
             // and return a sentinel so the trap handler knows not to overwrite.
-            if unsafe { signal::do_rt_sigreturn(_regs) } {
+            if unsafe { signal::do_rt_sigreturn(_mctx) } {
                 signal::SIGRETURN_SENTINEL
             } else {
                 (-22_i64) as u64 // -EINVAL if sigframe is invalid
@@ -156,7 +157,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_PWRITE64 => do_pwrite64(args[0] as i32, args[1], args[2], args[3] as i64),
         SYS_STATX => do_statx(args[0] as i32, args[1], args[2] as i32, args[3] as u32, args[4]),
         SYS_FACCESSAT => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
-        SYS_CLONE => thread::do_clone_with_regs(args[0], args[1], args[2], args[3], args[4], _regs),
+        SYS_CLONE => thread::do_clone_with_regs(args[0], args[1], args[2], args[3], args[4], &_mctx.ss),
         SYS_FUTEX => thread::do_futex(args[0], args[1] as u32, args[2] as u32, args[3], args[4], args[5] as u32),
         SYS_DUP => do_dup(args[0] as i32),
         SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),
@@ -190,10 +191,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
             let ret = unsafe { libc::umask(args[0] as libc::mode_t) };
             ret as u64
         }
-        SYS_GETGROUPS => {
-            // getgroups(size, list) — return 0 groups for simplicity
-            0
-        }
+        SYS_GETGROUPS => creds::do_getgroups(args[0] as u32, args[1]),
         SYS_SETPRIORITY => 0, // stub success
         SYS_GETPRIORITY => 20, // default nice value
         SYS_SETITIMER => 0, // stub success
@@ -270,6 +268,18 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_MEMBARRIER => do_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
         SYS_STATFS => do_statfs(args[0], args[1]),
         SYS_FSTATFS => do_fstatfs(args[0] as i32, args[1]),
+        SYS_SETREGID => creds::do_setregid(args[0] as u32, args[1] as u32),
+        SYS_SETGID => creds::do_setgid(args[0] as u32),
+        SYS_SETREUID => creds::do_setreuid(args[0] as u32, args[1] as u32),
+        SYS_SETUID => creds::do_setuid(args[0] as u32),
+        SYS_SETRESUID => creds::do_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYS_GETRESUID => creds::do_getresuid(args[0], args[1], args[2]),
+        SYS_SETRESGID => creds::do_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYS_GETRESGID => creds::do_getresgid(args[0], args[1], args[2]),
+        SYS_SETFSUID => creds::do_setfsuid(args[0] as u32),
+        SYS_SETFSGID => creds::do_setfsgid(args[0] as u32),
+        SYS_SETGROUPS => creds::do_setgroups(args[0] as u32, args[1]),
+        SYS_SENDFILE => do_sendfile(args[0] as i32, args[1] as i32, args[2], args[3]),
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -1452,4 +1462,71 @@ fn do_fstatfs(fd: i32, buf: u64) -> u64 {
         w64(80, 0); // f_flags
     }
     0
+}
+
+fn do_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: u64) -> u64 {
+    // sendfile(out_fd, in_fd, offset, count) — copy data between file descriptors
+    // macOS has sendfile with a different signature, so we implement via read/write loop.
+    let mut remaining = count as usize;
+    let mut total: usize = 0;
+    let mut buf = [0u8; 8192];
+
+    // If offset_ptr is non-null, seek in_fd to that offset first, and update it after
+    let mut offset_val: i64 = 0;
+    let has_offset = offset_ptr != 0;
+    if has_offset {
+        offset_val = unsafe { (offset_ptr as *const i64).read_unaligned() };
+    }
+
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let nread = if has_offset {
+            let r = unsafe { libc::pread(in_fd, buf.as_mut_ptr() as *mut _, to_read, offset_val) };
+            if r > 0 {
+                offset_val += r as i64;
+            }
+            r
+        } else {
+            unsafe { libc::read(in_fd, buf.as_mut_ptr() as *mut _, to_read) }
+        };
+
+        if nread < 0 {
+            if total > 0 {
+                break;
+            }
+            return crate::translate::linux_errno();
+        }
+        if nread == 0 {
+            break; // EOF
+        }
+
+        // Write all read data to out_fd
+        let mut written = 0usize;
+        while written < nread as usize {
+            let nw = unsafe {
+                libc::write(
+                    out_fd,
+                    buf[written..].as_ptr() as *const _,
+                    nread as usize - written,
+                )
+            };
+            if nw < 0 {
+                if total > 0 {
+                    if has_offset {
+                        unsafe { (offset_ptr as *mut i64).write_unaligned(offset_val) };
+                    }
+                    return total as u64;
+                }
+                return crate::translate::linux_errno();
+            }
+            written += nw as usize;
+        }
+        total += nread as usize;
+        remaining -= nread as usize;
+    }
+
+    if has_offset {
+        unsafe { (offset_ptr as *mut i64).write_unaligned(offset_val) };
+    }
+    total as u64
 }

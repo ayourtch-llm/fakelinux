@@ -111,9 +111,17 @@ pub struct ThreadState64 {
 }
 
 #[repr(C)]
+pub struct NeonState64 {
+    pub v: [u128; 32],  // q0-q31, each 128 bits
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+#[repr(C)]
 pub struct MContext64 {
     pub es: ExceptionState64,
     pub ss: ThreadState64,
+    pub ns: NeonState64,
 }
 
 #[repr(C)]
@@ -155,8 +163,7 @@ unsafe extern "C" fn sigtrap_handler(
 
     let uctx = &mut *(ctx as *mut UContext);
     let mctx = &mut *uctx.uc_mcontext;
-    let regs = &mut mctx.ss;
-    let pc = regs.pc;
+    let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
 
     // For BRK_MARKER, check if this was originally a TPIDR access or a SVC
@@ -169,68 +176,68 @@ unsafe extern "C" fn sigtrap_handler(
             if orig_instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
                 // MSR tpidr_el0, Xn
                 let rn = (orig_instr & 0x1F) as usize;
-                let val = read_reg(regs, rn);
+                let val = read_reg(&mctx.ss, rn);
                 set_thread_tpidr(val);
-                regs.pc = pc + 4;
+                mctx.ss.pc = pc + 4;
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
                 let rn = (orig_instr & 0x1F) as usize;
                 let val = get_thread_tpidr();
-                write_reg(regs, rn, val);
-                regs.pc = pc + 4;
+                write_reg(&mut mctx.ss, rn, val);
+                mctx.ss.pc = pc + 4;
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             }
         }
 
         // Not in patch table → this was a SVC #0
-        let nr = regs.x[8];
+        let nr = mctx.ss.x[8];
         let args = [
-            regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5],
+            mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];
 
         // For fork (clone without CLONE_VM), save guest registers so the
         // forked child can jump directly to guest code without sigreturn.
         use crate::linux::SYS_CLONE;
         if nr == SYS_CLONE && args[0] & 0x100 == 0 {
-            crate::thread::save_fork_regs(regs, pc + 4);
+            crate::thread::save_fork_regs(&mctx.ss, pc + 4);
         }
 
-        let result = syscall::emulate(nr, &args, regs);
+        let result = syscall::emulate(nr, &args, mctx);
 
         // Check if fork was requested — redirect sigreturn to trampoline
         if crate::thread::FORK_PENDING.swap(false, Ordering::SeqCst) {
             // Save the guest's return PC (after the clone SVC)
             let guest_resume_pc = pc + 4;
-            crate::thread::save_fork_regs(regs, guest_resume_pc);
+            crate::thread::save_fork_regs(&mctx.ss, guest_resume_pc);
             // Redirect sigreturn to the fork trampoline
-            regs.pc = crate::thread::fork_trampoline_addr();
+            mctx.ss.pc = crate::thread::fork_trampoline_addr();
             // Clear signal mask so SIGTRAP is unblocked after sigreturn
             uctx.uc_sigmask = 0;
         } else if result == crate::signal::SIGRETURN_SENTINEL {
-            // rt_sigreturn: registers were already restored directly into regs.
+            // rt_sigreturn: registers were already restored directly into mctx.
             // Don't overwrite x0 or pc.
         } else {
-            regs.x[0] = result as u64;
-            regs.pc = pc + 4;
+            mctx.ss.x[0] = result as u64;
+            mctx.ss.pc = pc + 4;
         }
     } else if instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
         // MSR tpidr_el0, Xn — guest is writing to TPIDR_EL0
         // macOS clobbers TPIDR_EL0 on signal return, so we save the value
         // and serve it via intercepted MRS instructions.
         let rn = (instr & 0x1F) as usize;
-        let val = read_reg(regs, rn);
+        let val = read_reg(&mctx.ss, rn);
         set_thread_tpidr(val);
-        regs.pc = pc + 4;
+        mctx.ss.pc = pc + 4;
     } else if instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
         // MRS Xn, tpidr_el0 — guest is reading TPIDR_EL0
         // Return our saved value instead of the macOS-clobbered one.
         let rn = (instr & 0x1F) as usize;
         let val = get_thread_tpidr();
-        write_reg(regs, rn, val);
-        regs.pc = pc + 4;
+        write_reg(&mut mctx.ss, rn, val);
+        mctx.ss.pc = pc + 4;
     } else if instr & 0xFFE0_001F == 0xD420_0000 {
         // BRK #N — could be guest's own trap or macOS internal trap (e.g. after fork)
         let brk_imm = (instr >> 5) & 0xFFFF;
@@ -254,7 +261,7 @@ unsafe extern "C" fn sigtrap_handler(
 
     // Deliver any signals that were deferred while we were in the SIGTRAP handler.
     // We build the sigframe directly here since we have the guest registers in mcontext.
-    crate::signal::deliver_pending_to_guest(regs);
+    crate::signal::deliver_pending_to_guest(mctx);
 }
 
 /// Get the handler function pointer (for use in forked children).

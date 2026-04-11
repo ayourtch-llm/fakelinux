@@ -1,3 +1,4 @@
+mod creds;
 mod elf;
 mod epoll;
 mod eventfd;

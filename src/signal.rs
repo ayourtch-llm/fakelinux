@@ -113,23 +113,28 @@ pub fn mac_to_linux(mac_sig: i32) -> i32 {
 //   offset 276: _pad (u32)
 //   offset 280: saved_tpidr
 //   offset 288: saved_sigmask
-//   total = 296, rounded up to 304 for 16-byte alignment
+//   offset 296: saved_neon[0..31] (32 * 16 = 512 bytes, q0-q31)
+//   total = 808, rounded up to 816 for 16-byte alignment
 
-const RT_SIGFRAME_SIZE: usize = 304; // 296 rounded up to 16-byte alignment
+// NEON/FP save area: 32 x 128-bit (16 bytes) = 512 bytes, starts at offset 296
+// Total = 296 + 512 = 808, rounded up to 816 for 16-byte alignment
+const NEON_SAVE_OFFSET: usize = 296;
+const RT_SIGFRAME_SIZE: usize = 816; // (296 + 512) rounded up to 16-byte alignment
 
 /// Build a Linux rt_sigframe on the guest stack and redirect execution to the
 /// guest signal handler. Called from signal_forwarder (macOS signal context).
 ///
-/// `regs` is the macOS mcontext thread state (guest registers at point of interruption).
+/// `mctx` is the macOS mcontext (guest registers + NEON state at point of interruption).
 /// `linux_sig` is the Linux signal number.
 /// `handler` is the guest handler address.
 /// `handler_mask` is the sa_mask from the guest sigaction.
 unsafe fn build_sigframe_and_redirect(
-    regs: &mut crate::trap::ThreadState64,
+    mctx: &mut crate::trap::MContext64,
     linux_sig: i32,
     handler: u64,
     handler_mask: u64,
 ) {
+    let regs = &mut mctx.ss;
     let guest_sp = regs.sp;
     let guest_tpidr = crate::trap::get_thread_tpidr();
     let old_sigmask = GUEST_SIGMASK.load(Ordering::SeqCst);
@@ -161,6 +166,13 @@ unsafe fn build_sigframe_and_redirect(
     // Save sigmask
     (p.add(288) as *mut u64).write_unaligned(old_sigmask);
 
+    // Save NEON/FP registers q0-q31 from the mcontext (not from current CPU regs,
+    // which may have been clobbered by Rust code in the signal/SIGTRAP handler).
+    let neon_dst = p.add(NEON_SAVE_OFFSET) as *mut u128;
+    for i in 0..32 {
+        neon_dst.add(i).write_unaligned(mctx.ns.v[i]);
+    }
+
     // Block signals in handler_mask | (1 << linux_sig) during handler execution
     // Linux kernel convention: bit (sig-1) represents signal sig
     let block_mask = handler_mask | (1u64 << (linux_sig - 1) as u64);
@@ -182,7 +194,8 @@ unsafe fn build_sigframe_and_redirect(
 
 /// Restore guest state from an rt_sigframe on the stack. Called during rt_sigreturn.
 /// Returns true on success.
-pub unsafe fn do_rt_sigreturn(regs: &mut crate::trap::ThreadState64) -> bool {
+pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
+    let regs = &mut mctx.ss;
     let frame_addr = regs.sp;
     let p = frame_addr as *const u8;
 
@@ -213,6 +226,13 @@ pub unsafe fn do_rt_sigreturn(regs: &mut crate::trap::ThreadState64) -> bool {
     // Restore sigmask
     let saved_mask = (p.add(288) as *const u64).read_unaligned();
     GUEST_SIGMASK.store(saved_mask, Ordering::SeqCst);
+
+    // Restore NEON/FP registers q0-q31 into the mcontext.
+    // When the signal handler returns, macOS restores these from the mcontext.
+    let neon_src = p.add(NEON_SAVE_OFFSET) as *const u128;
+    for i in 0..32 {
+        mctx.ns.v[i] = neon_src.add(i).read_unaligned();
+    }
 
     true
 }
@@ -289,12 +309,11 @@ unsafe extern "C" fn signal_forwarder(
         return;
     }
 
-    // Get the macOS ucontext -> mcontext -> thread state (= guest registers)
+    // Get the macOS ucontext -> mcontext (contains guest GPRs + NEON state)
     let uctx = &mut *(ctx as *mut crate::trap::UContext);
     let mctx = &mut *uctx.uc_mcontext;
-    let regs = &mut mctx.ss;
 
-    build_sigframe_and_redirect(regs, linux_sig, handler, handler_mask);
+    build_sigframe_and_redirect(mctx, linux_sig, handler, handler_mask);
 }
 
 // ---- Guest syscall handlers ----
@@ -383,7 +402,7 @@ pub fn do_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, _sigsetsize: u
 /// Deliver pending signals directly by building sigframes on the guest stack.
 /// Called from the SIGTRAP handler after clearing IN_SIGTRAP, when we have
 /// the guest's registers in the mcontext.
-pub unsafe fn deliver_pending_to_guest(regs: &mut crate::trap::ThreadState64) {
+pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
     let current_mask = GUEST_SIGMASK.load(Ordering::SeqCst);
     let pending = PENDING_SIGNALS.load(Ordering::SeqCst);
     let deliverable = pending & !current_mask;
@@ -406,7 +425,7 @@ pub unsafe fn deliver_pending_to_guest(regs: &mut crate::trap::ThreadState64) {
             };
 
             if handler != SIG_DFL && handler != SIG_IGN {
-                build_sigframe_and_redirect(regs, sig, handler, handler_mask);
+                build_sigframe_and_redirect(mctx, sig, handler, handler_mask);
             }
             break; // deliver one at a time
         }

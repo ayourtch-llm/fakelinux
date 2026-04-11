@@ -100,6 +100,17 @@ pub const SYS_PRCTL: u64 = 167;
 pub const SYS_SYSINFO: u64 = 179;
 pub const SYS_GETRUSAGE: u64 = 165;
 pub const SYS_MEMBARRIER: u64 = 283;
+pub const SYS_SENDFILE: u64 = 71;
+pub const SYS_SETREGID: u64 = 143;
+pub const SYS_SETGID: u64 = 144;
+pub const SYS_SETREUID: u64 = 145;
+pub const SYS_SETUID: u64 = 146;
+pub const SYS_SETRESUID: u64 = 147;
+pub const SYS_GETRESUID: u64 = 148;
+pub const SYS_SETRESGID: u64 = 149;
+pub const SYS_GETRESGID: u64 = 150;
+pub const SYS_SETFSUID: u64 = 151;
+pub const SYS_SETFSGID: u64 = 152;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;

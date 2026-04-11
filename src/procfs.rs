@@ -154,8 +154,8 @@ fn generate_status() -> Vec<u8> {
          VmSize:\t    0 kB\n\
          Threads:\t1\n",
         pid = pid,
-        uid = unsafe { libc::getuid() },
-        gid = unsafe { libc::getgid() },
+        uid = crate::creds::do_getuid(),
+        gid = crate::creds::do_getgid(),
     )
     .into_bytes()
 }
