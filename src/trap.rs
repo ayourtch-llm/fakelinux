@@ -36,6 +36,71 @@ pub const MRS_TPIDR_BASE: u32 = 0xD53B_D040;
 /// This global is used as fallback and for the main thread's initial value.
 pub static GUEST_TPIDR: AtomicU64 = AtomicU64::new(0);
 
+// ─── Per-thread guest x18 (platform register) ───────────────────────────────
+//
+// On macOS/Darwin, x18 is the "platform register" reserved by the OS.
+// macOS can clobber x18 during signal delivery or between sigreturn and
+// guest resume. Linux code uses x18 as a regular callee-saved register.
+// We save/restore x18 ourselves, similar to TPIDR virtualization.
+
+static GUEST_X18: AtomicU64 = AtomicU64::new(0);
+
+// Raw x18 capture: naked asm wrapper saves x18 to this global before
+// any Rust/macOS code can clobber it. Single-threaded access (signal handler).
+static mut RAW_X18_CAPTURE: u64 = 0;
+
+/// Naked asm signal handler wrapper that captures x18 before calling Rust handler.
+/// On macOS aarch64, the kernel and/or signal trampoline may clobber x18 before
+/// our Rust handler runs. This naked function is the FIRST code to execute,
+/// saving x18 to a global before anything else touches it.
+#[unsafe(naked)]
+unsafe extern "C" fn sigtrap_handler_wrapper(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ctx: *mut c_void,
+) {
+    std::arch::naked_asm!(
+        // Save x18 to RAW_X18_CAPTURE immediately
+        "adrp x9, {capture}@PAGE",
+        "str x18, [x9, {capture}@PAGEOFF]",
+        // Tail-call the real Rust handler (same args in x0, x1, x2)
+        "b {handler}",
+        capture = sym RAW_X18_CAPTURE,
+        handler = sym sigtrap_handler,
+    );
+}
+static X18_KEY: AtomicU64 = AtomicU64::new(0);
+static X18_KEY_INIT: AtomicBool = AtomicBool::new(false);
+
+pub fn init_x18_key() {
+    let mut key: libc::pthread_key_t = 0;
+    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+    if ret != 0 {
+        panic!("pthread_key_create for x18 failed: {}", ret);
+    }
+    X18_KEY.store(key as u64, Ordering::SeqCst);
+    X18_KEY_INIT.store(true, Ordering::SeqCst);
+}
+
+fn set_thread_x18(val: u64) {
+    if X18_KEY_INIT.load(Ordering::SeqCst) {
+        let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        unsafe { libc::pthread_setspecific(key, val as *const libc::c_void); }
+    }
+    GUEST_X18.store(val, Ordering::SeqCst);
+}
+
+fn get_thread_x18() -> u64 {
+    if X18_KEY_INIT.load(Ordering::SeqCst) {
+        let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+        let val = unsafe { libc::pthread_getspecific(key) } as u64;
+        if val != 0 {
+            return val;
+        }
+    }
+    GUEST_X18.load(Ordering::SeqCst)
+}
+
 // ─── Per-thread TPIDR via pthread keys ──────────────────────────────────────
 
 /// pthread_key_t for per-thread guest TPIDR storage.
@@ -166,6 +231,22 @@ unsafe extern "C" fn sigtrap_handler(
     let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
 
+    // x18 guest register preservation.
+    // macOS clobbers x18 (platform register) both in the mcontext AND in the
+    // hardware register during signal delivery. Our naked asm wrapper
+    // (sigtrap_handler_wrapper) captured x18 to RAW_X18_CAPTURE as the very
+    // first instruction before any clobbering. Use that value.
+    let captured_x18 = RAW_X18_CAPTURE;
+    if captured_x18 != 0 {
+        set_thread_x18(captured_x18);
+        mctx.ss.x[18] = captured_x18;
+    } else {
+        let saved_x18 = get_thread_x18();
+        if saved_x18 != 0 {
+            mctx.ss.x[18] = saved_x18;
+        }
+    }
+
     // For BRK_MARKER, check if this was originally a TPIDR access or a SVC
     if instr == BRK_MARKER {
         // Look up the original instruction in the patch table
@@ -179,14 +260,22 @@ unsafe extern "C" fn sigtrap_handler(
                 let val = read_reg(&mctx.ss, rn);
                 set_thread_tpidr(val);
                 mctx.ss.pc = pc + 4;
+                set_thread_x18(mctx.ss.x[18]);
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
                 let rn = (orig_instr & 0x1F) as usize;
                 let val = get_thread_tpidr();
+                if val == 0 {
+                    let mut buf = [0u8; 128];
+                    let n = raw_fmt(&mut buf, format_args!(
+                        "fakelinux: WARNING: MRS tpidr_el0 returning 0 at pc={:#x} reg=x{}\n", pc, rn));
+                    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                }
                 write_reg(&mut mctx.ss, rn, val);
                 mctx.ss.pc = pc + 4;
+                set_thread_x18(mctx.ss.x[18]);
                 IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             }
@@ -223,6 +312,12 @@ unsafe extern "C" fn sigtrap_handler(
         // Return our saved value instead of the macOS-clobbered one.
         let rn = (instr & 0x1F) as usize;
         let val = get_thread_tpidr();
+        if val == 0 {
+            let mut buf = [0u8; 128];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: WARNING: MRS tpidr_el0 (unpatched) returning 0 at pc={:#x} reg=x{}\n", pc, rn));
+            unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+        }
         write_reg(&mut mctx.ss, rn, val);
         mctx.ss.pc = pc + 4;
     } else if instr & 0xFFE0_001F == 0xD420_0000 {
@@ -243,6 +338,10 @@ unsafe extern "C" fn sigtrap_handler(
         libc::write(2, buf.as_ptr() as *const _, n);
         libc::_exit(128 + libc::SIGTRAP);
     }
+
+    // Save guest x18 from mcontext so we can restore it on next signal entry.
+    // This captures the value the guest will resume with (after our modifications).
+    set_thread_x18(mctx.ss.x[18]);
 
     IN_SIGTRAP.store(false, Ordering::SeqCst);
 
@@ -291,7 +390,7 @@ pub fn init_child_after_fork() {
 pub fn install_sigtrap_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigtrap_handler as *const () as libc::sighandler_t;
+        sa.sa_sigaction = sigtrap_handler_wrapper as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigemptyset(&mut sa.sa_mask);
         if libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut()) != 0 {
@@ -304,7 +403,7 @@ pub fn install_sigtrap_handler() {
 
 /// Get the handler function pointer (for use in forked children).
 pub fn sigtrap_handler_ptr() -> libc::sighandler_t {
-    sigtrap_handler as *const () as libc::sighandler_t
+    sigtrap_handler_wrapper as *const () as libc::sighandler_t
 }
 
 pub fn install_handler() {
