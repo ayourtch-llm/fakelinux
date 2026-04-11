@@ -200,7 +200,8 @@ pub fn install_handler() {
             panic!("sigaltstack failed");
         }
 
-        // Install SIGTRAP handler with SA_SIGINFO
+        // Install SIGTRAP handler FIRST (before unblocking — if SIGTRAP is
+        // pending, unblocking would fire it with SIG_DFL=terminate!)
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = sigtrap_handler as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
@@ -208,6 +209,11 @@ pub fn install_handler() {
         if libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut()) != 0 {
             panic!("sigaction(SIGTRAP) failed");
         }
+
+        // NOW unblock all signals (safe — our handler is installed)
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
 
         // Install SIGSEGV/SIGBUS handlers for debugging guest crashes
         let mut sa2: libc::sigaction = std::mem::zeroed();

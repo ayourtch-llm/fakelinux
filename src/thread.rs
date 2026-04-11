@@ -230,12 +230,11 @@ fn do_fork(_flags: u64) -> u64 {
         return crate::translate::linux_errno();
     }
     if pid == 0 {
-        // Child: reinstall signal handler with fresh sigaltstack (parent's
-        // is marked SS_ONSTACK). Then return 0 — sigreturn will resume
-        // guest code. macOS clobbers TPIDR_EL0 on sigreturn, but we
-        // virtualize TPIDR via BRK interception so the guest doesn't care.
-        crate::trap::install_handler();
-        return 0;
+        // Child: can't run guest code after fork-from-signal-handler
+        // (SIGTRAP delivery broken despite handler reinstall + unblock).
+        // _exit(127) — parent wait4 picks it up, shell continues.
+        // Single-command `sh -c 'cmd'` works via exec optimization.
+        unsafe { libc::_exit(127); }
 
         #[allow(unreachable_code)]
         unsafe {
@@ -287,6 +286,14 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
     let rusage = if rusage_ptr != 0 { rusage_ptr as *mut libc::rusage } else { std::ptr::null_mut() };
 
     let ret = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
+    if ret > 0 && wstatus_ptr != 0 {
+        unsafe {
+            let s = status;
+            let msg = format!("fakelinux: wait4 pid={} status={:#x} signaled={} sig={}\n",
+                ret, s, libc::WIFSIGNALED(s), if libc::WIFSIGNALED(s) { libc::WTERMSIG(s) } else { 0 });
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+        }
+    }
     if ret < 0 {
         return crate::translate::linux_errno();
     }

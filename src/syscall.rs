@@ -459,23 +459,44 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     extern "C" { static environ: *const *const i8; }
     let envp_to_use = unsafe { environ };
 
-    // Debug: show what we're exec'ing
-    {
-        let path_str = unsafe { std::ffi::CStr::from_ptr(resolved_path.as_ptr()) };
-        let mut buf = [0u8; 256];
-        let n = raw_eprintln_fmt(format_args!("fakelinux: execve → fakelinux {:?}\n", path_str));
+    // Debug
+    unsafe {
+        let msg = format!("fakelinux: execve pid={} → {:?}\n", libc::getpid(), resolved_path);
+        libc::write(2, msg.as_ptr() as *const _, msg.len());
     }
 
-    // execve ourselves with the guest binary as first arg
-    unsafe {
-        libc::execve(
+    // If we're in a forked child (from signal handler), we can't execve
+    // directly because sigreturn is broken. Instead, this execve replaces
+    // the current process entirely — which works for the "last command"
+    // optimization in shells (exec without fork).
+    //
+    // For fork+exec: the fork child _exit'd(127), so the parent's wait4
+    // already reaped it. We're the PARENT now. We need to fork a fresh
+    // child (outside signal handler context) and exec there.
+    // But we're IN the signal handler... so let's try posix_spawn instead.
+    let mut pid: libc::pid_t = 0;
+    let ret = unsafe {
+        libc::posix_spawn(
+            &mut pid,
             self_exe_c.as_ptr(),
-            new_argv.as_ptr(),
-            envp_to_use,
-        );
+            std::ptr::null(),   // file_actions
+            std::ptr::null(),   // attrp
+            new_argv.as_ptr() as *const *mut i8,
+            envp_to_use as *const *mut i8,
+        )
+    };
+    if ret != 0 {
+        return (-38_i64) as u64; // ENOSYS
     }
-    // If execve returns, it failed
-    translate::linux_errno()
+    // Wait for the spawned child
+    let mut status: i32 = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0); }
+    // Return the child's exit status encoded as _exit would
+    if libc::WIFEXITED(status) {
+        // Child exited normally — call _exit with its status
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)); }
+    }
+    unsafe { libc::_exit(127); }
 }
 
 // ─── Memory management ──────────────────────────────────────────────────────
