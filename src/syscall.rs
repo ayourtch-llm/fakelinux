@@ -280,6 +280,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_SETFSGID => creds::do_setfsgid(args[0] as u32),
         SYS_SETGROUPS => creds::do_setgroups(args[0] as u32, args[1]),
         SYS_SENDFILE => do_sendfile(args[0] as i32, args[1] as i32, args[2], args[3]),
+        SYS_SYMLINKAT => do_symlinkat(args[0], args[1] as i32, args[2]),
+        SYS_LINKAT => do_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as i32),
+        SYS_FLOCK => do_flock(args[0] as i32, args[1] as i32),
+        SYS_UTIMENSAT => do_utimensat(args[0] as i32, args[1], args[2], args[3] as i32),
+        SYS_FTRUNCATE => do_ftruncate(args[0] as i32, args[1] as i64),
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -1529,4 +1534,158 @@ fn do_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: u64) -> u64 {
         unsafe { (offset_ptr as *mut i64).write_unaligned(offset_val) };
     }
     total as u64
+}
+
+fn do_symlinkat(target: u64, newdirfd: i32, linkpath: u64) -> u64 {
+    let target_ptr = target as *const libc::c_char;
+    let (eff_path, _hold) = effective_path_ptr(linkpath);
+    let dirfd = translate::translate_dirfd(newdirfd);
+    let ret = unsafe { libc::symlinkat(target_ptr, dirfd, eff_path) };
+    if ret == 0 {
+        0
+    } else if _hold.is_some() {
+        let ret2 = unsafe { libc::symlinkat(target_ptr, dirfd, linkpath as *const libc::c_char) };
+        if ret2 < 0 { translate::linux_errno() } else { 0 }
+    } else {
+        translate::linux_errno()
+    }
+}
+
+fn do_linkat(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags: i32) -> u64 {
+    let (eff_old, _hold_old) = effective_path_ptr(oldpath);
+    let (eff_new, _hold_new) = effective_path_ptr(newpath);
+    // Linux AT_EMPTY_PATH=0x1000, AT_SYMLINK_FOLLOW=0x400 — same on macOS
+    let ret = unsafe {
+        libc::linkat(
+            translate::translate_dirfd(olddirfd),
+            eff_old,
+            translate::translate_dirfd(newdirfd),
+            eff_new,
+            flags,
+        )
+    };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_flock(fd: i32, operation: i32) -> u64 {
+    // Linux and macOS flock constants are the same (LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4)
+    let ret = unsafe { libc::flock(fd, operation) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_utimensat(dirfd: i32, pathname: u64, times_ptr: u64, flags: i32) -> u64 {
+    // Linux struct timespec is {i64 tv_sec, i64 tv_nsec} — same layout on macOS aarch64
+    // Special values: UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE
+    let mac_dirfd = translate::translate_dirfd(dirfd);
+
+    if pathname == 0 {
+        // futimens variant: operate on fd directly
+        // macOS doesn't have futimens as a syscall, use futimes
+        if times_ptr == 0 {
+            // NULL times = set both to now
+            let ret = unsafe { libc::futimes(dirfd, std::ptr::null()) };
+            if ret < 0 { return translate::linux_errno(); }
+            return 0;
+        }
+        // Read Linux timespecs and convert to macOS timeval for futimes
+        let ts = times_ptr as *const libc::timespec;
+        let atime = unsafe { *ts };
+        let mtime = unsafe { *ts.add(1) };
+        let times = [
+            timespec_to_timeval(&atime),
+            timespec_to_timeval(&mtime),
+        ];
+        let ret = unsafe { libc::futimes(dirfd, times.as_ptr()) };
+        if ret < 0 { return translate::linux_errno(); }
+        return 0;
+    }
+
+    let (eff_path, _hold) = effective_path_ptr(pathname);
+
+    if times_ptr == 0 {
+        // NULL times = set both to now; use utimes with NULL
+        let ret = unsafe { libc::utimes(eff_path, std::ptr::null()) };
+        if ret == 0 { return 0; }
+        if _hold.is_some() {
+            let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, std::ptr::null()) };
+            if ret2 < 0 { return translate::linux_errno(); }
+            return 0;
+        }
+        return translate::linux_errno();
+    }
+
+    // Read Linux timespecs
+    let ts = times_ptr as *const libc::timespec;
+    let atime = unsafe { *ts };
+    let mtime = unsafe { *ts.add(1) };
+
+    // Check for UTIME_OMIT — if both are OMIT, nothing to do
+    const UTIME_OMIT: i64 = 0x3FFFFFFE;
+    const UTIME_NOW: i64 = 0x3FFFFFFF;
+    if atime.tv_nsec as i64 == UTIME_OMIT && mtime.tv_nsec as i64 == UTIME_OMIT {
+        return 0;
+    }
+
+    // For UTIME_NOW/UTIME_OMIT we need to read current times first
+    // macOS doesn't support these flags natively, so we emulate
+    let mut tv = [
+        timespec_to_timeval(&atime),
+        timespec_to_timeval(&mtime),
+    ];
+
+    // If either is UTIME_NOW or UTIME_OMIT, get current times
+    if atime.tv_nsec as i64 == UTIME_NOW || atime.tv_nsec as i64 == UTIME_OMIT
+        || mtime.tv_nsec as i64 == UTIME_NOW || mtime.tv_nsec as i64 == UTIME_OMIT
+    {
+        // Get current time for NOW, current file time for OMIT
+        let mut now_tv: libc::timeval = unsafe { std::mem::zeroed() };
+        unsafe { libc::gettimeofday(&mut now_tv, std::ptr::null_mut()) };
+
+        if atime.tv_nsec as i64 == UTIME_NOW {
+            tv[0] = now_tv;
+        } else if atime.tv_nsec as i64 == UTIME_OMIT {
+            // Need to stat the file to get current atime
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let _r = if flags & 0x100 != 0 { // AT_SYMLINK_NOFOLLOW
+                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, libc::AT_SYMLINK_NOFOLLOW) }
+            } else {
+                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, 0) }
+            };
+            tv[0].tv_sec = st.st_atime;
+            tv[0].tv_usec = st.st_atime_nsec as i32 / 1000;
+        }
+        if mtime.tv_nsec as i64 == UTIME_NOW {
+            tv[1] = now_tv;
+        } else if mtime.tv_nsec as i64 == UTIME_OMIT {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let _r = if flags & 0x100 != 0 {
+                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, libc::AT_SYMLINK_NOFOLLOW) }
+            } else {
+                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, 0) }
+            };
+            tv[1].tv_sec = st.st_mtime;
+            tv[1].tv_usec = st.st_mtime_nsec as i32 / 1000;
+        }
+    }
+
+    let ret = unsafe { libc::utimes(eff_path, tv.as_ptr()) };
+    if ret == 0 { return 0; }
+    if _hold.is_some() {
+        let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, tv.as_ptr()) };
+        if ret2 < 0 { return translate::linux_errno(); }
+        return 0;
+    }
+    translate::linux_errno()
+}
+
+fn timespec_to_timeval(ts: &libc::timespec) -> libc::timeval {
+    libc::timeval {
+        tv_sec: ts.tv_sec,
+        tv_usec: (ts.tv_nsec / 1000) as i32,
+    }
+}
+
+fn do_ftruncate(fd: i32, length: i64) -> u64 {
+    let ret = unsafe { libc::ftruncate(fd, length) };
+    if ret < 0 { translate::linux_errno() } else { 0 }
 }

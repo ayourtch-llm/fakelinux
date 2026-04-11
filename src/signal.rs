@@ -5,7 +5,6 @@
 //! that forward to the guest by building a Linux rt_sigframe on the guest stack.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 /// Address of the sigreturn trampoline (executable page with mov x8,#139; brk #0xf000).
 static SIGRETURN_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
@@ -22,10 +21,54 @@ pub struct GuestSigaction {
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
-/// Table of guest signal handlers indexed by Linux signal number (1..64).
-static GUEST_SIGACTIONS: Mutex<[GuestSigaction; 65]> = Mutex::new(
-    [GuestSigaction { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }; 65],
-);
+/// Lock-free sigaction table. Each signal (1..64) has 4 atomic u64 fields.
+/// This is async-signal-safe: signal_forwarder can read without a mutex.
+struct AtomicSigaction {
+    handler: AtomicU64,
+    flags: AtomicU64,
+    restorer: AtomicU64,
+    mask: AtomicU64,
+}
+
+impl AtomicSigaction {
+    const fn new() -> Self {
+        Self {
+            handler: AtomicU64::new(SIG_DFL),
+            flags: AtomicU64::new(0),
+            restorer: AtomicU64::new(0),
+            mask: AtomicU64::new(0),
+        }
+    }
+
+    fn load(&self) -> GuestSigaction {
+        GuestSigaction {
+            handler: self.handler.load(Ordering::SeqCst),
+            flags: self.flags.load(Ordering::SeqCst),
+            restorer: self.restorer.load(Ordering::SeqCst),
+            mask: self.mask.load(Ordering::SeqCst),
+        }
+    }
+
+    fn store(&self, sa: &GuestSigaction) {
+        // Store handler last so readers see consistent flags/mask first
+        self.flags.store(sa.flags, Ordering::SeqCst);
+        self.restorer.store(sa.restorer, Ordering::SeqCst);
+        self.mask.store(sa.mask, Ordering::SeqCst);
+        self.handler.store(sa.handler, Ordering::SeqCst);
+    }
+}
+
+// Macro to generate a const array since AtomicU64 isn't Copy
+macro_rules! atomic_sigaction_array {
+    ($n:expr) => {{
+        // SAFETY: AtomicU64::new(0) is all-zeros, same as zeroed memory
+        const INIT: AtomicSigaction = AtomicSigaction::new();
+        [INIT; $n]
+    }};
+}
+
+/// Lock-free table of guest signal handlers indexed by Linux signal number (1..64).
+static GUEST_SIGACTIONS: [AtomicSigaction; 65] = atomic_sigaction_array!(65);
 
 /// Guest signal mask (bitmask of blocked signals, bit N = Linux signal N).
 pub static GUEST_SIGMASK: AtomicU64 = AtomicU64::new(0);
@@ -289,12 +332,10 @@ unsafe extern "C" fn signal_forwarder(
         return;
     }
 
-    // Look up the guest handler
-    let (handler, handler_mask) = {
-        let table = GUEST_SIGACTIONS.lock().unwrap();
-        let sa = &table[linux_sig as usize];
-        (sa.handler, sa.mask)
-    };
+    // Look up the guest handler (lock-free atomic read — async-signal-safe)
+    let sa = GUEST_SIGACTIONS[linux_sig as usize].load();
+    let handler = sa.handler;
+    let handler_mask = sa.mask;
 
     // If no custom handler, skip (shouldn't happen but be safe)
     if handler == SIG_DFL || handler == SIG_IGN {
@@ -336,17 +377,16 @@ pub fn do_rt_sigaction(linux_sig: u64, act_ptr: u64, oldact_ptr: u64, _sigsetsiz
         return 0;
     }
 
-    let mut table = GUEST_SIGACTIONS.lock().unwrap();
-
-    // Return old action
+    // Return old action (lock-free atomic read)
     if oldact_ptr != 0 {
-        write_guest_sigaction(oldact_ptr, &table[sig]);
+        let old = GUEST_SIGACTIONS[sig].load();
+        write_guest_sigaction(oldact_ptr, &old);
     }
 
-    // Install new action
+    // Install new action (lock-free atomic store)
     if act_ptr != 0 {
         let new_act = read_guest_sigaction(act_ptr);
-        table[sig] = new_act;
+        GUEST_SIGACTIONS[sig].store(&new_act);
 
         // Install a macOS signal handler if the guest wants a custom handler
         if let Some(mac_sig) = linux_to_mac(sig as i32) {
@@ -417,12 +457,9 @@ pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
             // Clear this signal from pending
             PENDING_SIGNALS.fetch_and(!(1u64 << (sig - 1) as u64), Ordering::SeqCst);
 
-            // Look up guest handler
-            let (handler, handler_mask) = {
-                let table = GUEST_SIGACTIONS.lock().unwrap();
-                let sa = &table[sig as usize];
-                (sa.handler, sa.mask)
-            };
+            // Look up guest handler (lock-free atomic read)
+            let sa = GUEST_SIGACTIONS[sig as usize].load();
+            let (handler, handler_mask) = (sa.handler, sa.mask);
 
             if handler != SIG_DFL && handler != SIG_IGN {
                 build_sigframe_and_redirect(mctx, sig, handler, handler_mask);

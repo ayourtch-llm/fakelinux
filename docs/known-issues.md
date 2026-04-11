@@ -1,17 +1,15 @@
 # Known Issues and Future Fixes
 
-Issues identified during code review of Phase 1-6 implementation.
+Issues identified during code review. See docs/compatibility-roadmap.md for the
+full plan to reach broader Linux compatibility.
 
 ## High Priority
 
-### Mutex in signal handler (signal.rs)
-`GUEST_SIGACTIONS.lock()` in `signal_forwarder` is not async-signal-safe.
-If a signal arrives while `do_rt_sigaction` holds the mutex, deadlock occurs.
-Fix: replace with lock-free array of AtomicU64 pairs, or block signals around mutex hold.
+### ~~Mutex in signal handler (signal.rs)~~ FIXED
+Replaced with lock-free AtomicSigaction array. No more mutex in signal context.
 
-### NEON/FP registers not saved in sigframe
-The rt_sigframe only saves GPRs. Signal delivery during FP-heavy code will
-corrupt NEON/FP state silently. Fix: save/restore 32x 128-bit NEON registers.
+### ~~NEON/FP registers not saved in sigframe~~ FIXED
+All 32 q0-q31 registers saved/restored via macOS mcontext in sigframe.
 
 ## Medium Priority
 
