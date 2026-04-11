@@ -1,7 +1,12 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::syscall;
+
+/// Flag indicating we're inside the SIGTRAP handler. When set, other signal
+/// handlers (signal_forwarder) must defer delivery by queuing to pending,
+/// because the ucontext contains SIGTRAP handler registers, not guest registers.
+pub static IN_SIGTRAP: AtomicBool = AtomicBool::new(false);
 
 /// Format into a stack buffer using raw write — no Mutex, safe after fork.
 fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
@@ -37,10 +42,10 @@ pub fn get_guest_tpidr() -> u64 {
 // macOS aarch64 mcontext structures
 
 #[repr(C)]
-struct ExceptionState64 {
-    far: u64,
-    esr: u32,
-    exception: u32,
+pub struct ExceptionState64 {
+    pub far: u64,
+    pub esr: u32,
+    pub exception: u32,
 }
 
 #[repr(C)]
@@ -51,23 +56,23 @@ pub struct ThreadState64 {
     pub sp: u64,
     pub pc: u64,
     pub cpsr: u32,
-    _pad: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]
-struct MContext64 {
-    es: ExceptionState64,
-    ss: ThreadState64,
+pub struct MContext64 {
+    pub es: ExceptionState64,
+    pub ss: ThreadState64,
 }
 
 #[repr(C)]
-struct UContext {
-    uc_onstack: i32,
-    uc_sigmask: u32,
-    uc_stack: libc::stack_t,
-    uc_link: *mut UContext,
-    uc_mcsize: usize,
-    uc_mcontext: *mut MContext64,
+pub struct UContext {
+    pub uc_onstack: i32,
+    pub uc_sigmask: u32,
+    pub uc_stack: libc::stack_t,
+    pub uc_link: *mut UContext,
+    pub uc_mcsize: usize,
+    pub uc_mcontext: *mut MContext64,
 }
 
 /// Read a register value from the saved thread state by register number (0-30).
@@ -95,6 +100,8 @@ unsafe extern "C" fn sigtrap_handler(
     _info: *mut libc::siginfo_t,
     ctx: *mut c_void,
 ) {
+    IN_SIGTRAP.store(true, Ordering::SeqCst);
+
     let uctx = &mut *(ctx as *mut UContext);
     let mctx = &mut *uctx.uc_mcontext;
     let regs = &mut mctx.ss;
@@ -114,6 +121,7 @@ unsafe extern "C" fn sigtrap_handler(
                 let val = read_reg(regs, rn);
                 GUEST_TPIDR.store(val, Ordering::SeqCst);
                 regs.pc = pc + 4;
+                IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
@@ -121,6 +129,7 @@ unsafe extern "C" fn sigtrap_handler(
                 let val = GUEST_TPIDR.load(Ordering::SeqCst);
                 write_reg(regs, rn, val);
                 regs.pc = pc + 4;
+                IN_SIGTRAP.store(false, Ordering::SeqCst);
                 return;
             }
         }
@@ -149,6 +158,9 @@ unsafe extern "C" fn sigtrap_handler(
             regs.pc = crate::thread::fork_trampoline_addr();
             // Clear signal mask so SIGTRAP is unblocked after sigreturn
             uctx.uc_sigmask = 0;
+        } else if result == crate::signal::SIGRETURN_SENTINEL {
+            // rt_sigreturn: registers were already restored directly into regs.
+            // Don't overwrite x0 or pc.
         } else {
             regs.x[0] = result as u64;
             regs.pc = pc + 4;
@@ -186,6 +198,12 @@ unsafe extern "C" fn sigtrap_handler(
         libc::write(2, buf.as_ptr() as *const _, n);
         libc::_exit(128 + libc::SIGTRAP);
     }
+
+    IN_SIGTRAP.store(false, Ordering::SeqCst);
+
+    // Deliver any signals that were deferred while we were in the SIGTRAP handler.
+    // We build the sigframe directly here since we have the guest registers in mcontext.
+    crate::signal::deliver_pending_to_guest(regs);
 }
 
 /// Get the handler function pointer (for use in forked children).

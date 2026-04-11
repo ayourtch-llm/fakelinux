@@ -70,6 +70,8 @@ pub const SYS_FCHOWNAT: u64 = 54;
 pub const SYS_READV: u64 = 65;
 pub const SYS_PREAD64: u64 = 67;
 pub const SYS_PWRITE64: u64 = 68;
+pub const SYS_KILL: u64 = 129;
+pub const SYS_TKILL: u64 = 130;
 pub const SYS_STATX: u64 = 291;
 
 // Auxiliary vector types

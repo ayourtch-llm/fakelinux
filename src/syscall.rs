@@ -73,7 +73,16 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_SET_ROBUST_LIST => 0,
         SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
-        SYS_RT_SIGRETURN => 0, // stub
+        SYS_RT_SIGRETURN => {
+            // rt_sigreturn restores ALL registers from the sigframe on the stack.
+            // It does NOT return a value in x0. We restore directly into _regs
+            // and return a sentinel so the trap handler knows not to overwrite.
+            if unsafe { signal::do_rt_sigreturn(_regs) } {
+                signal::SIGRETURN_SENTINEL
+            } else {
+                (-22_i64) as u64 // -EINVAL if sigframe is invalid
+            }
+        }
         SYS_CLOCK_GETTIME => do_clock_gettime(args[0] as i32, args[1]),
         SYS_UNAME => do_uname(args[0]),
         SYS_GETRANDOM => do_getrandom(args[0], args[1], args[2] as u32),
@@ -99,15 +108,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _regs: &mut ThreadState64) -> u64 {
         SYS_GETDENTS64 => do_getdents64(args[0] as i32, args[1], args[2]),
         SYS_PPOLL => (-38_i64) as u64, // ENOSYS stub
         SYS_SOCKET => (-38_i64) as u64, // ENOSYS stub
-        SYS_TGKILL => {
-            let sig = args[2] as i32;
-            if sig == 6 {
-                raw_eprintln("fakelinux: guest called abort (tgkill SIGABRT)\n");
-                unsafe { libc::_exit(134) }
-            }
-            unsafe { libc::kill(libc::getpid(), sig); }
-            0
-        }
+        SYS_KILL => signal::do_kill(args[0] as i64, args[1] as i32),
+        SYS_TKILL => signal::do_tkill(args[0] as i32, args[1] as i32),
+        SYS_TGKILL => signal::do_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),
         SYS_UMASK => {
             let ret = unsafe { libc::umask(args[0] as libc::mode_t) };
             ret as u64

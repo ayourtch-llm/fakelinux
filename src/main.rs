@@ -47,6 +47,7 @@ fn main() {
         unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr); }
         trap::GUEST_TPIDR.store(tpidr, std::sync::atomic::Ordering::SeqCst);
     }
+    signal::create_sigreturn_trampoline();
     trap::install_handler();
 
     // Load segments, patch SVCs, set up stack
