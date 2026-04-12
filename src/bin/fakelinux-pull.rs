@@ -1,5 +1,7 @@
-//! Minimal OCI image puller — pulls Docker images without Docker installed.
+//! Minimal OCI image puller — pulls Docker/OCI images without Docker installed.
 //! Usage: fakelinux-pull <image:tag> <output-dir>
+//!
+//! Supports Docker Hub (docker.io) and GitHub Container Registry (ghcr.io).
 
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -14,13 +16,14 @@ fn main() {
     if args.len() != 3 {
         eprintln!("Usage: {} <image:tag> <output-dir>", args[0]);
         eprintln!("Example: {} python:3.12-alpine ./python-rootfs", args[0]);
+        eprintln!("         {} ghcr.io/owner/repo:tag ./rootfs", args[0]);
         std::process::exit(1);
     }
 
-    let (image, tag) = parse_image_ref(&args[1]);
+    let (registry, image, tag) = parse_image_ref(&args[1]);
     let output_dir = &args[2];
 
-    println!("Pulling {image}:{tag} -> {output_dir}");
+    println!("Pulling {registry}/{image}:{tag} -> {output_dir}");
 
     let client = Client::builder()
         .user_agent("fakelinux-pull/0.1")
@@ -28,12 +31,12 @@ fn main() {
         .expect("failed to build HTTP client");
 
     // Step 1: Get auth token
-    println!("Authenticating...");
-    let token = get_auth_token(&client, &image);
+    println!("Authenticating with {registry}...");
+    let token = get_auth_token(&client, &registry, &image);
 
-    // Step 2: Fetch manifest (handle fat manifests)
+    // Step 2: Fetch manifest (handle fat manifests / OCI indices)
     println!("Fetching manifest...");
-    let manifest = get_manifest(&client, &image, &tag, &token);
+    let manifest = get_manifest(&client, &registry, &image, &tag, &token);
 
     // Step 3: Extract layer digests
     let layers = get_layers(&manifest);
@@ -50,7 +53,7 @@ fn main() {
             layers.len(),
             &digest[..19]
         );
-        download_and_extract_layer(&client, &image, digest, &token, output_dir);
+        download_and_extract_layer(&client, &registry, &image, digest, &token, output_dir);
     }
 
     // Step 6: Strip quarantine xattrs (macOS)
@@ -62,34 +65,77 @@ fn main() {
     println!("Done! Rootfs extracted to {output_dir}");
 }
 
-/// Parse "python:3.12-alpine" -> ("library/python", "3.12-alpine")
-fn parse_image_ref(reference: &str) -> (String, String) {
+/// Registry info for API endpoint construction.
+struct RegistryInfo {
+    /// Base URL for the v2 API (e.g. "https://registry-1.docker.io")
+    api_base: String,
+    /// Auth token URL template. {image} and {scope} are substituted.
+    auth_url: String,
+}
+
+fn registry_info(registry: &str) -> RegistryInfo {
+    match registry {
+        "docker.io" => RegistryInfo {
+            api_base: "https://registry-1.docker.io".into(),
+            auth_url: "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull".into(),
+        },
+        "ghcr.io" => RegistryInfo {
+            api_base: "https://ghcr.io".into(),
+            auth_url: "https://ghcr.io/token?scope=repository:{image}:pull".into(),
+        },
+        other => {
+            // Generic OCI registry — try token endpoint at the registry itself
+            let base = format!("https://{other}");
+            RegistryInfo {
+                api_base: base.clone(),
+                auth_url: format!("{base}/token?scope=repository:{{image}}:pull"),
+            }
+        }
+    }
+}
+
+/// Parse image reference into (registry, image, tag).
+/// Examples:
+///   "python:3.12-alpine"            -> ("docker.io", "library/python", "3.12-alpine")
+///   "myuser/myrepo:v1"              -> ("docker.io", "myuser/myrepo", "v1")
+///   "ghcr.io/owner/repo:latest"     -> ("ghcr.io", "owner/repo", "latest")
+///   "quay.io/org/repo"              -> ("quay.io", "org/repo", "latest")
+fn parse_image_ref(reference: &str) -> (String, String, String) {
     let (name, tag) = if let Some((n, t)) = reference.split_once(':') {
         (n.to_string(), t.to_string())
     } else {
         (reference.to_string(), "latest".to_string())
     };
 
-    // Add "library/" prefix for official images (no slash in name)
-    let name = if !name.contains('/') {
+    // Check if the first component looks like a registry hostname
+    // (contains a dot or is "localhost")
+    let parts: Vec<&str> = name.splitn(2, '/').collect();
+    if parts.len() == 2 && (parts[0].contains('.') || parts[0] == "localhost") {
+        let registry = parts[0].to_string();
+        let image = parts[1].to_string();
+        return (registry, image, tag);
+    }
+
+    // Docker Hub: add "library/" prefix for official images (no slash)
+    let image = if !name.contains('/') {
         format!("library/{name}")
     } else {
         name
     };
 
-    (name, tag)
+    ("docker.io".into(), image, tag)
 }
 
-fn get_auth_token(client: &Client, image: &str) -> String {
-    let url = format!(
-        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull"
-    );
+fn get_auth_token(client: &Client, registry: &str, image: &str) -> String {
+    let info = registry_info(registry);
+    let url = info.auth_url.replace("{image}", image);
     let resp: Value = client.get(&url).send().unwrap().json().unwrap();
     resp["token"].as_str().expect("no token in auth response").to_string()
 }
 
-fn get_manifest(client: &Client, image: &str, tag: &str, token: &str) -> Value {
-    let url = format!("https://registry-1.docker.io/v2/{image}/manifests/{tag}");
+fn get_manifest(client: &Client, registry: &str, image: &str, tag: &str, token: &str) -> Value {
+    let info = registry_info(registry);
+    let url = format!("{}/v2/{image}/manifests/{tag}", info.api_base);
     let resp = client
         .get(&url)
         .bearer_auth(token)
@@ -115,7 +161,7 @@ fn get_manifest(client: &Client, image: &str, tag: &str, token: &str) -> Value {
         || (schema_version == 2 && manifest.get("manifests").is_some())
     {
         println!("Fat manifest detected, selecting linux/arm64...");
-        return resolve_platform_manifest(client, image, token, &manifest, "arm64");
+        return resolve_platform_manifest(client, registry, image, token, &manifest, "arm64");
     }
 
     manifest
@@ -123,6 +169,7 @@ fn get_manifest(client: &Client, image: &str, tag: &str, token: &str) -> Value {
 
 fn resolve_platform_manifest(
     client: &Client,
+    registry: &str,
     image: &str,
     token: &str,
     index: &Value,
@@ -138,7 +185,6 @@ fn resolve_platform_manifest(
                 && platform["os"].as_str() == Some("linux")
         })
         .unwrap_or_else(|| {
-            // Print available platforms for debugging
             for m in manifests {
                 let p = &m["platform"];
                 eprintln!(
@@ -157,7 +203,8 @@ fn resolve_platform_manifest(
 
     println!("  -> resolving {digest}");
 
-    let url = format!("https://registry-1.docker.io/v2/{image}/manifests/{digest}");
+    let info = registry_info(registry);
+    let url = format!("{}/v2/{image}/manifests/{digest}", info.api_base);
     let resp = client
         .get(&url)
         .bearer_auth(token)
@@ -186,12 +233,14 @@ fn get_layers(manifest: &Value) -> Vec<String> {
 
 fn download_and_extract_layer(
     client: &Client,
+    registry: &str,
     image: &str,
     digest: &str,
     token: &str,
     output_dir: &str,
 ) {
-    let url = format!("https://registry-1.docker.io/v2/{image}/blobs/{digest}");
+    let info = registry_info(registry);
+    let url = format!("{}/v2/{image}/blobs/{digest}", info.api_base);
     let mut resp = client
         .get(&url)
         .bearer_auth(token)
