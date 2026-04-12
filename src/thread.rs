@@ -159,6 +159,7 @@ pub const CLONE_VM: u64 = 0x00000100;
 pub const CLONE_FS: u64 = 0x00000200;
 pub const CLONE_FILES: u64 = 0x00000400;
 pub const CLONE_SIGHAND: u64 = 0x00000800;
+pub const CLONE_VFORK: u64 = 0x00004000;
 pub const CLONE_THREAD: u64 = 0x00010000;
 pub const CLONE_SYSVSEM: u64 = 0x00040000;
 pub const CLONE_SETTLS: u64 = 0x00080000;
@@ -172,6 +173,15 @@ pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64, regs: &crate::trap::ThreadState64) -> u64 {
     // Fork: clone without CLONE_VM
     if flags & CLONE_VM == 0 {
+        return do_fork(flags);
+    }
+
+    // CLONE_VM | CLONE_VFORK (without CLONE_THREAD): vfork-like clone.
+    // Used by musl/glibc for posix_spawn/system(). The child shares the
+    // parent's address space and the parent blocks until the child execs or
+    // exits. We treat this as a regular fork — the child will re-exec
+    // fakelinux anyway, so sharing the address space briefly is fine.
+    if flags & CLONE_VFORK != 0 && flags & CLONE_THREAD == 0 {
         return do_fork(flags);
     }
 
