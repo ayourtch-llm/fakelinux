@@ -562,10 +562,15 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
     }
 }
 
-/// Convert macOS termios to Linux aarch64 termios (60 bytes) at guest address.
-/// Linux layout: u32 iflag, u32 oflag, u32 cflag, u32 lflag, u8 c_line,
-///               u8 c_cc[32], u8 pad[3], u32 ispeed, u32 ospeed
+/// Convert macOS termios to Linux aarch64 kernel termios (36 bytes) at guest address.
+/// Kernel layout (TCGETS): u32 iflag, u32 oflag, u32 cflag, u32 lflag,
+///                          u8 c_line, u8 c_cc[NCCS=19]
+/// Total: 36 bytes.  Note: the kernel struct does NOT include c_ispeed/c_ospeed;
+/// those live only in struct termios2 (TCGETS2).  Userspace musl defines a larger
+/// struct (NCCS=32 + speeds = 60 bytes), but the kernel only writes 36 bytes, so
+/// we must not overflow into the caller's stack canary or saved registers.
 fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
+    const KERNEL_NCCS: usize = 19;
     unsafe {
         let p = linux_ptr as *mut u8;
         (p as *mut u32).write_unaligned(mac.c_iflag as u32);
@@ -574,23 +579,18 @@ fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
         (p.add(12) as *mut u32).write_unaligned(mac.c_lflag as u32);
         // c_line (Linux-specific, byte at offset 16)
         *p.add(16) = 0;
-        // c_cc: copy min(20, 32) from macOS, zero-fill rest
+        // c_cc: copy first KERNEL_NCCS entries from macOS
         let cc_dst = p.add(17);
-        std::ptr::write_bytes(cc_dst, 0, 32);
-        // Map macOS cc indices to Linux cc indices (first ~20 are compatible)
-        for i in 0..20usize {
+        for i in 0..KERNEL_NCCS.min(mac.c_cc.len()) {
             *cc_dst.add(i) = mac.c_cc[i];
         }
-        // padding
-        std::ptr::write_bytes(p.add(49), 0, 3);
-        // speeds
-        (p.add(52) as *mut u32).write_unaligned(mac.c_ispeed as u32);
-        (p.add(56) as *mut u32).write_unaligned(mac.c_ospeed as u32);
+        // Total written: 16 + 1 + 19 = 36 bytes
     }
 }
 
-/// Convert Linux aarch64 termios (60 bytes at guest address) to macOS termios.
+/// Convert Linux aarch64 kernel termios (36 bytes at guest address) to macOS termios.
 fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
+    const KERNEL_NCCS: usize = 19;
     unsafe {
         let p = linux_ptr as *const u8;
         let mut mac: libc::termios = std::mem::zeroed();
@@ -598,13 +598,13 @@ fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
         mac.c_oflag = (p.add(4) as *const u32).read_unaligned() as u64;
         mac.c_cflag = (p.add(8) as *const u32).read_unaligned() as u64;
         mac.c_lflag = (p.add(12) as *const u32).read_unaligned() as u64;
-        // c_cc: copy first 20 from Linux
+        // c_cc: copy KERNEL_NCCS entries from Linux
         let cc_src = p.add(17);
-        for i in 0..20usize {
+        for i in 0..KERNEL_NCCS.min(mac.c_cc.len()) {
             mac.c_cc[i] = *cc_src.add(i);
         }
-        mac.c_ispeed = (p.add(52) as *const u32).read_unaligned() as u64;
-        mac.c_ospeed = (p.add(56) as *const u32).read_unaligned() as u64;
+        // Derive speeds from cflag CBAUD bits (kernel doesn't store them separately)
+        // For now leave as 0 — macOS tcsetattr will use the cflag baud bits
         mac
     }
 }
