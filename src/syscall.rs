@@ -369,6 +369,7 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
 }
 
 fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u64 {
+    if pathname == 0 { return (-14_i64) as u64; } // -EFAULT
     let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
 
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
