@@ -84,6 +84,29 @@ pub const LINUX_F_SETLK: i32 = 6;
 pub const LINUX_F_SETLKW: i32 = 7;
 pub const LINUX_F_DUPFD_CLOEXEC: i32 = 1030;
 
+/// Translate Linux file status flags (for F_SETFL) to macOS.
+/// Linux O_NONBLOCK=0x800, macOS O_NONBLOCK=0x4.
+/// Linux O_APPEND=0x400, macOS O_APPEND=0x8.
+/// Linux O_ASYNC=0x2000, macOS O_ASYNC=0x40.
+pub fn linux_fl_to_mac(linux_fl: i32) -> i32 {
+    let mut mac = 0;
+    if linux_fl & 0x800 != 0 { mac |= libc::O_NONBLOCK; }  // Linux O_NONBLOCK
+    if linux_fl & 0x400 != 0 { mac |= libc::O_APPEND; }    // Linux O_APPEND
+    if linux_fl & 0x2000 != 0 { mac |= 0x40; }             // O_ASYNC
+    mac
+}
+
+/// Translate macOS file status flags (from F_GETFL) to Linux.
+pub fn mac_fl_to_linux(mac_fl: i32) -> i32 {
+    let mut linux = 0;
+    if mac_fl & libc::O_NONBLOCK != 0 { linux |= 0x800; }  // Linux O_NONBLOCK
+    if mac_fl & libc::O_APPEND != 0 { linux |= 0x400; }    // Linux O_APPEND
+    if mac_fl & 0x40 != 0 { linux |= 0x2000; }             // O_ASYNC
+    // Preserve access mode (O_RDONLY=0, O_WRONLY=1, O_RDWR=2 — same on both)
+    linux |= mac_fl & 0x3;
+    linux
+}
+
 pub fn translate_fcntl_cmd(linux_cmd: i32) -> Option<i32> {
     match linux_cmd {
         LINUX_F_DUPFD => Some(libc::F_DUPFD),

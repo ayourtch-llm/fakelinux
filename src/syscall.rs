@@ -930,8 +930,20 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
     }
 
     if let Some(mac_cmd) = translate::translate_fcntl_cmd(linux_cmd) {
-        let ret = unsafe { libc::fcntl(fd, mac_cmd, arg as i32) };
-        if ret < 0 { translate::linux_errno() } else { ret as u64 }
+        // Translate flags for F_SETFL (Linux → macOS) and F_GETFL (macOS → Linux)
+        let effective_arg = if linux_cmd == translate::LINUX_F_SETFL {
+            translate::linux_fl_to_mac(arg as i32) as i32
+        } else {
+            arg as i32
+        };
+        let ret = unsafe { libc::fcntl(fd, mac_cmd, effective_arg) };
+        if ret < 0 {
+            translate::linux_errno()
+        } else if linux_cmd == translate::LINUX_F_GETFL {
+            translate::mac_fl_to_linux(ret) as u64
+        } else {
+            ret as u64
+        }
     } else {
         eprintln!("fakelinux: unsupported fcntl cmd {}", linux_cmd);
         (-22_i64) as u64 // -EINVAL
