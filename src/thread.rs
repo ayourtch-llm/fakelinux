@@ -419,12 +419,40 @@ extern "C" fn fork_trampoline_entry() -> ! {
         0
     };
 
+    // Probe pipe fds before fork for debugging
+    if crate::syscall::trace_enabled() {
+        for fd in [5_i32, 6, 7, 8, 9, 10] {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::fstat(fd, &mut st) };
+            if ret == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO {
+                let pid_val = unsafe { libc::getpid() };
+                let msg = format!("fakelinux: [{}] FORK_PROBE pre-fork fd={} ino={}\n",
+                    pid_val, fd, st.st_ino);
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            }
+        }
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe { libc::_exit(127); }
     }
 
     if pid == 0 {
+        // Probe pipe fds in child right after fork
+        if crate::syscall::trace_enabled() {
+            for fd in [0_i32, 1, 5, 6, 7, 8, 9, 10] {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let ret = unsafe { libc::fstat(fd, &mut st) };
+                if ret == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO {
+                    let pid_val = unsafe { libc::getpid() };
+                    let msg = format!("fakelinux: [{}] FORK_PROBE child fd={} ino={}\n",
+                        pid_val, fd, st.st_ino);
+                    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                }
+            }
+        }
+
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();

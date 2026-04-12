@@ -491,7 +491,40 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
     if eventfd::is_eventfd(fd_i32) {
         return eventfd::do_write(fd_i32, buf, count);
     }
+    // Probe fd 1 pipe inode on first write to track pipe identity
+    if fd_i32 == 1 && TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        static FD1_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !FD1_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let fstat_ret = unsafe { libc::fstat(1, &mut st) };
+            if fstat_ret == 0 {
+                let pid = unsafe { libc::getpid() };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] FD1_PROBE ino={}\n", pid, st.st_ino));
+            }
+        }
+    }
     let ret = unsafe { libc::write(fd_i32, buf as *const _, count as usize) };
+    if ret < 0 && fd_i32 == 1 {
+        // Probe fd 1 on failure
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let fstat_ret = unsafe { libc::fstat(1, &mut st) };
+        let fd_type = if fstat_ret == 0 {
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFIFO => "pipe",
+                libc::S_IFREG => "file",
+                libc::S_IFCHR => "char",
+                libc::S_IFSOCK => "socket",
+                _ => "other",
+            }
+        } else { "fstat_failed" };
+        let errno = unsafe { *libc::__error() };
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] write(1) FAILED: errno={} fd_type={} mode={:#o} ino={}\n",
+            pid, errno, fd_type, if fstat_ret == 0 { st.st_mode } else { 0 },
+            if fstat_ret == 0 { st.st_ino } else { 0 }));
+    }
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (fd_i32 <= 8) {
         let preview = if ret > 0 && buf != 0 {
             let len = (ret as usize).min(80);
@@ -1716,6 +1749,28 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
         raw_eprintln_fmt(format_args!(
             "fakelinux: pselect6 nfds={} rd:{:#x}→{:#x} wr:{:#x}→{:#x} ret={} tv={}\n",
             nfds, rdbits_before, rdbits_after, wrbits_before, wrbits_after, ret, tv));
+    }
+    // One-shot diagnostic: when pselect watches fds 5&6 and gets nothing, probe the fds
+    if ret == 0 && rdbits_before == 0x60 && nfds == 7 {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            for fd in [5_i32, 6] {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let fstat_ret = unsafe { libc::fstat(fd, &mut st) };
+                let fd_type = if fstat_ret == 0 {
+                    match st.st_mode & libc::S_IFMT {
+                        libc::S_IFIFO => "pipe",
+                        libc::S_IFREG => "file",
+                        libc::S_IFCHR => "char",
+                        _ => "other",
+                    }
+                } else { "EBADF" };
+                let pid = unsafe { libc::getpid() };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] HANG PROBE fd={} type={} ino={}\n",
+                    pid, fd, fd_type, if fstat_ret == 0 { st.st_ino } else { 0 }));
+            }
+        }
     }
 
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
