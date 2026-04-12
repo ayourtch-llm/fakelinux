@@ -1246,8 +1246,13 @@ unsafe extern "C" fn trap_handler(
 }
 
 /// Full signal environment re-init for child after fork().
-/// Re-installs trap handler, allocates a fresh signal alt stack, and unblocks signals.
+/// Re-installs trap handler, allocates a fresh signal alt stack, unblocks signals,
+/// and clears inherited pending signals (POSIX: child's pending set is empty).
 pub fn init_child_after_fork() {
+    // POSIX: child's pending signal set must be empty after fork.
+    // Clear fakelinux's internal pending signals (inherited from parent via COW).
+    crate::signal::reset_after_fork();
+
     unsafe {
         // Allocate a fresh signal alt stack for the child
         let stack_size: usize = 128 * 1024;

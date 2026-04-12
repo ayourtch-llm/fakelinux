@@ -100,6 +100,31 @@ fn main() {
     signal::create_sigreturn_trampoline();
     trap::install_handler();
 
+    // Restore signal state inherited from before execve.
+    // POSIX: SIG_IGN is preserved across execve; signal mask is preserved.
+    // The previous fakelinux process encoded these in env vars.
+    if let Ok(ign_str) = std::env::var("FAKELINUX_SIGIGN") {
+        if let Ok(ign_mask) = u64::from_str_radix(ign_str.trim_start_matches("0x"), 16) {
+            for sig in 1..65u64 {
+                if ign_mask & (1u64 << (sig - 1)) != 0 {
+                    // Set this signal to SIG_IGN in the guest signal table
+                    signal::do_rt_sigaction(sig, 0, 0, 8);
+                    // Write SIG_IGN directly (do_rt_sigaction with act_ptr=0 is a no-op)
+                    // Instead, build a SIG_IGN sigaction on the stack and call do_rt_sigaction
+                    let ign_act: [u64; 4] = [1, 0, 0, 0]; // handler=SIG_IGN, flags=0, restorer=0, mask=0
+                    signal::do_rt_sigaction(sig, ign_act.as_ptr() as u64, 0, 8);
+                }
+            }
+        }
+        std::env::remove_var("FAKELINUX_SIGIGN");
+    }
+    if let Ok(mask_str) = std::env::var("FAKELINUX_SIGMASK") {
+        if let Ok(mask) = u64::from_str_radix(mask_str.trim_start_matches("0x"), 16) {
+            signal::GUEST_SIGMASK.store(mask, std::sync::atomic::Ordering::SeqCst);
+        }
+        std::env::remove_var("FAKELINUX_SIGMASK");
+    }
+
     // Initialize container mode:
     // --container flag creates a new namespace (init process, PID 1)
     // FAKELINUX_CONTAINER env var attaches to existing namespace (child after execve)

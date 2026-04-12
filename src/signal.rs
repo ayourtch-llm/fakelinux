@@ -103,7 +103,14 @@ pub fn guest_sigaction(linux_sig: usize) -> GuestSigaction {
 pub static GUEST_SIGMASK: AtomicU64 = AtomicU64::new(0);
 
 /// Pending signals (bitmask, bit N = Linux signal N is pending but was blocked).
-static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
+pub static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset signal state for a child process after fork().
+/// POSIX: child's pending signal set must be empty.
+/// Signal dispositions and mask are inherited (correct via COW).
+pub fn reset_after_fork() {
+    PENDING_SIGNALS.store(0, Ordering::SeqCst);
+}
 
 /// Sentinel return value from emulate() meaning "rt_sigreturn restored all regs, don't touch x0/pc".
 pub const SIGRETURN_SENTINEL: u64 = 0xFFFF_FFFF_DEAD_5167;
@@ -415,6 +422,16 @@ pub fn do_rt_sigaction(linux_sig: u64, act_ptr: u64, oldact_ptr: u64, _sigsetsiz
     // Install new action (lock-free atomic store)
     if act_ptr != 0 {
         let new_act = read_guest_sigaction(act_ptr);
+        if crate::syscall::trace_enabled() {
+            let handler_name = match new_act.handler {
+                0 => "SIG_DFL".to_string(),
+                1 => "SIG_IGN".to_string(),
+                h => format!("{:#x}", h),
+            };
+            let pid = unsafe { libc::getpid() };
+            crate::syscall::raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] rt_sigaction(sig={}, handler={})\n", pid, sig, handler_name));
+        }
         GUEST_SIGACTIONS[sig].store(&new_act);
 
         // Install a macOS signal handler if the guest wants a custom handler
@@ -541,7 +558,16 @@ pub fn do_kill(pid: i64, linux_sig: i32) -> u64 {
         None => return (-22_i64) as u64, // -EINVAL
     };
 
+    if crate::syscall::trace_enabled() {
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: kill(real_pid={}, mac_sig={}) from pid={}\n",
+            pid, mac_sig, unsafe { libc::getpid() }));
+    }
     let ret = unsafe { libc::kill(pid as i32, mac_sig) };
+    if crate::syscall::trace_enabled() {
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: kill result={}\n", ret));
+    }
     if ret < 0 {
         crate::translate::linux_errno()
     } else {
