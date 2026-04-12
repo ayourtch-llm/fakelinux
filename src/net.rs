@@ -237,11 +237,18 @@ pub fn do_recvfrom(
 }
 
 pub fn do_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
+    let (mac_level, mac_optname) = match translate::translate_sockopt(level, optname) {
+        Some(pair) => pair,
+        None => {
+            // Unknown option — try pass-through, return ENOPROTOOPT on failure
+            (level, optname)
+        }
+    };
     let ret = unsafe {
         libc::setsockopt(
             fd,
-            level,
-            optname,
+            mac_level,
+            mac_optname,
             optval as *const libc::c_void,
             optlen as libc::socklen_t,
         )
@@ -254,11 +261,15 @@ pub fn do_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u32
 }
 
 pub fn do_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen_ptr: u64) -> u64 {
+    let (mac_level, mac_optname) = match translate::translate_sockopt(level, optname) {
+        Some(pair) => pair,
+        None => (level, optname),
+    };
     let ret = unsafe {
         libc::getsockopt(
             fd,
-            level,
-            optname,
+            mac_level,
+            mac_optname,
             optval as *mut libc::c_void,
             optlen_ptr as *mut libc::socklen_t,
         )
@@ -266,6 +277,16 @@ pub fn do_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen_ptr:
     if ret < 0 {
         translate::linux_errno()
     } else {
+        // For SO_ERROR, translate the macOS errno stored in the option value
+        // to the corresponding Linux errno
+        if translate::is_so_error(level, optname) && optval != 0 {
+            unsafe {
+                let err = *(optval as *const i32);
+                if err != 0 {
+                    *(optval as *mut i32) = translate::mac_errno_to_linux(err);
+                }
+            }
+        }
         0
     }
 }
@@ -332,10 +353,43 @@ pub fn do_socketpair(domain: i32, type_: i32, protocol: i32, sv_ptr: u64) -> u64
     0
 }
 
+/// Translate a Linux aarch64 msghdr (56 bytes) to a macOS msghdr (48 bytes).
+/// The layouts differ in msg_iovlen (size_t vs int) and msg_controllen (size_t vs socklen_t).
+/// For common cases (small iovlen/controllen), the direct cast works because the
+/// upper bytes are zero. But we translate properly for correctness.
+fn linux_msghdr_to_mac(linux_ptr: u64) -> libc::msghdr {
+    unsafe {
+        let p = linux_ptr as *const u8;
+        let msg_name = (p as *const u64).read_unaligned() as *mut libc::c_void;
+        let msg_namelen = (p.add(8) as *const u32).read_unaligned();
+        let msg_iov = (p.add(16) as *const u64).read_unaligned() as *mut libc::iovec;
+        let msg_iovlen = (p.add(24) as *const u64).read_unaligned() as i32; // truncate size_t to int
+        let msg_control = (p.add(32) as *const u64).read_unaligned() as *mut libc::c_void;
+        let msg_controllen = (p.add(40) as *const u64).read_unaligned() as u32; // truncate
+        let msg_flags = (p.add(48) as *const i32).read_unaligned();
+        libc::msghdr {
+            msg_name,
+            msg_namelen,
+            msg_iov,
+            msg_iovlen,
+            msg_control,
+            msg_controllen,
+            msg_flags,
+        }
+    }
+}
+
 pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
-    let ret = unsafe {
-        libc::sendmsg(fd, msg_ptr as *const libc::msghdr, flags)
-    };
+    let mut mac_msg = linux_msghdr_to_mac(msg_ptr);
+    // Translate sockaddr in msg_name if present
+    if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
+        linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+    }
+    let ret = unsafe { libc::sendmsg(fd, &mac_msg, flags) };
+    // Restore sockaddr for guest
+    if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
+        mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+    }
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -344,12 +398,67 @@ pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
 }
 
 pub fn do_recvmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
-    let ret = unsafe {
-        libc::recvmsg(fd, msg_ptr as *mut libc::msghdr, flags)
-    };
+    let mut mac_msg = linux_msghdr_to_mac(msg_ptr);
+    let ret = unsafe { libc::recvmsg(fd, &mut mac_msg, flags) };
     if ret < 0 {
         translate::linux_errno()
     } else {
+        // Write back fields that the kernel may have modified
+        unsafe {
+            let p = msg_ptr as *mut u8;
+            // msg_namelen (offset 8)
+            (p.add(8) as *mut u32).write_unaligned(mac_msg.msg_namelen);
+            // msg_controllen (offset 40, as u64 on Linux)
+            (p.add(40) as *mut u64).write_unaligned(mac_msg.msg_controllen as u64);
+            // msg_flags (offset 48)
+            (p.add(48) as *mut i32).write_unaligned(mac_msg.msg_flags);
+        }
+        // Translate returned sockaddr
+        if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
+            mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+        }
         ret as u64
     }
+}
+
+/// sendmmsg(fd, msgvec, vlen, flags) — send multiple messages.
+/// Linux struct mmsghdr on aarch64:
+///   struct msghdr msg_hdr;   // 56 bytes (Linux layout)
+///   unsigned int  msg_len;   // 4 bytes at offset 56
+///   // total 60, padded to 64 for alignment
+pub fn do_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> u64 {
+    const LINUX_MMSGHDR_SIZE: usize = 64; // 56 (msghdr) + 4 (msg_len) + 4 (pad)
+
+    let mut sent = 0u32;
+    for i in 0..vlen {
+        let mmsghdr_ptr = msgvec + (i as u64) * (LINUX_MMSGHDR_SIZE as u64);
+        let mut mac_msg = linux_msghdr_to_mac(mmsghdr_ptr);
+
+        // Translate sockaddr if present
+        if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
+            linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+        }
+
+        let ret = unsafe { libc::sendmsg(fd, &mac_msg, flags) };
+
+        // Restore sockaddr
+        if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
+            mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+        }
+
+        if ret < 0 {
+            if sent == 0 {
+                return translate::linux_errno();
+            }
+            break; // partial send: return count of successful messages
+        }
+
+        // Write msg_len field at offset 56 in the Linux mmsghdr
+        unsafe {
+            ((mmsghdr_ptr + 56) as *mut u32).write_unaligned(ret as u32);
+        }
+        sent += 1;
+    }
+
+    sent as u64
 }

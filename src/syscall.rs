@@ -206,6 +206,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_GETSOCKOPT => net::do_getsockopt(args[0] as i32, args[1] as i32, args[2] as i32, args[3], args[4]),
         SYS_SHUTDOWN => net::do_shutdown(args[0] as i32, args[1] as i32),
         SYS_SENDMSG => net::do_sendmsg(args[0] as i32, args[1], args[2] as i32),
+        SYS_SENDMMSG => net::do_sendmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as i32),
         SYS_RECVMSG => net::do_recvmsg(args[0] as i32, args[1], args[2] as i32),
         SYS_KILL => {
             let pid_arg = args[0] as i64;

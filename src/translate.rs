@@ -143,6 +143,69 @@ pub fn mac_flock_to_linux(mac: &libc::flock, linux_ptr: u64) {
     }
 }
 
+// ─── Socket option translation ───────────────────────────────────────────────
+// Linux and macOS use different values for SOL_SOCKET and SO_* option names.
+// IPPROTO_TCP (6) and TCP_NODELAY (1) are the same on both.
+
+// Linux SOL_SOCKET and SO_* constants
+const LINUX_SOL_SOCKET: i32 = 1;
+const LINUX_SO_REUSEADDR: i32 = 2;
+const LINUX_SO_TYPE: i32 = 3;
+const LINUX_SO_ERROR: i32 = 4;
+const LINUX_SO_BROADCAST: i32 = 6;
+const LINUX_SO_SNDBUF: i32 = 7;
+const LINUX_SO_RCVBUF: i32 = 8;
+const LINUX_SO_KEEPALIVE: i32 = 9;
+const LINUX_SO_OOBINLINE: i32 = 10;
+const LINUX_SO_LINGER: i32 = 13;
+const LINUX_SO_REUSEPORT: i32 = 15;
+const LINUX_SO_RCVTIMEO: i32 = 20;
+const LINUX_SO_SNDTIMEO: i32 = 21;
+const LINUX_SO_ACCEPTCONN: i32 = 30;
+
+// Linux IPPROTO_IPV6 = 41 on both, but IPV6_V6ONLY differs
+const LINUX_IPPROTO_IPV6: i32 = 41;
+const LINUX_IPV6_V6ONLY: i32 = 26;
+
+/// Translate Linux socket option level+name to macOS equivalents.
+/// Returns (mac_level, mac_optname). Returns None if unknown.
+pub fn translate_sockopt(linux_level: i32, linux_optname: i32) -> Option<(i32, i32)> {
+    if linux_level == LINUX_SOL_SOCKET {
+        let mac_opt = match linux_optname {
+            LINUX_SO_REUSEADDR => libc::SO_REUSEADDR,
+            LINUX_SO_TYPE => libc::SO_TYPE,
+            LINUX_SO_ERROR => libc::SO_ERROR,
+            LINUX_SO_BROADCAST => libc::SO_BROADCAST,
+            LINUX_SO_SNDBUF => libc::SO_SNDBUF,
+            LINUX_SO_RCVBUF => libc::SO_RCVBUF,
+            LINUX_SO_KEEPALIVE => libc::SO_KEEPALIVE,
+            LINUX_SO_OOBINLINE => libc::SO_OOBINLINE,
+            LINUX_SO_LINGER => libc::SO_LINGER,
+            LINUX_SO_REUSEPORT => libc::SO_REUSEPORT,
+            LINUX_SO_RCVTIMEO => libc::SO_RCVTIMEO,
+            LINUX_SO_SNDTIMEO => libc::SO_SNDTIMEO,
+            LINUX_SO_ACCEPTCONN => libc::SO_ACCEPTCONN,
+            _ => return None,
+        };
+        Some((libc::SOL_SOCKET, mac_opt))
+    } else if linux_level == LINUX_IPPROTO_IPV6 {
+        let mac_opt = match linux_optname {
+            LINUX_IPV6_V6ONLY => libc::IPV6_V6ONLY,
+            _ => linux_optname, // most IPV6 options have same values
+        };
+        Some((libc::IPPROTO_IPV6, mac_opt))
+    } else {
+        // IPPROTO_TCP(6), IPPROTO_IP(0), etc. — same on both platforms,
+        // and most option names (TCP_NODELAY=1, etc.) match too
+        Some((linux_level, linux_optname))
+    }
+}
+
+/// Check if this is a SO_ERROR getsockopt (needs errno translation on result).
+pub fn is_so_error(linux_level: i32, linux_optname: i32) -> bool {
+    linux_level == LINUX_SOL_SOCKET && linux_optname == LINUX_SO_ERROR
+}
+
 // ─── Errno translation (macOS → Linux) ──────────────────────────────────────
 // Errnos 1-10 and 12-34 are identical. Above 34 they diverge.
 // We map macOS errno → Linux errno so that the guest sees correct values.
