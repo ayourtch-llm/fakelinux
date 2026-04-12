@@ -181,6 +181,14 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         apply_relocations(elf, data, base_offset)?;
     }
 
+    // Fix up absolute pointers in relocated ET_EXEC binaries.
+    // Non-PIE executables have absolute addresses baked into their data segments.
+    // When we relocate past the 4GB PAGEZERO, these pointers must be adjusted.
+    // PC-relative code (ADRP/ADR/B/BL) works automatically, but data pointers don't.
+    if elf.header.e_type == ET_EXEC && base_offset != 0 {
+        fixup_exec_pointers(elf, base_offset);
+    }
+
     // Set up the guest stack
     let stack_ptr = setup_stack(elf, base_offset, phdr_addr, interp_base, guest_args)?;
 
@@ -599,6 +607,50 @@ fn setup_stack(
     }
 
     Ok(sp)
+}
+
+/// Fix up absolute pointers in relocated ET_EXEC data segments.
+/// Scans writable PT_LOAD segments for 8-byte values that fall within the
+/// binary's original address range and adjusts them by base_offset.
+fn fixup_exec_pointers(elf: &Elf, base_offset: u64) {
+    // Determine the binary's original address range from PT_LOAD segments
+    let mut orig_lo = u64::MAX;
+    let mut orig_hi: u64 = 0;
+    for phdr in &elf.phdrs {
+        if phdr.p_type != PT_LOAD { continue; }
+        let lo = phdr.p_vaddr;
+        let hi = phdr.p_vaddr + phdr.p_memsz;
+        if lo < orig_lo { orig_lo = lo; }
+        if hi > orig_hi { orig_hi = hi; }
+    }
+    if orig_lo >= orig_hi { return; }
+
+    let mut fixed = 0u64;
+    for phdr in &elf.phdrs {
+        if phdr.p_type != PT_LOAD { continue; }
+        // Only scan writable segments (data/bss) — not code
+        if phdr.p_flags & 2 == 0 { continue; } // PF_W = 2
+
+        let seg_start = base_offset + phdr.p_vaddr;
+        // Only scan the file-backed portion (filesz), not zeroed BSS
+        let seg_filesz = phdr.p_filesz;
+
+        // Scan every 8-byte aligned position for pointers in the original range
+        let mut off: u64 = 0;
+        while off + 8 <= seg_filesz {
+            let ptr_addr = seg_start + off;
+            let val = unsafe { *(ptr_addr as *const u64) };
+            if val >= orig_lo && val < orig_hi {
+                let new_val = val + base_offset;
+                unsafe { *(ptr_addr as *mut u64) = new_val; }
+                fixed += 1;
+            }
+            off += 8;
+        }
+    }
+    if fixed > 0 {
+        eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data", fixed);
+    }
 }
 
 /// Apply R_AARCH64_RELATIVE relocations from the DYNAMIC segment.
