@@ -23,14 +23,31 @@ fn main() {
     }
 
     let elf_path = &args[1];
-    let mut sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
+    let sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
     let rootfs = std::env::var("FAKELINUX_ROOT").unwrap_or_default();
+
+    // Convert relative rootfs/sysroot paths to absolute so they survive cd/chdir
+    // in child processes after fork+exec.
+    let rootfs = if !rootfs.is_empty() && !rootfs.starts_with('/') {
+        let abs = std::env::current_dir().unwrap().join(&rootfs);
+        let abs_str = abs.to_str().unwrap().to_string();
+        std::env::set_var("FAKELINUX_ROOT", &abs_str);
+        abs_str
+    } else { rootfs };
+    let sysroot = if !sysroot.is_empty() && !sysroot.starts_with('/') {
+        let abs = std::env::current_dir().unwrap().join(&sysroot);
+        let abs_str = abs.to_str().unwrap().to_string();
+        std::env::set_var("FAKELINUX_SYSROOT", &abs_str);
+        abs_str
+    } else { sysroot };
 
     // When FAKELINUX_ROOT is set but FAKELINUX_SYSROOT is not, auto-set sysroot = root.
     // This way FAKELINUX_ROOT alone is sufficient for rootfs usage.
-    if !rootfs.is_empty() && sysroot.is_empty() {
-        sysroot = rootfs.clone();
-    }
+    let sysroot = if !rootfs.is_empty() && sysroot.is_empty() {
+        rootfs.clone()
+    } else {
+        sysroot
+    };
 
     let data = std::fs::read(elf_path).unwrap_or_else(|e| {
         eprintln!("fakelinux: cannot read '{}': {}", elf_path, e);

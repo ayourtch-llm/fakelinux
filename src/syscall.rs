@@ -1024,9 +1024,14 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     new_argv.push(resolved_path.as_ptr());
 
-    // Then the guest's original argv (applet name + args)
+    // Then the guest's original argv (skip argv[0] since resolved_path serves as
+    // the binary path argument to fakelinux — fakelinux passes &args[1..] to the
+    // guest, so args[1]=binary, args[2..]=guest argv[1..])
     let mut guest_argv = argv_ptr as *const *const i8;
     unsafe {
+        if !(*guest_argv).is_null() {
+            guest_argv = guest_argv.add(1); // skip argv[0]
+        }
         while !(*guest_argv).is_null() {
             new_argv.push(*guest_argv);
             guest_argv = guest_argv.add(1);
