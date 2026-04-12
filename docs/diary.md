@@ -159,28 +159,82 @@ and size were being mishandled, causing incorrect signal masks.
 
 ## Known Issues
 
-### apt-get update Hangs After Downloading Release Files
+### apt-get update Hangs After Downloading Release Files (Active Investigation 2026-04-13)
 
-After DNS and fcntl fixes, `apt-get update` successfully:
+**Status**: Downloads complete successfully, then hangs. Root cause partially identified.
+
+**Symptoms**:
 1. Resolves DNS and connects to Ubuntu mirrors ✓
-2. Downloads Release files (InRelease, updates, backports, security) ✓
+2. Downloads 4 InRelease files (noble, noble-updates, noble-backports, noble-security) ✓
 3. Spawns gpgv for signature verification ✓
-4. **HANGS** after "Get:1-4" messages appear (no SIGPIPE visible)
+4. **HANGS** after "Get:1-4" messages appear
+5. First http and first gpgv method children die with signal 2 (SIGINT), get respawned
 
-The processes seem to complete but apt-get never exits. This suggests a subprocess communication issue - the http/gpgv methods communicate with apt via pipes and something in that protocol isn't working correctly.
+**Investigation findings (2026-04-13)**:
 
-**Workaround**: Use `timeout` to force termination after apt has fetched what it needs:
+#### Signal 2 (SIGINT) deaths of first method children
+
+The parent apt-get deliberately sends `kill(child, SIGINT)` after reading each method's
+"100 Capabilities" response. This appears to be normal apt behavior — apt probes workers
+and restarts them. The first child has SIGINT=SIG_DFL (the parent sets all signals to SIG_DFL
+before fork), so the child dies. The second instance installs a custom SIGINT handler fast enough
+to survive.
+
+**Debugging technique**: Added PID annotations to read/write/close/kill trace messages to
+distinguish parent (apt-get) vs child (method) syscalls. Without PIDs, the interleaved output
+is unreadable. Pattern: `fakelinux: [PID] read(fd, count=N) = R`.
+
+#### Root cause of hang: pipe fd aliasing after close
+
+After all 4 downloads complete, someone closes fds 5 and 6 (the parent's pipe read-ends
+for http and gpgv methods). Then:
+
+1. `/dev/null` gets opened → assigned fd 5 (reusing the freed number)
+2. `dup3(5, 1)` and `dup3(5, 2)` redirect stdout/stderr to /dev/null
+3. Parent enters pselect6 loop watching fds 5 and 6 (rd:0x60) with 500ms timeout
+4. pselect returns 0 every time — fd 5 is /dev/null (not a pipe), fd 6 is gone
+5. gpgv method tries `write(1, 189)` → gets **EPIPE** (-32) because pipe read-end is closed
+6. gpgv method sees EOF on stdin → exits
+7. Parent never sees exit because it's watching wrong fds → infinite loop
+
+**Key evidence**:
+- `[parent] close(6)` then `close(5)` right before hang loop
+- `openat("/dev/null") → fd 5` immediately after
+- `[gpgv_method] write(1, count=189) = -1 (EPIPE)` — pipe broken
+- `pselect6 nfds=7 rd:0x60→0x0 ret=0 tv=0s+500000000ns` — watching wrong fds
+
+**Still unknown**: Which process closes fds 5 and 6. Options:
+- The real `gpgv` binary (child of gpgv method) might inherit and close them
+- The parent might close them as part of worker lifecycle management
+- A stale fd cleanup path in our emulation
+
+PID-annotated close() tracing was added to identify the culprit.
+
+**Debugging techniques used**:
+- `FAKELINUX_TRACE=1` with filtered grep for specific syscalls
+- Added PID to trace: `let pid = unsafe { libc::getpid() }` in do_read/do_write/do_close
+- Saved full trace to `/tmp/apt_trace.log` and used line-number searches
+- `ps aux | grep fakelinux` during hang to see live child processes
+- `pselect6` timeout value logging to distinguish spin (0ns) from poll (500ms)
+
+#### Signal fixes (2026-04-13)
+
+Three signal-related bugs were fixed (may not be root cause of hang but improve correctness):
+
+1. **PENDING_SIGNALS not cleared after fork** (signal.rs, trap.rs): Child inherited parent's
+   pending signals via COW. POSIX requires child's pending set to be empty.
+
+2. **SIG_IGN not preserved across execve** (syscall.rs, main.rs): When do_execve() re-execs
+   fakelinux, the new process had fresh statics with all GUEST_SIGACTIONS = SIG_DFL. Now
+   encodes SIG_IGN bitmask in `FAKELINUX_SIGIGN` env var, read on startup.
+
+3. **Signal mask not inherited across execve** (main.rs): GUEST_SIGMASK reset to 0 on re-exec.
+   Now propagated via `FAKELINUX_SIGMASK` env var.
+
+**Workaround**: Use `timeout` to force termination:
 ```bash
 FAKELINUX_ROOT=./ubuntu-rootfs timeout 120 ./target/debug/fakelinux --container ./ubuntu-rootfs/usr/bin/apt-get update
 ```
-
-Or run in background and kill after ~60 seconds when "Get:X" messages appear.
-
-**Investigation notes**:
-- No SIGPIPE visible in trace
-- gpgv and http method processes do run and get patched
-- apt forks them and waits via wait4
-- The hang is in the parent apt-get waiting for something that never comes
 
 ### DNS Resolution Fails
 
