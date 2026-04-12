@@ -632,12 +632,22 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
         LINUX_TIOCGPGRP => {
             let pgrp = unsafe { libc::tcgetpgrp(fd) };
             if pgrp < 0 { return translate::linux_errno(); }
-            unsafe { (arg as *mut i32).write_unaligned(pgrp) };
+            let vpgrp = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::real_to_virtual(pgrp).unwrap_or(pgrp)
+            } else {
+                pgrp
+            };
+            unsafe { (arg as *mut i32).write_unaligned(vpgrp) };
             0
         }
         LINUX_TIOCSPGRP => {
             let pgrp = unsafe { (arg as *const i32).read_unaligned() };
-            let ret = unsafe { libc::tcsetpgrp(fd, pgrp) };
+            let real_pgrp = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::translate_pid_arg(pgrp)
+            } else {
+                pgrp
+            };
+            let ret = unsafe { libc::tcsetpgrp(fd, real_pgrp) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         LINUX_TIOCSCTTY => {
