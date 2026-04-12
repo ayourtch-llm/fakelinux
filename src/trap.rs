@@ -238,6 +238,14 @@ pub fn references_x18(instr: u32) -> bool {
     if instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE
         || instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE { return false; }
 
+    // Early SIMD exclusion: scalar and vector SIMD instructions use Vn/Dn registers,
+    // not GPRs. Must check BEFORE disarm64 which may misclassify SIMD Rn as INT_REG.
+    let top_byte = (instr >> 24) & 0xFF;
+    let is_simd_scalar_or_vec = matches!(top_byte & 0x9F, 0x0E | 0x0F)
+        || matches!(top_byte, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f
+                            | 0x5e | 0x7e | 0x5f | 0x7f | 0x1e | 0x1f);
+    if is_simd_scalar_or_vec { return false; }
+
     let Some(decoded) = disarm64::decoder::decode(instr) else { return false; };
     let defn = decoded.definition();
     let bits = decoded.bits();
@@ -284,7 +292,8 @@ pub fn references_x18(instr: u32) -> bool {
     // Exclude SIMD/FP instructions (top nibble 0x0/0x2/0x4/0x6 with bit25=1 are AdvSIMD)
     let top_byte = (instr >> 24) & 0xFF;
     let is_simd_fp = matches!(top_byte & 0x9F, 0x0E | 0x0F)  // AdvSIMD data processing
-        || matches!(top_byte, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f);
+        || matches!(top_byte, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f
+                            | 0x5e | 0x7e | 0x5f | 0x7f);  // AdvSIMD scalar
     if is_simd_fp { return false; }
 
     let bits28_27 = (instr >> 27) & 3;
@@ -778,7 +787,10 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
     // (size field distinguishes byte/half/word/doubleword)
 
     // ─── Bitfield (SBFM/UBFM/BFM — includes LSL, LSR, ASR, SXTW, etc.) ──
-    if (orig_instr >> 23) & 0x3F == 0b100110 {
+    // ARM encoding: sf opc(2) 100110 N immr(6) imms(6) Rn(5) Rd(5)
+    // Fixed bits [28:24] = 10011, bit 23 = 0 for 32-bit (sf=0), 1 for 64-bit (sf=1)
+    // We check bits [28:24] = 10011
+    if (orig_instr >> 24) & 0x1F == 0b10011 {
         let sf = (orig_instr >> 31) & 1;
         let opc = (orig_instr >> 29) & 0x3;
         let n = (orig_instr >> 22) & 1;
@@ -799,12 +811,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
                     let field_width = imms - immr + 1;
                     sign_extend(val, field_width)
                 } else {
-                    // SBFIZ
+                    // SBFIZ: extract bottom (imms+1) bits, sign-extend, shift left by (bits-immr)
                     let width = imms + 1;
                     let lsb = bits - immr;
                     let val = src & ((1u64 << width) - 1);
-                    let shifted = val << lsb;
-                    sign_extend(shifted >> (bits - lsb - width), lsb + width)
+                    let sext = sign_extend(val, width);
+                    sext << lsb
                 }
             }
             1 => { // BFM (BFI, BFXIL)
@@ -1455,6 +1467,7 @@ mod tests {
             0xd2800000, // MOV x0, #0
             0xb9400000, // LDR w0, [x0]
             0xd4000001, // SVC #0
+            0x5e136250, // USHL D16, D18, D19 — SIMD scalar, D18 is NOT GPR x18
         ];
         for &instr in non_x18 {
             assert!(!references_x18(instr), "false positive for {:#010x}", instr);
