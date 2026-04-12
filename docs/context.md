@@ -147,9 +147,8 @@ gcc -static-pie -o /out/hello_alpine /tmp/t.c'
 
 ## Known Limitations
 
-1. **No dynamic linking** — only static/static-PIE binaries (PT_INTERP loading is scaffolded but untested)
-2. **No thread creation** — clone with CLONE_THREAD is scaffolded but incomplete
-3. **16KB page mismatch** — some edge cases with mmap/mprotect alignment
+1. **Thread creation** — clone with CLONE_THREAD is scaffolded but incomplete
+2. **16KB page mismatch** — some edge cases with mmap/mprotect alignment
 4. **Fork child startup slow** — each fork+exec re-loads fakelinux from scratch (~100ms)
 5. **Missing syscalls** — socket, epoll, signalfd, etc. would need implementation for more complex programs
 
