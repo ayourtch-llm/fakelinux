@@ -263,9 +263,14 @@ pub fn references_x18(instr: u32) -> bool {
             }
         }
         // MODIFIED_REG (Rm_SFT) sometimes has no bit_fields but Rm is at bits[20:16]
+        // Only for non-SIMD instructions (top byte 0x0e/0x4e/0x2e/0x6e are SIMD)
         if operand.class == InsnOperandClass::MODIFIED_REG && operand.bit_fields.is_empty() {
-            let rm = (bits >> 16) & 0x1F;
-            if rm == 18 { return true; }
+            let top = (instr >> 24) & 0xFF;
+            let is_simd = matches!(top, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f);
+            if !is_simd {
+                let rm = (bits >> 16) & 0x1F;
+                if rm == 18 { return true; }
+            }
         }
     }
 
@@ -276,6 +281,12 @@ pub fn references_x18(instr: u32) -> bool {
     //
     // Single-register load/store: bits[28:27]=11 (LDST single)
     // Load/store pair:            bits[28:27]=01 (LDP/STP) — bits[20:15] are imm7, NOT Rm!
+    // Exclude SIMD/FP instructions (top nibble 0x0/0x2/0x4/0x6 with bit25=1 are AdvSIMD)
+    let top_byte = (instr >> 24) & 0xFF;
+    let is_simd_fp = matches!(top_byte & 0x9F, 0x0E | 0x0F)  // AdvSIMD data processing
+        || matches!(top_byte, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f);
+    if is_simd_fp { return false; }
+
     let bits28_27 = (instr >> 27) & 3;
     let is_ldst_single = bits28_27 == 3; // bits[28:27]=11
     let is_ldst_pair = bits28_27 == 1;   // bits[28:27]=01 (LDP/STP)
@@ -1044,19 +1055,19 @@ fn decode_bitmask_imm(instr: u32, is_64: bool) -> Option<u64> {
         31 - not_imms.leading_zeros()
     };
     if len < 1 { return None; }
-    let size = 1u32 << len;
+    let size = if len >= 32 { 64u32 } else { 1u32 << len };
     let mask = size - 1;
     let s = imms & mask;
     let r = immr & mask;
     if s == mask { return None; } // all-ones reserved
-    let welem = (1u64 << (s + 1)) - 1;
+    let welem = if s + 1 >= 64 { u64::MAX } else { (1u64 << (s + 1)) - 1 };
     let elem = if r == 0 { welem } else { (welem >> r) | (welem << (size - r)) };
-    let elem = elem & ((1u64 << size) - 1);
+    let elem = elem & (if size >= 64 { u64::MAX } else { (1u64 << size) - 1 });
     // Replicate element to fill 64 bits
     let mut result = 0u64;
     let mut shift = 0;
     while shift < 64 {
-        result |= elem << shift;
+        result |= elem.wrapping_shl(shift);
         shift += size;
     }
     if !is_64 { Some(result & 0xFFFF_FFFF) } else { Some(result) }
