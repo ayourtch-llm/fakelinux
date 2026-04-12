@@ -55,7 +55,7 @@ fn raw_eprintln(msg: &str) {
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
 }
 
-fn raw_eprintln_fmt(args: std::fmt::Arguments) {
+pub fn raw_eprintln_fmt(args: std::fmt::Arguments) {
     use std::io::Write;
     let mut buf = [0u8; 256];
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
@@ -72,6 +72,10 @@ static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 
 pub fn set_trace(on: bool) {
     TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn trace_enabled() -> bool {
+    TRACE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Emulate a single Linux aarch64 syscall. Returns the result value for x0.
@@ -488,6 +492,16 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
         return eventfd::do_write(fd_i32, buf, count);
     }
     let ret = unsafe { libc::write(fd_i32, buf as *const _, count as usize) };
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (fd_i32 <= 8) {
+        let preview = if ret > 0 && buf != 0 {
+            let len = (ret as usize).min(80);
+            let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
+            String::from_utf8_lossy(slice).to_string()
+        } else { String::new() };
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!("fakelinux: [{}] write({}, count={}) = {} {:?}\n",
+            pid, fd_i32, count, ret, preview));
+    }
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
@@ -497,6 +511,16 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
         return eventfd::do_read(fd_i32, buf, count);
     }
     let ret = unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (fd_i32 <= 8) {
+        let preview = if ret > 0 && buf != 0 {
+            let len = (ret as usize).min(120);
+            let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
+            String::from_utf8_lossy(slice).to_string()
+        } else { String::new() };
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!("fakelinux: [{}] read({}, count={}) = {} {:?}\n",
+            pid, fd_i32, count, ret, preview));
+    }
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
@@ -556,6 +580,10 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
 }
 
 fn do_close(fd: i32) -> u64 {
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) && fd <= 10 {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!("fakelinux: [{}] close({})\n", pid, fd));
+    }
     // Clean up virtual fd state if this fd is one of those
     eventfd::on_close(fd);
     epoll::on_close(fd);
@@ -1233,13 +1261,25 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             };
             // Check if the file is an ELF; if not, fall back to guest binary
             // (busybox sh finds /usr/bin/uname on macOS, which is Mach-O)
-            let is_elf = std::fs::read(check_path.to_str().unwrap_or(""))
+            let check_str = check_path.to_str().unwrap_or("");
+            let is_elf = std::fs::read(check_str)
                 .map(|d| d.len() >= 4 && d[..4] == [0x7f, b'E', b'L', b'F'])
                 .unwrap_or(false);
+            if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: execve path={:?} resolved={:?} is_elf={}\n",
+                    std::str::from_utf8(path_bytes).unwrap_or("?"), check_str, is_elf));
+            }
             if is_elf {
                 check_path
             } else {
-                procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
+                let fallback = procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap());
+                if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: execve FALLBACK to {:?}\n",
+                        fallback.to_str().unwrap_or("?")));
+                }
+                fallback
             }
         }
     };
@@ -1259,6 +1299,31 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
     new_argv.push(std::ptr::null());
+
+    // Communicate SIG_IGN signals to the new fakelinux process via env var.
+    // POSIX requires SIG_IGN to be preserved across execve. Since re-exec
+    // gives us fresh statics, we pass the SIG_IGN set as a bitmask.
+    // Also communicate the current signal mask (POSIX: preserved across execve).
+    {
+        let mut ign_mask: u64 = 0;
+        for sig in 1..65u64 {
+            let sa = signal::guest_sigaction(sig as usize);
+            if sa.handler == 1 { // SIG_IGN
+                ign_mask |= 1u64 << (sig - 1);
+            }
+        }
+        if ign_mask != 0 {
+            std::env::set_var("FAKELINUX_SIGIGN", format!("{:#x}", ign_mask));
+        } else {
+            std::env::remove_var("FAKELINUX_SIGIGN");
+        }
+        let sigmask = signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst);
+        if sigmask != 0 {
+            std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask));
+        } else {
+            std::env::remove_var("FAKELINUX_SIGMASK");
+        }
+    }
 
     // Use the HOST environment (not guest's) so env vars like FAKELINUX_TRACE propagate
     let new_envp_marker: *const *const i8 = std::ptr::null();
@@ -1644,9 +1709,13 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (ret > 0 || nfds > 3) {
         let rdbits_after = if readfds != 0 { unsafe { *(readfds as *const u64) } } else { 0 };
         let wrbits_after = if writefds != 0 { unsafe { *(writefds as *const u64) } } else { 0 };
+        let tv = if timeout != 0 {
+            let ts = unsafe { &*(timeout as *const libc::timespec) };
+            format!("{}s+{}ns", ts.tv_sec, ts.tv_nsec)
+        } else { "NULL".to_string() };
         raw_eprintln_fmt(format_args!(
-            "fakelinux: pselect6 nfds={} rd:{:#x}→{:#x} wr:{:#x}→{:#x} ret={}\n",
-            nfds, rdbits_before, rdbits_after, wrbits_before, wrbits_after, ret));
+            "fakelinux: pselect6 nfds={} rd:{:#x}→{:#x} wr:{:#x}→{:#x} ret={} tv={}\n",
+            nfds, rdbits_before, rdbits_after, wrbits_before, wrbits_after, ret, tv));
     }
 
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
