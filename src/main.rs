@@ -18,17 +18,17 @@ mod trap;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --init flag (must come before the ELF path)
-    let mut init_mode = false;
+    // Parse --container flag (must come before the ELF path)
+    let mut container_mode = false;
     let mut guest_arg_start = 1;
-    if args.len() > 1 && args[1] == "--init" {
-        init_mode = true;
+    if args.len() > 1 && (args[1] == "--container" || args[1] == "--init") {
+        container_mode = true;
         guest_arg_start = 2;
     }
 
     if args.len() <= guest_arg_start {
-        eprintln!("Usage: fakelinux [--init] <aarch64-linux-elf> [args...]");
-        eprintln!("  --init       Run in container mode (virtual PID namespace, PID 1)");
+        eprintln!("Usage: fakelinux [--container] <aarch64-linux-elf> [args...]");
+        eprintln!("  --container  Run in container mode (virtual PID namespace, PID 1)");
         eprintln!("  Set FAKELINUX_SYSROOT to an aarch64 Linux rootfs for dynamic binaries.");
         std::process::exit(1);
     }
@@ -100,10 +100,20 @@ fn main() {
     signal::create_sigreturn_trampoline();
     trap::install_handler();
 
-    // Initialize container mode if requested
-    if init_mode {
-        pidns::init();
-        eprintln!("fakelinux: container mode (--init), virtual PID 1");
+    // Initialize container mode:
+    // --container flag creates a new namespace (init process, PID 1)
+    // FAKELINUX_CONTAINER env var attaches to existing namespace (child after execve)
+    if container_mode {
+        pidns::init_container();
+        eprintln!("fakelinux: container mode (--container), virtual PID 1");
+    } else if let Ok(shm_name) = std::env::var("FAKELINUX_CONTAINER") {
+        let vpid: i32 = std::env::var("FAKELINUX_VPID")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let vppid: i32 = std::env::var("FAKELINUX_VPPID")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if vpid > 0 {
+            pidns::attach_container(&shm_name, vpid, vppid);
+        }
     }
 
     // Load segments, patch SVCs, set up stack

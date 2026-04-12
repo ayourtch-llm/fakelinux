@@ -308,8 +308,12 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 if ret_i64 > 0 {
                     let real_pid = ret as i32;
                     let vpid = pidns::real_to_virtual(real_pid).unwrap_or(real_pid);
-                    // Reap: remove from table after wait
-                    pidns::unregister_real_pid(real_pid);
+                    // Reap: mark entry as unused in shm table
+                    if vpid != real_pid {
+                        pidns::unregister_vpid(vpid);
+                    }
+                    // Restore parent's own env vars (fork may have set child's)
+                    pidns::restore_parent_env();
                     vpid as u64
                 } else {
                     ret

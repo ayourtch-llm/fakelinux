@@ -405,6 +405,20 @@ fn do_fork(_flags: u64) -> u64 {
 /// Runs outside signal context. Does the actual fork, sets x0 to the pid,
 /// restores guest registers, and jumps back to guest code.
 extern "C" fn fork_trampoline_entry() -> ! {
+    // In container mode, pre-allocate a vpid for the child and set env vars
+    // BEFORE fork so the child inherits them. We'll register the real PID
+    // and restore parent env after fork returns.
+    let container = crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let child_vpid = if container {
+        // Allocate vpid with placeholder real_pid=0 (will be filled after fork)
+        let parent_vpid = crate::pidns::current_vpid();
+        let vpid = crate::pidns::register_fork(0); // placeholder
+        crate::pidns::set_child_env(vpid, parent_vpid);
+        vpid
+    } else {
+        0
+    };
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe { libc::_exit(127); }
@@ -414,18 +428,18 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
-
-        // Register child in virtual PID namespace
-        if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::pidns::register_pid(unsafe { libc::getpid() });
-        }
+        // Child inherits the shm mmap via MAP_SHARED and has correct
+        // FAKELINUX_VPID/VPPID env vars for execve.
     }
 
     let return_pid = if pid == 0 {
         0u64
-    } else if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        // Parent: register child and return virtual PID
-        crate::pidns::register_pid(pid) as u64
+    } else if container {
+        // Parent: now we know the child's real PID, update the shm entry
+        crate::pidns::update_entry(child_vpid, pid);
+        // Restore parent's own env vars
+        crate::pidns::restore_parent_env();
+        child_vpid as u64
     } else {
         pid as u64
     };

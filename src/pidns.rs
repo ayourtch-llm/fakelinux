@@ -1,128 +1,269 @@
-//! Virtual PID namespace for container mode (--init).
+//! Virtual PID namespace for container mode (--container).
 //!
-//! Maps real macOS PIDs to virtual container PIDs starting from 1.
-//! When container mode is active, getpid/getppid/wait4/kill all
-//! operate on virtual PIDs.
+//! Uses shared memory (shm_open + mmap MAP_SHARED) so the PID table
+//! survives fork() and is accessible after execve() via env vars.
+//! All operations are lock-free using atomics.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Mutex;
 
-/// Whether container mode is active (--init flag).
+/// Whether container mode is active.
 pub static CONTAINER_MODE: AtomicBool = AtomicBool::new(false);
 
-/// The real macOS PID of the init process (vpid 1).
-static INIT_REAL_PID: AtomicI32 = AtomicI32::new(0);
+/// Cached virtual PID for the current process (set once at startup).
+static MY_VPID: AtomicI32 = AtomicI32::new(0);
 
-struct PidTable {
-    /// real_pid -> virtual_pid
-    real_to_virt: HashMap<i32, i32>,
-    /// virtual_pid -> real_pid
-    virt_to_real: HashMap<i32, i32>,
-    /// Next virtual PID to assign (starts at 2; 1 is reserved for init).
-    next_vpid: i32,
+/// Cached virtual PPID for the current process (set once at startup).
+static MY_VPPID: AtomicI32 = AtomicI32::new(0);
+
+/// Maximum number of virtual PIDs.
+const MAX_ENTRIES: usize = 262144; // 256K
+
+/// Magic number for validation: "FAKE" in ASCII.
+const MAGIC: u32 = 0x46414B45;
+
+/// Header of the shared memory region, followed by entries array.
+/// Total size = 16 + 4 * MAX_ENTRIES ≈ 1MB.
+#[repr(C)]
+struct SharedPidTable {
+    magic: u32,
+    max_entries: i32,
+    next_vpid: AtomicI32,
+    count: AtomicI32,
+    // entries[vpid] = real_pid (0 = unused). Index 0 is unused (vpids start at 1).
+    entries: [AtomicI32; MAX_ENTRIES],
 }
 
-static PID_TABLE: Mutex<Option<PidTable>> = Mutex::new(None);
+/// Pointer to the mmap'd shared PID table. Set once, never changes.
+static mut SHM_PTR: *mut SharedPidTable = std::ptr::null_mut();
 
-/// Initialize container mode. Registers the current process as virtual PID 1.
-pub fn init() {
-    let real_pid = unsafe { libc::getpid() };
-    INIT_REAL_PID.store(real_pid, Ordering::SeqCst);
+/// The shm name (e.g. "/fakelinux-abcd1234") for cleanup.
+static mut SHM_NAME: Option<String> = None;
 
-    let mut real_to_virt = HashMap::new();
-    let mut virt_to_real = HashMap::new();
-    real_to_virt.insert(real_pid, 1);
-    virt_to_real.insert(1, real_pid);
+/// Whether this process is the init (responsible for shm_unlink).
+static IS_INIT: AtomicBool = AtomicBool::new(false);
 
-    let mut table = PID_TABLE.lock().unwrap();
-    *table = Some(PidTable {
-        real_to_virt,
-        virt_to_real,
-        next_vpid: 2,
-    });
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
+fn table() -> &'static SharedPidTable {
+    unsafe {
+        debug_assert!(!SHM_PTR.is_null());
+        &*SHM_PTR
+    }
+}
+
+fn generate_shm_name() -> String {
+    let pid = unsafe { libc::getpid() };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    // macOS shm_open name max is 31 chars including the leading '/'
+    format!("/fl-{:x}-{:x}", pid, (ts.tv_nsec as u32) ^ (ts.tv_sec as u32))
+}
+
+fn shm_size() -> usize {
+    std::mem::size_of::<SharedPidTable>()
+}
+
+fn open_and_map_shm(name: &str, create: bool) -> *mut SharedPidTable {
+    let c_name = std::ffi::CString::new(name).unwrap();
+    let fd = if create {
+        let fd = unsafe {
+            libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            panic!("pidns: shm_open create '{}' failed: {}", name, std::io::Error::last_os_error());
+        }
+        if unsafe { libc::ftruncate(fd, shm_size() as i64) } != 0 {
+            panic!("pidns: ftruncate failed: {}", std::io::Error::last_os_error());
+        }
+        fd
+    } else {
+        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0) };
+        if fd < 0 {
+            panic!("pidns: shm_open attach '{}' failed: {}", name, std::io::Error::last_os_error());
+        }
+        fd
+    };
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            shm_size(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    unsafe { libc::close(fd); }
+
+    if ptr == libc::MAP_FAILED {
+        panic!("pidns: mmap failed: {}", std::io::Error::last_os_error());
+    }
+    ptr as *mut SharedPidTable
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/// Create a new container namespace. Called when --container is passed.
+/// Registers the current process as virtual PID 1.
+pub fn init_container() {
+    let name = generate_shm_name();
+    let ptr = open_and_map_shm(&name, true);
+
+    // Initialize the table
+    unsafe {
+        (*ptr).magic = MAGIC;
+        (*ptr).max_entries = MAX_ENTRIES as i32;
+        (*ptr).next_vpid = AtomicI32::new(2); // 1 is reserved for init
+        (*ptr).count = AtomicI32::new(1);
+        // Zero-init entries (mmap of new shm is already zeroed, but be explicit for entry 1)
+        (*ptr).entries[1].store(libc::getpid(), Ordering::Release);
+
+        SHM_PTR = ptr;
+        SHM_NAME = Some(name.clone());
+    }
+
+    IS_INIT.store(true, Ordering::SeqCst);
+    MY_VPID.store(1, Ordering::SeqCst);
+    MY_VPPID.store(0, Ordering::SeqCst);
+    CONTAINER_MODE.store(true, Ordering::SeqCst);
+
+    // Set env vars so children can attach
+    std::env::set_var("FAKELINUX_CONTAINER", &name);
+    std::env::set_var("FAKELINUX_VPID", "1");
+    std::env::set_var("FAKELINUX_VPPID", "0");
+}
+
+/// Attach to an existing container namespace. Called when FAKELINUX_CONTAINER
+/// env var is detected on startup.
+pub fn attach_container(shm_name: &str, vpid: i32, vppid: i32) {
+    let ptr = open_and_map_shm(shm_name, false);
+
+    // Validate
+    unsafe {
+        if (*ptr).magic != MAGIC {
+            panic!("pidns: shm magic mismatch (expected {:#x}, got {:#x})", MAGIC, (*ptr).magic);
+        }
+        SHM_PTR = ptr;
+        SHM_NAME = Some(shm_name.to_string());
+    }
+
+    MY_VPID.store(vpid, Ordering::SeqCst);
+    MY_VPPID.store(vppid, Ordering::SeqCst);
     CONTAINER_MODE.store(true, Ordering::SeqCst);
 }
 
-/// Register a new real PID in the virtual namespace. Returns the assigned vpid.
-pub fn register_pid(real_pid: i32) -> i32 {
-    let mut lock = PID_TABLE.lock().unwrap();
-    let table = lock.as_mut().expect("pidns not initialized");
-
-    // If already registered, return existing vpid
-    if let Some(&vpid) = table.real_to_virt.get(&real_pid) {
+/// Allocate a new vpid for a child and register its real PID.
+/// Called by the parent after fork(). Returns the child's vpid.
+pub fn register_fork(child_real_pid: i32) -> i32 {
+    let t = table();
+    let vpid = t.next_vpid.fetch_add(1, Ordering::SeqCst);
+    if vpid <= 0 || vpid >= MAX_ENTRIES as i32 {
+        eprintln!("pidns: vpid overflow ({}), wrapping", vpid);
         return vpid;
     }
-
-    let vpid = table.next_vpid;
-    table.next_vpid += 1;
-    table.real_to_virt.insert(real_pid, vpid);
-    table.virt_to_real.insert(vpid, real_pid);
+    t.entries[vpid as usize].store(child_real_pid, Ordering::Release);
+    t.count.fetch_add(1, Ordering::Relaxed);
     vpid
 }
 
-/// Translate a real PID to its virtual PID. Returns None if not registered.
-pub fn real_to_virtual(real_pid: i32) -> Option<i32> {
-    let lock = PID_TABLE.lock().unwrap();
-    let table = lock.as_ref()?;
-    table.real_to_virt.get(&real_pid).copied()
+/// Update the real PID for an already-allocated vpid entry.
+/// Used after fork when the real child PID becomes known.
+pub fn update_entry(vpid: i32, real_pid: i32) {
+    if vpid > 0 && vpid < MAX_ENTRIES as i32 {
+        table().entries[vpid as usize].store(real_pid, Ordering::Release);
+    }
 }
 
-/// Translate a virtual PID to its real PID. Returns None if not registered.
-pub fn virtual_to_real(vpid: i32) -> Option<i32> {
-    let lock = PID_TABLE.lock().unwrap();
-    let table = lock.as_ref()?;
-    table.virt_to_real.get(&vpid).copied()
+/// Set env vars for a child about to execve, so re-exec'd fakelinux can attach.
+pub fn set_child_env(child_vpid: i32, parent_vpid: i32) {
+    std::env::set_var("FAKELINUX_VPID", child_vpid.to_string());
+    std::env::set_var("FAKELINUX_VPPID", parent_vpid.to_string());
 }
 
-/// Remove a process from the table (e.g., after wait reaps it).
-pub fn unregister_real_pid(real_pid: i32) {
-    let mut lock = PID_TABLE.lock().unwrap();
-    if let Some(table) = lock.as_mut() {
-        if let Some(vpid) = table.real_to_virt.remove(&real_pid) {
-            table.virt_to_real.remove(&vpid);
+/// Restore env vars for the parent after a child execve fails or after fork
+/// returns to the parent path.
+pub fn restore_parent_env() {
+    let vpid = MY_VPID.load(Ordering::Relaxed);
+    let vppid = MY_VPPID.load(Ordering::Relaxed);
+    std::env::set_var("FAKELINUX_VPID", vpid.to_string());
+    std::env::set_var("FAKELINUX_VPPID", vppid.to_string());
+}
+
+/// Mark the current process's entry as unused. Called on exit.
+pub fn on_exit() {
+    if !CONTAINER_MODE.load(Ordering::Relaxed) {
+        return;
+    }
+    let vpid = MY_VPID.load(Ordering::Relaxed);
+    if vpid > 0 && vpid < MAX_ENTRIES as i32 {
+        table().entries[vpid as usize].store(0, Ordering::Release);
+        table().count.fetch_sub(1, Ordering::Relaxed);
+    }
+    if IS_INIT.load(Ordering::Relaxed) {
+        if let Some(name) = unsafe { &*std::ptr::addr_of!(SHM_NAME) } {
+            let c_name = std::ffi::CString::new(name.as_str()).unwrap();
+            unsafe { libc::shm_unlink(c_name.as_ptr()); }
         }
     }
 }
 
-/// Get the virtual PID for the current process.
+// ─── Query API ───────────────────────────────────────────────────────────────
+
+/// Get the cached virtual PID for the current process.
 pub fn current_vpid() -> i32 {
-    let real_pid = unsafe { libc::getpid() };
-    real_to_virtual(real_pid).unwrap_or(real_pid)
+    MY_VPID.load(Ordering::Relaxed)
 }
 
-/// Get the virtual PPID for the current process.
-/// Init (vpid 1) returns 0. Children of init return 1.
+/// Get the cached virtual PPID for the current process.
 pub fn current_vppid() -> i32 {
-    let real_pid = unsafe { libc::getpid() };
-    let init_pid = INIT_REAL_PID.load(Ordering::SeqCst);
+    MY_VPPID.load(Ordering::Relaxed)
+}
 
-    if real_pid == init_pid {
-        return 0; // init's parent is 0 (kernel)
+/// Translate a virtual PID to a real PID. Returns None if not found.
+pub fn virtual_to_real(vpid: i32) -> Option<i32> {
+    if vpid <= 0 || vpid >= MAX_ENTRIES as i32 {
+        return None;
     }
+    let real = table().entries[vpid as usize].load(Ordering::Acquire);
+    if real != 0 { Some(real) } else { None }
+}
 
-    let real_ppid = unsafe { libc::getppid() };
-    // If our real parent is the init process, return vpid 1
-    if real_ppid == init_pid {
-        return 1;
+/// Translate a real PID to a virtual PID by scanning entries.
+/// This is O(n) but only needed for wait4 return translation.
+pub fn real_to_virtual(real_pid: i32) -> Option<i32> {
+    let t = table();
+    let limit = t.next_vpid.load(Ordering::Acquire).min(MAX_ENTRIES as i32);
+    for i in 1..limit {
+        if t.entries[i as usize].load(Ordering::Acquire) == real_pid {
+            return Some(i);
+        }
     }
-    // Otherwise look up the parent in the table
-    real_to_virtual(real_ppid).unwrap_or(0)
+    None
+}
+
+/// Mark a virtual PID entry as unused (e.g., after wait reaps it).
+pub fn unregister_vpid(vpid: i32) {
+    if vpid > 0 && vpid < MAX_ENTRIES as i32 {
+        let old = table().entries[vpid as usize].swap(0, Ordering::AcqRel);
+        if old != 0 {
+            table().count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Translate a virtual PID argument from a syscall to a real PID.
 /// Special values: -1 (any child), 0 (same process group), positive vpid.
 pub fn translate_pid_arg(vpid: i32) -> i32 {
     match vpid {
-        -1 => -1,                // wait for any child — pass through
-        0 => 0,                  // same process group — pass through
-        p if p > 0 => {
-            virtual_to_real(p).unwrap_or(p)
-        }
+        -1 => -1,
+        0 => 0,
+        p if p > 0 => virtual_to_real(p).unwrap_or(p),
         neg => {
-            // Negative: wait for process group |neg|
-            // Translate the group leader PID
             let abs = -neg;
             -(virtual_to_real(abs).unwrap_or(abs))
         }
@@ -134,39 +275,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pid_namespace_basic() {
-        // Reset state for test
-        {
-            let mut lock = PID_TABLE.lock().unwrap();
-            *lock = None;
-        }
-        CONTAINER_MODE.store(false, Ordering::SeqCst);
-
-        // Initialize
-        init();
+    fn test_pid_namespace_shm() {
+        // Create a fresh container
+        init_container();
         assert!(CONTAINER_MODE.load(Ordering::SeqCst));
+        assert_eq!(current_vpid(), 1);
+        assert_eq!(current_vppid(), 0);
 
         let real_pid = unsafe { libc::getpid() };
-        assert_eq!(real_to_virtual(real_pid), Some(1));
         assert_eq!(virtual_to_real(1), Some(real_pid));
+        assert_eq!(real_to_virtual(real_pid), Some(1));
 
         // Register a fake child
-        let vpid = register_pid(99999);
+        let vpid = register_fork(99999);
         assert_eq!(vpid, 2);
-        assert_eq!(real_to_virtual(99999), Some(2));
         assert_eq!(virtual_to_real(2), Some(99999));
+        assert_eq!(real_to_virtual(99999), Some(2));
 
-        // Re-register returns same vpid
-        assert_eq!(register_pid(99999), 2);
+        // Register another
+        let vpid2 = register_fork(88888);
+        assert_eq!(vpid2, 3);
 
         // Unregister
-        unregister_real_pid(99999);
-        assert_eq!(real_to_virtual(99999), None);
+        unregister_vpid(2);
         assert_eq!(virtual_to_real(2), None);
+        assert_eq!(real_to_virtual(99999), None);
 
         // translate_pid_arg
         assert_eq!(translate_pid_arg(-1), -1);
         assert_eq!(translate_pid_arg(0), 0);
         assert_eq!(translate_pid_arg(1), real_pid);
+        assert_eq!(translate_pid_arg(3), 88888);
+
+        // Cleanup
+        unregister_vpid(3);
+        on_exit();
     }
 }
