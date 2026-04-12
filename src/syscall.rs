@@ -141,6 +141,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_PRLIMIT64 => do_prlimit64(args[0], args[1] as i32, args[2], args[3]),
         SYS_RSEQ => (-38_i64) as u64, // ENOSYS
         SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
+        SYS_SCHED_SETSCHEDULER => 0, // stub success
         SYS_SCHED_SETAFFINITY => 0, // stub success
         SYS_SCHED_GETAFFINITY => do_sched_getaffinity(args[0] as i32, args[1] as u32, args[2]),
         SYS_PSELECT6 => do_pselect6(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
@@ -455,6 +456,14 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
         let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
         if path.to_bytes().is_empty() {
             return do_fstat(linux_dirfd, statbuf);
+        }
+    }
+
+    // Check if this is a /proc path we handle virtually
+    if pathname != 0 {
+        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        if let Some(()) = procfs::try_stat(path.to_bytes(), statbuf) {
+            return 0;
         }
     }
 
@@ -1407,6 +1416,8 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
     const PR_GET_NO_NEW_PRIVS: i32 = 39;
     const PR_SET_PDEATHSIG: i32 = 1;
     const PR_GET_PDEATHSIG: i32 = 2;
+    const PR_CAPBSET_READ: i32 = 23;
+    const PR_CAPBSET_DROP: i32 = 24;
 
     match option {
         PR_SET_NAME => {
@@ -1443,6 +1454,8 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
         PR_SET_VMA => 0, // stub success (used for naming anonymous mappings)
         PR_SET_NO_NEW_PRIVS => 0,
         PR_GET_NO_NEW_PRIVS => 0,
+        PR_CAPBSET_READ => 1, // report all capabilities as present (we run as "root")
+        PR_CAPBSET_DROP => 0, // stub success
         PR_SET_PDEATHSIG => 0,
         PR_GET_PDEATHSIG => {
             if arg2 != 0 {

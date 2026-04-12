@@ -67,17 +67,24 @@ pub fn set_auxv(data: Vec<u8>) {
 pub fn try_open(path: &[u8]) -> Option<i32> {
     let path_str = std::str::from_utf8(path).ok()?;
 
-    let content = generate_content(path_str)?;
+    // Handle /proc as a directory (for ps to enumerate PIDs via getdents64)
+    if path_str == "/proc" {
+        return try_open_proc_dir();
+    }
 
-    // Create a pipe; write content to write-end, close it, return read-end.
+    let content = generate_content(path_str)?;
+    Some(pipe_content(&content))
+}
+
+/// Create a pipe fd containing the given content.
+fn pipe_content(content: &[u8]) -> i32 {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return None;
+        return -1;
     }
     let read_fd = fds[0];
     let write_fd = fds[1];
 
-    // Write content
     let mut written = 0usize;
     while written < content.len() {
         let n = unsafe {
@@ -92,10 +99,38 @@ pub fn try_open(path: &[u8]) -> Option<i32> {
     }
     unsafe { libc::close(write_fd); }
 
-    Some(read_fd)
+    read_fd
+}
+
+/// Open /proc as a directory containing our PID as an entry.
+/// Creates a temp directory with symlinks/dirs for each "process".
+fn try_open_proc_dir() -> Option<i32> {
+    let pid = unsafe { libc::getpid() };
+    let dir_path = format!("/tmp/.fakelinux-proc-{}", pid);
+    let c_dir = std::ffi::CString::new(dir_path.as_str()).ok()?;
+
+    // Create the temp dir and a subdirectory for our PID
+    unsafe { libc::mkdir(c_dir.as_ptr(), 0o755); }
+    let pid_dir = format!("{}/{}", dir_path, pid);
+    let c_pid_dir = std::ffi::CString::new(pid_dir.as_str()).ok()?;
+    unsafe { libc::mkdir(c_pid_dir.as_ptr(), 0o755); }
+
+    // Also create "self" symlink
+    let self_link = format!("{}/self", dir_path);
+    let c_self = std::ffi::CString::new(self_link.as_str()).ok()?;
+    let c_target = std::ffi::CString::new(format!("{}", pid)).ok()?;
+    unsafe { libc::symlink(c_target.as_ptr(), c_self.as_ptr()); }
+
+    // Open as directory
+    let fd = unsafe { libc::open(c_dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd >= 0 { Some(fd) } else { None }
 }
 
 fn generate_content(path: &str) -> Option<Vec<u8>> {
+    // Normalize /proc/<pid>/... to /proc/self/... when <pid> matches our PID
+    let normalized = normalize_proc_path(path);
+    let path = normalized.as_deref().unwrap_or(path);
+
     match path {
         "/proc/self/maps" => Some(generate_maps()),
         "/proc/self/auxv" => Some(with(|pfs| pfs.auxv.clone())),
@@ -106,10 +141,25 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/sys/kernel/osrelease" => Some(b"6.1.0-fakelinux\n".to_vec()),
         "/proc/self/mountinfo" => Some(generate_mountinfo()),
         "/proc/meminfo" => Some(generate_meminfo()),
+        "/proc/uptime" => Some(generate_uptime()),
+        "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         _ => {
             // /proc/self/fd/N → not a regular file open, ignore
             None
         }
+    }
+}
+
+/// If path is /proc/<pid>/... where <pid> matches our PID, return /proc/self/...
+fn normalize_proc_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/proc/")?;
+    let slash_pos = rest.find('/')?;
+    let pid_str = &rest[..slash_pos];
+    let pid: i32 = pid_str.parse().ok()?;
+    if pid == unsafe { libc::getpid() } {
+        Some(format!("/proc/self{}", &rest[slash_pos..]))
+    } else {
+        None
     }
 }
 
@@ -259,9 +309,88 @@ fn generate_meminfo() -> Vec<u8> {
     .into_bytes()
 }
 
+fn generate_uptime() -> Vec<u8> {
+    // Use clock_gettime(CLOCK_MONOTONIC) for uptime
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    let secs = ts.tv_sec as f64 + ts.tv_nsec as f64 / 1_000_000_000.0;
+    // Format: uptime_seconds idle_seconds
+    format!("{:.2} {:.2}\n", secs, secs * 0.9).into_bytes()
+}
+
+/// Handle stat/fstatat on /proc paths. Returns Some(()) if handled.
+/// Writes a synthetic Linux stat struct to statbuf.
+pub fn try_stat(path: &[u8], statbuf: u64) -> Option<()> {
+    let path_str = std::str::from_utf8(path).ok()?;
+
+    // Normalize /proc/<pid>/... to /proc/self/...
+    let normalized = normalize_proc_path(path_str);
+    let check = normalized.as_deref().unwrap_or(path_str);
+
+    // Check if this is a proc path we know about
+    let is_dir = match check {
+        "/proc" | "/proc/self" | "/proc/self/task" | "/proc/self/fd"
+        | "/proc/self/net" => true,
+        _ => false,
+    };
+
+    // Also match /proc/<our-pid> as a directory
+    let is_pid_dir = if !is_dir && path_str.starts_with("/proc/") {
+        let rest = &path_str[6..];
+        // Check if it's just /proc/<digits> where digits = our pid
+        if let Ok(pid) = rest.parse::<i32>() {
+            pid == unsafe { libc::getpid() }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let is_file = generate_content(path_str).is_some();
+
+    if !is_dir && !is_pid_dir && !is_file {
+        return None;
+    }
+
+    // Write a synthetic Linux aarch64 stat struct (128 bytes)
+    let buf = statbuf as *mut u8;
+    unsafe { std::ptr::write_bytes(buf, 0, 128); }
+
+    let pid = unsafe { libc::getpid() } as u64;
+    let mode: u32 = if is_dir || is_pid_dir {
+        0o40555 // S_IFDIR | r-xr-xr-x
+    } else {
+        0o100444 // S_IFREG | r--r--r--
+    };
+
+    // Linux aarch64 struct stat layout:
+    //   offset  0: u64 st_dev
+    //   offset  8: u64 st_ino
+    //   offset 16: u32 st_mode
+    //   offset 20: u32 st_nlink
+    //   offset 24: u32 st_uid
+    //   offset 28: u32 st_gid
+    unsafe {
+        // st_dev = 0 (proc has no real device)
+        // st_ino = pid-based fake inode
+        let ino = pid.wrapping_mul(1000).wrapping_add(1);
+        std::ptr::copy_nonoverlapping(&ino as *const u64 as *const u8, buf.add(8), 8);
+        std::ptr::copy_nonoverlapping(&mode as *const u32 as *const u8, buf.add(16), 4);
+        let nlink: u32 = if is_dir || is_pid_dir { 2 } else { 1 };
+        std::ptr::copy_nonoverlapping(&nlink as *const u32 as *const u8, buf.add(20), 4);
+    }
+
+    Some(())
+}
+
 /// Handle readlink on /proc paths.
 pub fn try_readlink(path: &[u8], buf: u64, bufsiz: u64) -> Option<u64> {
     let path_str = std::str::from_utf8(path).ok()?;
+
+    // Normalize /proc/<pid>/... to /proc/self/...
+    let normalized = normalize_proc_path(path_str);
+    let path_str = normalized.as_deref().unwrap_or(path_str);
 
     if path_str == "/proc/self/exe" {
         return with(|pfs| {

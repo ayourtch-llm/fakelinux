@@ -19,6 +19,7 @@ pub const SYS_SET_TID_ADDRESS: u64 = 96;
 pub const SYS_FUTEX: u64 = 98;
 pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_CLOCK_GETTIME: u64 = 113;
+pub const SYS_SCHED_SETSCHEDULER: u64 = 119;
 pub const SYS_SCHED_GETAFFINITY: u64 = 123;
 pub const SYS_SCHED_YIELD: u64 = 124;
 pub const SYS_CLONE: u64 = 220;
