@@ -8,7 +8,7 @@ A Rust program that runs **unchanged aarch64 Linux ELF binaries** on macOS Apple
 - Python 3.12 (musl, Alpine): 100/100 reliability
 - busybox (Alpine): sh, vi, echo, ls, cat, pipes, forks, command substitution
 - Ubuntu glibc dynamic binaries: bash, ls, ps, id, cat, wget (busybox)
-- **apt-get update**: downloads 4 InRelease files from Ubuntu repos, hangs on gpgv verification
+- **apt-get update**: downloads 4 InRelease files from Ubuntu repos, gpgv verification completes successfully (verified 2026-04-12)
 - **HTTP networking**: fully working (DNS, TCP connect, HTTP fetch)
 - 26/26 test suite passing
 - Container mode with virtual PID namespace via shared memory
@@ -170,24 +170,13 @@ Linux aarch64 msghdr = 56 bytes, macOS = 48 bytes. Difference: `msg_iovlen` and 
 
 ## Current Known Issues
 
-### 1. apt-get gpgv Method Pipe Hang (BLOCKING BUG)
+### 1. apt-get gpgv Method Pipe Hang (RESOLVED)
 
-**Symptoms**: apt-get downloads 4 InRelease files successfully, then hangs when gpgv method processes them.
+**Status**: VERIFIED WORKING as of 2026-04-12. Multiple consecutive runs of `apt-get update` complete successfully.
 
-**Details**:
-- Parent creates pipes, forks gpgv children, children exec fakelinux→gpgv method
-- Children write results (verification status) to stdout (fd 1) — writes succeed
-- Parent's `pselect6(nfds=7, rd:0x60)` watches fds 5,6 but they never become readable (returns 0 on every poll)
-- Eventually children read EOF on stdin (read(0)→0) and exit
-- Standalone gpgv method works perfectly — the issue is parent-child pipe communication
+**Previous symptoms (now resolved)**: apt-get downloads 4 InRelease files successfully, then hangs when gpgv method processes them.
 
-**Root cause hypothesis**: The parent's pipe read-end fds (5,6) might not actually be connected to the children's stdout pipes. Possible fd reallocation during the complex fork+exec+pipe sequence. The http method had the same issue but was fixed by F_GETFL/F_SETFL flag translation — the gpgv method might have a different variant of the same problem.
-
-**Debugging done**:
-- Confirmed `close(0)` is never called (added logging)
-- Confirmed fd 0 is valid (F_GETFL=0x0) at time of EOF
-- Non-blocking probe before blocking read: EAGAIN (pipe open, no data) → then blocking read returns 0
-- Native macOS test (same pattern with SIGILL handler + file I/O) works correctly
+**Resolution**: Fixed via `fcntl` F_GETFL/F_SETFL flag translation (`O_NONBLOCK`, `O_APPEND`, etc.) in `src/translate.rs`. The http method and gpgv method both benefited from this fix.
 - The F_SETFL fix resolved the http method's version of this bug but not gpgv's
 
 **Key observation**: After the F_SETFL fix, the http method's `read(0)` returns -11 (EAGAIN) instead of 0 (EOF), and the method correctly retries via pselect. The gpgv method's `read(0)` returns actual 0 (EOF), meaning the pipe write-end is truly closed by the parent.
