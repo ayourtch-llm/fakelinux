@@ -14,6 +14,38 @@ use crate::translate;
 const LINUX_SOCK_NONBLOCK: i32 = 0x800;
 const LINUX_SOCK_CLOEXEC: i32 = 0x80000;
 
+// ─── MSG flags translation ───────────────────────────────────────────────────
+// Linux and macOS use different values for some MSG_* flags in send/recv.
+// Linux MSG_NOSIGNAL=0x4000, macOS MSG_NOSIGNAL=0x80000.
+// Linux MSG_DONTWAIT=0x40, macOS MSG_DONTWAIT=0x80.
+// Linux MSG_MORE=0x8000, macOS has no equivalent (strip it).
+// Linux MSG_CMSG_CLOEXEC=0x40000000, macOS MSG_CMSG_CLOEXEC=not available (strip).
+
+const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
+const LINUX_MSG_DONTWAIT: i32 = 0x40;
+const LINUX_MSG_MORE: i32 = 0x8000;
+const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x40000000;
+
+fn translate_msg_flags(linux_flags: i32) -> i32 {
+    let mut mac = linux_flags;
+
+    // Strip Linux-specific flags first, then set macOS equivalents
+    if mac & LINUX_MSG_NOSIGNAL != 0 {
+        mac &= !LINUX_MSG_NOSIGNAL;
+        // macOS uses SO_NOSIGPIPE on the socket (set in apply_sock_flags),
+        // so we don't need MSG_NOSIGNAL per-call. But set it anyway if available.
+        mac |= 0x80000; // macOS MSG_NOSIGNAL
+    }
+    if mac & LINUX_MSG_DONTWAIT != 0 {
+        mac &= !LINUX_MSG_DONTWAIT;
+        mac |= 0x80; // macOS MSG_DONTWAIT
+    }
+    // Strip flags with no macOS equivalent
+    mac &= !(LINUX_MSG_MORE | LINUX_MSG_CMSG_CLOEXEC);
+
+    mac
+}
+
 // ─── sockaddr translation ────────────────────────────────────────────────────
 //
 // Linux sockaddr:  { u16 sa_family; u8 sa_data[14]; }
@@ -171,6 +203,7 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
 }
 
 pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u32) -> u64 {
+    let mac_flags = translate_msg_flags(flags);
     if dest_addr != 0 {
         linux_sockaddr_to_mac(dest_addr, addrlen);
     }
@@ -179,7 +212,7 @@ pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrle
             fd,
             buf as *const libc::c_void,
             len as usize,
-            flags,
+            mac_flags,
             if dest_addr == 0 {
                 std::ptr::null()
             } else {
@@ -206,12 +239,13 @@ pub fn do_recvfrom(
     src_addr: u64,
     addrlen_ptr: u64,
 ) -> u64 {
+    let mac_flags = translate_msg_flags(flags);
     let ret = unsafe {
         libc::recvfrom(
             fd,
             buf as *mut libc::c_void,
             len as usize,
-            flags,
+            mac_flags,
             if src_addr == 0 {
                 std::ptr::null_mut()
             } else {
@@ -380,12 +414,13 @@ fn linux_msghdr_to_mac(linux_ptr: u64) -> libc::msghdr {
 }
 
 pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
+    let mac_flags = translate_msg_flags(flags);
     let mut mac_msg = linux_msghdr_to_mac(msg_ptr);
     // Translate sockaddr in msg_name if present
     if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
         linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
     }
-    let ret = unsafe { libc::sendmsg(fd, &mac_msg, flags) };
+    let ret = unsafe { libc::sendmsg(fd, &mac_msg, mac_flags) };
     // Restore sockaddr for guest
     if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
         mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
@@ -398,8 +433,9 @@ pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
 }
 
 pub fn do_recvmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
+    let mac_flags = translate_msg_flags(flags);
     let mut mac_msg = linux_msghdr_to_mac(msg_ptr);
-    let ret = unsafe { libc::recvmsg(fd, &mut mac_msg, flags) };
+    let ret = unsafe { libc::recvmsg(fd, &mut mac_msg, mac_flags) };
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -428,6 +464,7 @@ pub fn do_recvmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
 ///   // total 60, padded to 64 for alignment
 pub fn do_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> u64 {
     const LINUX_MMSGHDR_SIZE: usize = 64; // 56 (msghdr) + 4 (msg_len) + 4 (pad)
+    let mac_flags = translate_msg_flags(flags);
 
     let mut sent = 0u32;
     for i in 0..vlen {
@@ -439,7 +476,7 @@ pub fn do_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> u64 {
             linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
         }
 
-        let ret = unsafe { libc::sendmsg(fd, &mac_msg, flags) };
+        let ret = unsafe { libc::sendmsg(fd, &mac_msg, mac_flags) };
 
         // Restore sockaddr
         if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
