@@ -136,6 +136,8 @@ pub const SYS_SETRESGID: u64 = 149;
 pub const SYS_GETRESGID: u64 = 150;
 pub const SYS_SETFSUID: u64 = 151;
 pub const SYS_SETFSGID: u64 = 152;
+pub const SYS_CLOSE_RANGE: u64 = 436;
+pub const SYS_FACCESSAT2: u64 = 439;
 
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;

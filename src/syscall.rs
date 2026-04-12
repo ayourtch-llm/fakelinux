@@ -154,6 +154,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_PRLIMIT64 => do_prlimit64(args[0], args[1] as i32, args[2], args[3]),
         SYS_RSEQ => (-38_i64) as u64, // ENOSYS
         SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
+        SYS_CLOSE_RANGE => do_close_range(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYS_FACCESSAT2 => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
         SYS_SCHED_SETSCHEDULER => 0, // stub success
         SYS_SCHED_SETAFFINITY => 0, // stub success
         SYS_SCHED_GETAFFINITY => do_sched_getaffinity(args[0] as i32, args[1] as u32, args[2]),
@@ -538,6 +540,20 @@ fn do_close(fd: i32) -> u64 {
     procfs::on_close(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
+fn do_close_range(first: u32, last: u32, _flags: u32) -> u64 {
+    // Close all fds from first to last (inclusive).
+    // Clamp to a reasonable range to avoid iterating millions of fds.
+    let last = last.min(first.saturating_add(65536));
+    for fd in first..=last {
+        let fd = fd as i32;
+        eventfd::on_close(fd);
+        epoll::on_close(fd);
+        procfs::on_close(fd);
+        unsafe { libc::close(fd); }
+    }
+    0
 }
 
 fn do_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
@@ -1466,12 +1482,20 @@ fn do_getrandom(buf: u64, buflen: u64, _flags: u32) -> u64 {
     buflen
 }
 
-fn do_prlimit64(_pid: u64, _resource: i32, _new_limit: u64, old_limit: u64) -> u64 {
+fn do_prlimit64(_pid: u64, resource: i32, _new_limit: u64, old_limit: u64) -> u64 {
+    const RLIMIT_NOFILE: i32 = 7;
     if old_limit != 0 {
         unsafe {
             let ptr = old_limit as *mut u64;
-            *ptr = u64::MAX;
-            *ptr.add(1) = u64::MAX;
+            if resource == RLIMIT_NOFILE {
+                // Return a reasonable fd limit; u64::MAX causes glibc to iterate
+                // millions of fds in closefrom() fallback
+                *ptr = 1024;       // rlim_cur
+                *ptr.add(1) = 4096; // rlim_max
+            } else {
+                *ptr = u64::MAX;
+                *ptr.add(1) = u64::MAX;
+            }
         }
     }
     0
