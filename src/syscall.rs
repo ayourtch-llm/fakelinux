@@ -176,7 +176,14 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_DUP => do_dup(args[0] as i32),
         SYS_DUP3 => do_dup3(args[0] as i32, args[1] as i32, args[2] as i32),
         SYS_PIPE2 => do_pipe2(args[0], args[1] as i32),
-        SYS_GETDENTS64 => do_getdents64(args[0] as i32, args[1], args[2]),
+        SYS_GETDENTS64 => {
+            // Check if this is a virtual /proc directory fd
+            if let Some(n) = procfs::try_getdents64(args[0] as i32, args[1], args[2]) {
+                n
+            } else {
+                do_getdents64(args[0] as i32, args[1], args[2])
+            }
+        }
         SYS_PPOLL => do_ppoll(args[0], args[1] as u32, args[2], args[3], args[4]),
         SYS_EVENTFD2 => eventfd::do_eventfd2(args[0] as u32, args[1] as i32),
         SYS_EPOLL_CREATE1 => epoll::do_epoll_create1(args[0] as i32),
@@ -525,9 +532,10 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
 }
 
 fn do_close(fd: i32) -> u64 {
-    // Clean up eventfd/epoll state if this fd is one of those
+    // Clean up virtual fd state if this fd is one of those
     eventfd::on_close(fd);
     epoll::on_close(fd);
+    procfs::on_close(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -538,6 +546,10 @@ fn do_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
 }
 
 fn do_fstat(fd: i32, statbuf: u64) -> u64 {
+    // Check if this is a virtual /proc directory fd
+    if let Some(()) = procfs::try_fstat_virtual(fd, statbuf) {
+        return 0;
+    }
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
         let ret = libc::fstat(fd, &mut mac_stat);
@@ -914,12 +926,24 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
     if linux_flags & 0x1000 != 0 {
         let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
         if path.to_bytes().is_empty() {
+            // Check virtual dir fd first
+            if procfs::is_virtual_dir(mac_dirfd) {
+                return procfs::write_statx_dir(statxbuf);
+            }
             unsafe {
                 let mut mac_stat: libc::stat = std::mem::zeroed();
                 let ret = libc::fstat(mac_dirfd, &mut mac_stat);
                 if ret < 0 { return translate::linux_errno(); }
                 translate::mac_stat_to_linux_statx(&mac_stat, statxbuf as *mut u8);
             }
+            return 0;
+        }
+    }
+
+    // Check if this is a /proc path we handle virtually
+    if pathname != 0 {
+        let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        if let Some(()) = procfs::try_statx(path.to_bytes(), statxbuf) {
             return 0;
         }
     }
