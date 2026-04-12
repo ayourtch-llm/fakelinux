@@ -4,6 +4,7 @@ use crate::eventfd;
 use crate::linux::*;
 use crate::loader;
 use crate::net;
+use crate::pidns;
 use crate::procfs;
 use crate::rootfs;
 use crate::signal;
@@ -114,8 +115,20 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_MUNMAP => do_munmap(args[0], args[1]),
         SYS_MPROTECT => do_mprotect(args[0], args[1], args[2]),
         SYS_MADVISE => 0,
-        SYS_GETPID => unsafe { libc::getpid() as u64 },
-        SYS_GETPPID => unsafe { libc::getppid() as u64 },
+        SYS_GETPID => {
+            if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::current_vpid() as u64
+            } else {
+                unsafe { libc::getpid() as u64 }
+            }
+        }
+        SYS_GETPPID => {
+            if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::current_vppid() as u64
+            } else {
+                unsafe { libc::getppid() as u64 }
+            }
+        }
         SYS_GETUID => creds::do_getuid(),
         SYS_GETEUID => creds::do_geteuid(),
         SYS_GETGID => creds::do_getgid(),
@@ -185,9 +198,26 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_SHUTDOWN => net::do_shutdown(args[0] as i32, args[1] as i32),
         SYS_SENDMSG => net::do_sendmsg(args[0] as i32, args[1], args[2] as i32),
         SYS_RECVMSG => net::do_recvmsg(args[0] as i32, args[1], args[2] as i32),
-        SYS_KILL => signal::do_kill(args[0] as i64, args[1] as i32),
+        SYS_KILL => {
+            let pid_arg = args[0] as i64;
+            let real_pid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::translate_pid_arg(pid_arg as i32) as i64
+            } else {
+                pid_arg
+            };
+            signal::do_kill(real_pid, args[1] as i32)
+        }
         SYS_TKILL => signal::do_tkill(args[0] as i32, args[1] as i32),
-        SYS_TGKILL => signal::do_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),
+        SYS_TGKILL => {
+            let tgid = args[0] as i32;
+            let tid = args[1] as i32;
+            let real_tgid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::translate_pid_arg(tgid)
+            } else {
+                tgid
+            };
+            signal::do_tgkill(real_tgid, tid, args[2] as i32)
+        }
         SYS_UMASK => {
             let ret = unsafe { libc::umask(args[0] as libc::mode_t) };
             ret as u64
@@ -264,7 +294,30 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 if ret2 < 0 { translate::linux_errno() } else { 0 }
             } else { translate::linux_errno() }
         }
-        SYS_WAIT4 => thread::do_wait4(args[0] as i64, args[1], args[2] as i32, args[3]),
+        SYS_WAIT4 => {
+            let pid_arg = args[0] as i64;
+            let translated_pid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::translate_pid_arg(pid_arg as i32) as i64
+            } else {
+                pid_arg
+            };
+            let ret = thread::do_wait4(translated_pid, args[1], args[2] as i32, args[3]);
+            // Translate returned real PID back to virtual PID
+            if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                let ret_i64 = ret as i64;
+                if ret_i64 > 0 {
+                    let real_pid = ret as i32;
+                    let vpid = pidns::real_to_virtual(real_pid).unwrap_or(real_pid);
+                    // Reap: remove from table after wait
+                    pidns::unregister_real_pid(real_pid);
+                    vpid as u64
+                } else {
+                    ret
+                }
+            } else {
+                ret
+            }
+        }
         SYS_EXECVE => do_execve(args[0], args[1], args[2]),
         SYS_MEMBARRIER => do_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
         SYS_STATFS => do_statfs(args[0], args[1]),

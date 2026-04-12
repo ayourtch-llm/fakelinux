@@ -5,6 +5,7 @@ mod eventfd;
 mod linux;
 mod loader;
 mod net;
+mod pidns;
 mod procfs;
 mod rootfs;
 mod signal;
@@ -16,13 +17,23 @@ mod trap;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: fakelinux <aarch64-linux-elf> [args...]");
+
+    // Parse --init flag (must come before the ELF path)
+    let mut init_mode = false;
+    let mut guest_arg_start = 1;
+    if args.len() > 1 && args[1] == "--init" {
+        init_mode = true;
+        guest_arg_start = 2;
+    }
+
+    if args.len() <= guest_arg_start {
+        eprintln!("Usage: fakelinux [--init] <aarch64-linux-elf> [args...]");
+        eprintln!("  --init       Run in container mode (virtual PID namespace, PID 1)");
         eprintln!("  Set FAKELINUX_SYSROOT to an aarch64 Linux rootfs for dynamic binaries.");
         std::process::exit(1);
     }
 
-    let elf_path = &args[1];
+    let elf_path = &args[guest_arg_start];
     let sysroot = std::env::var("FAKELINUX_SYSROOT").unwrap_or_default();
     let rootfs = std::env::var("FAKELINUX_ROOT").unwrap_or_default();
 
@@ -89,8 +100,14 @@ fn main() {
     signal::create_sigreturn_trampoline();
     trap::install_handler();
 
+    // Initialize container mode if requested
+    if init_mode {
+        pidns::init();
+        eprintln!("fakelinux: container mode (--init), virtual PID 1");
+    }
+
     // Load segments, patch SVCs, set up stack
-    let loaded = loader::load(&elf, &data, &args[1..], &sysroot).unwrap_or_else(|e| {
+    let loaded = loader::load(&elf, &data, &args[guest_arg_start..], &sysroot).unwrap_or_else(|e| {
         eprintln!("fakelinux: {}", e);
         std::process::exit(1);
     });

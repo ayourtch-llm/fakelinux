@@ -105,20 +105,21 @@ fn pipe_content(content: &[u8]) -> i32 {
 /// Open /proc as a directory containing our PID as an entry.
 /// Creates a temp directory with symlinks/dirs for each "process".
 fn try_open_proc_dir() -> Option<i32> {
-    let pid = unsafe { libc::getpid() };
-    let dir_path = format!("/tmp/.fakelinux-proc-{}", pid);
+    let real_pid = unsafe { libc::getpid() };
+    let vpid = visible_pid();
+    let dir_path = format!("/tmp/.fakelinux-proc-{}", real_pid);
     let c_dir = std::ffi::CString::new(dir_path.as_str()).ok()?;
 
-    // Create the temp dir and a subdirectory for our PID
+    // Create the temp dir and a subdirectory for our visible PID
     unsafe { libc::mkdir(c_dir.as_ptr(), 0o755); }
-    let pid_dir = format!("{}/{}", dir_path, pid);
+    let pid_dir = format!("{}/{}", dir_path, vpid);
     let c_pid_dir = std::ffi::CString::new(pid_dir.as_str()).ok()?;
     unsafe { libc::mkdir(c_pid_dir.as_ptr(), 0o755); }
 
     // Also create "self" symlink
     let self_link = format!("{}/self", dir_path);
     let c_self = std::ffi::CString::new(self_link.as_str()).ok()?;
-    let c_target = std::ffi::CString::new(format!("{}", pid)).ok()?;
+    let c_target = std::ffi::CString::new(format!("{}", vpid)).ok()?;
     unsafe { libc::symlink(c_target.as_ptr(), c_self.as_ptr()); }
 
     // Open as directory
@@ -150,16 +151,46 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// If path is /proc/<pid>/... where <pid> matches our PID, return /proc/self/...
+/// If path is /proc/<pid>/... where <pid> matches our PID (real or virtual),
+/// return /proc/self/...
 fn normalize_proc_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/proc/")?;
     let slash_pos = rest.find('/')?;
     let pid_str = &rest[..slash_pos];
     let pid: i32 = pid_str.parse().ok()?;
-    if pid == unsafe { libc::getpid() } {
+    let real_pid = unsafe { libc::getpid() };
+
+    let is_self = if pid == real_pid {
+        true
+    } else if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // In container mode, also match our virtual PID
+        crate::pidns::current_vpid() == pid
+    } else {
+        false
+    };
+
+    if is_self {
         Some(format!("/proc/self{}", &rest[slash_pos..]))
     } else {
         None
+    }
+}
+
+/// Get the PID to use in /proc output (virtual if container mode, real otherwise).
+fn visible_pid() -> i32 {
+    if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::pidns::current_vpid()
+    } else {
+        unsafe { libc::getpid() }
+    }
+}
+
+/// Get the PPID to use in /proc output.
+fn visible_ppid() -> i32 {
+    if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::pidns::current_vppid()
+    } else {
+        unsafe { libc::getppid() }
     }
 }
 
@@ -194,16 +225,18 @@ fn generate_maps() -> Vec<u8> {
 }
 
 fn generate_status() -> Vec<u8> {
-    let pid = unsafe { libc::getpid() };
+    let pid = visible_pid();
     format!(
         "Name:\tfakelinux-guest\n\
          Pid:\t{pid}\n\
          Tgid:\t{pid}\n\
+         PPid:\t{ppid}\n\
          Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
          Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
          VmSize:\t    0 kB\n\
          Threads:\t1\n",
         pid = pid,
+        ppid = visible_ppid(),
         uid = crate::creds::do_getuid(),
         gid = crate::creds::do_getgid(),
     )
@@ -211,12 +244,13 @@ fn generate_status() -> Vec<u8> {
 }
 
 fn generate_stat() -> Vec<u8> {
-    let pid = unsafe { libc::getpid() };
+    let pid = visible_pid();
+    let ppid = visible_ppid();
     // Minimal /proc/self/stat line (field 1 = pid, field 2 = (name), field 3 = state, ...)
     format!(
         "{pid} (fakelinux-guest) R {ppid} {pid} {pid} 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = pid,
-        ppid = unsafe { libc::getppid() },
+        ppid = ppid,
     )
     .into_bytes()
 }
@@ -334,12 +368,12 @@ pub fn try_stat(path: &[u8], statbuf: u64) -> Option<()> {
         _ => false,
     };
 
-    // Also match /proc/<our-pid> as a directory
+    // Also match /proc/<our-pid> as a directory (real or virtual PID)
     let is_pid_dir = if !is_dir && path_str.starts_with("/proc/") {
         let rest = &path_str[6..];
         // Check if it's just /proc/<digits> where digits = our pid
         if let Ok(pid) = rest.parse::<i32>() {
-            pid == unsafe { libc::getpid() }
+            pid == unsafe { libc::getpid() } || pid == visible_pid()
         } else {
             false
         }

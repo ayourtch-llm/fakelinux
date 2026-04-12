@@ -414,9 +414,22 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
+
+        // Register child in virtual PID namespace
+        if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::pidns::register_pid(unsafe { libc::getpid() });
+        }
     }
 
-    FORK.set_x0(if pid == 0 { 0 } else { pid as u64 });
+    let return_pid = if pid == 0 {
+        0u64
+    } else if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // Parent: register child and return virtual PID
+        crate::pidns::register_pid(pid) as u64
+    } else {
+        pid as u64
+    };
+    FORK.set_x0(return_pid);
     unsafe { FORK.restore_and_resume(); }
 }
 
