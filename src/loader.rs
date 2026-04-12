@@ -399,9 +399,9 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
 /// The caller must ensure the memory is writable before calling this.
 /// After patching, the caller should set the final permissions and invalidate icache.
 pub fn patch_new_code(start: u64, len: u64) {
-    // Try to extract code ranges from ELF section headers if the mapped
-    // memory starts with an ELF header. This prevents x18 patching from
-    // corrupting non-code data (e.g. .dynstr) in the same mapping.
+    // Try to extract code ranges from ELF section headers (most precise) or
+    // program headers + PT_DYNAMIC (fallback). This prevents x18 patching from
+    // corrupting non-code data (e.g. .dynstr version strings) in the same mapping.
     let code_ranges = extract_code_ranges_from_memory(start, len);
 
     let count = len / 4;
@@ -409,7 +409,9 @@ pub fn patch_new_code(start: u64, len: u64) {
     let mut svc_patched = 0u64;
     let mut tpidr_patched = 0u64;
     let mut x18_patched = 0u64;
+    let mut x18_skipped = 0u64;
     let have_code_ranges = !code_ranges.is_empty();
+    let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok();
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -422,26 +424,35 @@ pub fn patch_new_code(start: u64, len: u64) {
                 add_runtime_tpidr_patch(pc_addr, instr);
                 base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
-            } else if !std::env::var("FAKELINUX_NO_X18").is_ok() && trap::references_x18(instr) {
+            } else if !skip_x18 && trap::references_x18(instr) {
                 let pc_addr = base.add(i) as u64;
-                if !have_code_ranges || addr_in_code_ranges(pc_addr, &code_ranges) {
+                // x18 patterns have high false-positive rates on data (string tables,
+                // symbol tables, etc.). Only patch if we have confirmed code ranges.
+                // SVC/TPIDR patterns are specific enough to scan everything safely.
+                if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges) {
                     add_runtime_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
                     x18_patched += 1;
+                } else if !have_code_ranges {
+                    x18_skipped += 1;
                 }
             }
         }
     }
-    if svc_patched > 0 || tpidr_patched > 0 || x18_patched > 0 {
+    if svc_patched > 0 || tpidr_patched > 0 || x18_patched > 0 || x18_skipped > 0 {
         eprintln!(
-            "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR, {} x18",
-            start, len, svc_patched, tpidr_patched, x18_patched
+            "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR, {} x18{}",
+            start, len, svc_patched, tpidr_patched, x18_patched,
+            if x18_skipped > 0 { format!(" ({} x18 skipped, no code ranges)", x18_skipped) } else { String::new() }
         );
     }
 }
 
-/// Try to extract code ranges from ELF section headers in mapped memory.
-/// Returns empty vec if the memory doesn't start with a valid ELF header.
+/// Try to extract code ranges from ELF headers in mapped memory.
+/// First tries section headers (most precise), then falls back to program headers
+/// + PT_DYNAMIC parsing to identify and exclude known data regions (.dynstr, .dynsym,
+/// .rela, etc.) from executable segments.
+/// Returns empty vec if no code ranges can be determined.
 fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> {
     const SHF_EXECINSTR: u64 = 4;
     let data = unsafe { std::slice::from_raw_parts(base_addr as *const u8, len as usize) };
@@ -451,32 +462,216 @@ fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> 
         return Vec::new();
     }
 
+    // Strategy 1: section headers (most precise)
     let e_shoff = elf::read_u64_pub(data, 40) as usize;
     let e_shentsize = elf::read_u16_pub(data, 58) as usize;
     let e_shnum = elf::read_u16_pub(data, 60) as usize;
 
-    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 || e_shoff >= data.len() {
+    if e_shoff != 0 && e_shnum != 0 && e_shentsize >= 64 && e_shoff < data.len() {
+        let mut ranges = Vec::new();
+        for i in 0..e_shnum {
+            let off = e_shoff + i * e_shentsize;
+            if off + 64 > data.len() { break; }
+            let sh_type = elf::read_u32_pub(data, off + 4);
+            let sh_flags = elf::read_u64_pub(data, off + 8);
+            let sh_addr = elf::read_u64_pub(data, off + 16);
+            let sh_size = elf::read_u64_pub(data, off + 32);
+            if sh_type == 1 && sh_flags & SHF_EXECINSTR != 0 && sh_size > 0 {
+                let mem_addr = base_addr + sh_addr;
+                if mem_addr >= base_addr && mem_addr < base_addr + len {
+                    ranges.push((mem_addr, sh_size));
+                }
+            }
+        }
+        if !ranges.is_empty() {
+            return ranges;
+        }
+    }
+
+    // Strategy 2: program headers + PT_DYNAMIC to exclude known data regions
+    extract_code_ranges_via_phdrs(data, base_addr, len)
+}
+
+/// Build code ranges from program headers by finding PF_X segments and subtracting
+/// known data regions identified via PT_DYNAMIC (DT_STRTAB, DT_SYMTAB, DT_RELA, etc.).
+/// This prevents x18 patching from corrupting string tables and other non-code data
+/// that shares the same PT_LOAD segment as .text.
+fn extract_code_ranges_via_phdrs(data: &[u8], base_addr: u64, len: u64) -> Vec<(u64, u64)> {
+    let e_phoff = elf::read_u64_pub(data, 32) as usize;
+    let e_phentsize = elf::read_u16_pub(data, 54) as usize;
+    let e_phnum = elf::read_u16_pub(data, 56) as usize;
+
+    if e_phoff == 0 || e_phnum == 0 || e_phentsize < 56 {
         return Vec::new();
     }
 
-    let mut ranges = Vec::new();
-    for i in 0..e_shnum {
-        let off = e_shoff + i * e_shentsize;
-        if off + 64 > data.len() { break; }
-        let sh_type = elf::read_u32_pub(data, off + 4);
-        let sh_flags = elf::read_u64_pub(data, off + 8);
-        let sh_addr = elf::read_u64_pub(data, off + 16);
-        let sh_size = elf::read_u64_pub(data, off + 32);
-        // SHT_PROGBITS with EXECINSTR
-        if sh_type == 1 && sh_flags & SHF_EXECINSTR != 0 && sh_size > 0 {
-            // sh_addr is the VMA in the ELF; map to actual memory address
-            let mem_addr = base_addr + sh_addr;
-            if mem_addr >= base_addr && mem_addr < base_addr + len {
-                ranges.push((mem_addr, sh_size));
+    // Parse program headers to find first PT_LOAD (for load base) and PT_DYNAMIC
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut dynamic_file_off = 0u64;
+    let mut dynamic_filesz = 0u64;
+    let mut exec_seg_vaddr = 0u64;
+    let mut exec_seg_filesz = 0u64;
+    let mut have_exec_seg = false;
+
+    for i in 0..e_phnum {
+        let off = e_phoff + i * e_phentsize;
+        if off + 56 > data.len() { break; }
+        let p_type = elf::read_u32_pub(data, off);
+        let p_flags = elf::read_u32_pub(data, off + 4);
+        let p_offset = elf::read_u64_pub(data, off + 8);
+        let p_vaddr = elf::read_u64_pub(data, off + 16);
+        let p_filesz = elf::read_u64_pub(data, off + 32);
+
+        if p_type == 1 /* PT_LOAD */ {
+            if first_load_vaddr.is_none() {
+                first_load_vaddr = Some(p_vaddr);
+            }
+            if p_flags & 1 /* PF_X */ != 0 && !have_exec_seg {
+                exec_seg_vaddr = p_vaddr;
+                exec_seg_filesz = p_filesz;
+                have_exec_seg = true;
+            }
+        }
+        if p_type == 2 /* PT_DYNAMIC */ && p_offset < data.len() as u64 {
+            dynamic_file_off = p_offset;
+            dynamic_filesz = p_filesz;
+        }
+    }
+
+    let first_load_vaddr = match first_load_vaddr {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if !have_exec_seg || dynamic_filesz == 0 {
+        return Vec::new();
+    }
+
+    // Compute load base: the mapping at base_addr corresponds to the first LOAD's p_vaddr
+    let load_base = base_addr.wrapping_sub(first_load_vaddr);
+
+    // Parse PT_DYNAMIC to find data region addresses
+    let dyn_start = dynamic_file_off as usize;
+    let dyn_end = dyn_start + dynamic_filesz as usize;
+    if dyn_end > data.len() {
+        return Vec::new();
+    }
+
+    let mut strtab = 0u64;
+    let mut strsz = 0u64;
+    let mut symtab = 0u64;
+    let mut hash = 0u64;
+    let mut gnu_hash = 0u64;
+    let mut rela = 0u64;
+    let mut relasz = 0u64;
+    let mut jmprel = 0u64;
+    let mut pltrelsz = 0u64;
+    let mut init = 0u64;
+    let mut fini = 0u64;
+    let mut init_array = 0u64;
+    let mut init_arraysz = 0u64;
+
+    let num_entries = dynamic_filesz as usize / 16;
+    for i in 0..num_entries {
+        let eoff = dyn_start + i * 16;
+        if eoff + 16 > data.len() { break; }
+        let tag = elf::read_u64_pub(data, eoff);
+        let val = elf::read_u64_pub(data, eoff + 8);
+        match tag {
+            0 => break,           // DT_NULL
+            2 => pltrelsz = val,  // DT_PLTRELSZ
+            4 => hash = val,      // DT_HASH
+            5 => strtab = val,    // DT_STRTAB
+            6 => symtab = val,    // DT_SYMTAB
+            7 => rela = val,      // DT_RELA
+            8 => relasz = val,    // DT_RELASZ
+            10 => strsz = val,    // DT_STRSZ
+            12 => init = val,     // DT_INIT (code — keep)
+            13 => fini = val,     // DT_FINI (code — keep)
+            23 => jmprel = val,   // DT_JMPREL
+            25 => init_array = val,     // DT_INIT_ARRAY
+            27 => init_arraysz = val,   // DT_INIT_ARRAYSZ
+            _ => {
+                // DT_GNU_HASH
+                if tag == 0x6ffffef5 { gnu_hash = val; }
             }
         }
     }
-    ranges
+
+    // Build exclusion list: known data regions (addr, size) in memory
+    let mut exclusions: Vec<(u64, u64)> = Vec::new();
+
+    // .dynstr — the primary target; contains version strings like "GLIBC_2.38"
+    if strtab != 0 && strsz != 0 {
+        exclusions.push((load_base.wrapping_add(strtab), strsz));
+    }
+    // .dynsym — typically between hash and strtab
+    if symtab != 0 && strtab > symtab {
+        exclusions.push((load_base.wrapping_add(symtab), strtab - symtab));
+    }
+    // .rela.dyn
+    if rela != 0 && relasz != 0 {
+        exclusions.push((load_base.wrapping_add(rela), relasz));
+    }
+    // .rela.plt
+    if jmprel != 0 && pltrelsz != 0 {
+        exclusions.push((load_base.wrapping_add(jmprel), pltrelsz));
+    }
+    // .hash — size unknown, but typically small; estimate from next known region
+    if hash != 0 && symtab > hash {
+        exclusions.push((load_base.wrapping_add(hash), symtab - hash));
+    }
+    // .gnu.hash — size unknown; estimate from symtab if it follows
+    if gnu_hash != 0 && symtab > gnu_hash {
+        exclusions.push((load_base.wrapping_add(gnu_hash), symtab - gnu_hash));
+    }
+
+    if exclusions.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort exclusions by address
+    exclusions.sort_by_key(|&(addr, _)| addr);
+
+    // Build code ranges: executable segment minus exclusions
+    let seg_start = load_base.wrapping_add(exec_seg_vaddr);
+    let seg_end = seg_start + exec_seg_filesz;
+    // Clamp to our mapping
+    let seg_start = seg_start.max(base_addr);
+    let seg_end = seg_end.min(base_addr + len);
+    if seg_start >= seg_end {
+        return Vec::new();
+    }
+
+    // Generate code ranges as gaps between/around exclusions
+    let mut code_ranges = Vec::new();
+    let mut pos = seg_start;
+    for &(ex_start, ex_size) in &exclusions {
+        let ex_end = ex_start + ex_size;
+        // Clamp exclusion to segment
+        let ex_start = ex_start.max(seg_start);
+        let ex_end = ex_end.min(seg_end);
+        if ex_start >= ex_end { continue; }
+        if ex_start > pos {
+            code_ranges.push((pos, ex_start - pos));
+        }
+        if ex_end > pos {
+            pos = ex_end;
+        }
+    }
+    if pos < seg_end {
+        code_ranges.push((pos, seg_end - pos));
+    }
+
+    if !code_ranges.is_empty() {
+        let total_code: u64 = code_ranges.iter().map(|&(_, s)| s).sum();
+        let total_excl: u64 = exclusions.iter().map(|&(_, s)| s).sum();
+        eprintln!(
+            "fakelinux: code ranges via phdrs at {:#x}: {} code regions ({:#x} bytes), excluded {:#x} bytes of data",
+            base_addr, code_ranges.len(), total_code, total_excl
+        );
+    }
+
+    code_ranges
 }
 
 fn setup_stack(
