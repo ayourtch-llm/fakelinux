@@ -59,6 +59,11 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
     ])
 }
 
+// Public wrappers for use by loader.rs runtime code range detection
+pub fn read_u16_pub(data: &[u8], off: usize) -> u16 { read_u16(data, off) }
+pub fn read_u32_pub(data: &[u8], off: usize) -> u32 { read_u32(data, off) }
+pub fn read_u64_pub(data: &[u8], off: usize) -> u64 { read_u64(data, off) }
+
 pub fn parse(data: &[u8]) -> Result<Elf, ElfError> {
     if data.len() < 64 {
         return Err(ElfError("file too small for ELF header".into()));
@@ -113,4 +118,35 @@ pub fn parse(data: &[u8]) -> Result<Elf, ElfError> {
     }
 
     Ok(Elf { header, phdrs })
+}
+
+/// Find executable code ranges (sections with SHF_EXECINSTR) in the ELF.
+/// Returns a list of (vaddr, size) pairs for code sections like .text and .plt.
+/// Falls back to empty list if section headers are absent or malformed.
+pub fn find_code_ranges(data: &[u8]) -> Vec<(u64, u64)> {
+    const SHF_EXECINSTR: u64 = 4;
+
+    if data.len() < 64 { return Vec::new(); }
+
+    let e_shoff = read_u64(data, 40) as usize;
+    let e_shentsize = read_u16(data, 58) as usize;
+    let e_shnum = read_u16(data, 60) as usize;
+
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 { return Vec::new(); }
+
+    let mut ranges = Vec::new();
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        if off + 64 > data.len() { break; }
+        let sh_type = read_u32(data, off + 4);
+        let sh_flags = read_u64(data, off + 8);
+        let sh_addr = read_u64(data, off + 16);
+        let sh_size = read_u64(data, off + 32);
+        // SHT_PROGBITS (1) with EXECINSTR flag
+        if sh_type == 1 && sh_flags & SHF_EXECINSTR != 0 && sh_size > 0 {
+            ranges.push((sh_addr, sh_size));
+        }
+    }
+    ranges.sort_by_key(|&(addr, _)| addr);
+    ranges
 }

@@ -255,7 +255,21 @@ fn load_segments(
 
         // Rewrite SVC #0 → BRK #0xF000 in executable segments
         if phdr.p_flags & PF_X != 0 {
-            rewrite_svc_instructions(seg_start, phdr.p_filesz);
+            // Compute code-only ranges within this segment so x18 patching
+            // doesn't corrupt non-code data (e.g. .dynstr) in the same PT_LOAD.
+            let elf_code_ranges = elf::find_code_ranges(data);
+            let code_ranges: Vec<(u64, u64)> = elf_code_ranges.iter()
+                .filter_map(|&(vaddr, size)| {
+                    let mem_addr = base_offset + vaddr;
+                    // Only include ranges that overlap this segment
+                    if mem_addr >= seg_start && mem_addr < seg_start + phdr.p_filesz {
+                        Some((mem_addr, size))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            rewrite_svc_instructions(seg_start, phdr.p_filesz, &code_ranges);
         }
 
         // Find program headers in memory
@@ -311,12 +325,27 @@ fn get_interp(elf: &Elf, data: &[u8]) -> Option<String> {
     None
 }
 
+/// Check if a memory address falls within one of the given code ranges.
+fn addr_in_code_ranges(addr: u64, code_ranges: &[(u64, u64)]) -> bool {
+    for &(range_start, range_size) in code_ranges {
+        if addr >= range_start && addr < range_start + range_size {
+            return true;
+        }
+    }
+    false
+}
+
 /// Scan executable memory and replace SVC #0 and MSR/MRS tpidr_el0 with UDF #0xF000.
-fn rewrite_svc_instructions(start: u64, size: u64) {
+/// `code_ranges` restricts x18 patching to actual code sections (to avoid corrupting
+/// data like string tables that may share the same PT_LOAD segment).
+fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     let count = size / 4;
     let base = start as *mut u32;
     let mut svc_patched = 0u64;
     let mut tpidr_patched = 0u64;
+    let mut x18_patched = 0u64;
+    let have_code_ranges = !code_ranges.is_empty();
+    let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok();
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -327,13 +356,20 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
                 // MSR/MRS tpidr_el0 → patch to UDF, store original in side table.
-                // The handler looks up the original instruction to determine the
-                // operation and register number.
                 let pc_addr = base.add(i) as u64;
                 crate::procfs::with(|_| {}); // ensure procfs is initialized
                 add_tpidr_patch(pc_addr, instr);
                 base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
+            } else if !skip_x18 && trap::references_x18(instr) {
+                let pc_addr = base.add(i) as u64;
+                // Only patch x18 in actual code sections — data in the same segment
+                // (e.g. .dynstr, .rodata) could match x18 patterns and must not be corrupted.
+                if !have_code_ranges || addr_in_code_ranges(pc_addr, code_ranges) {
+                    add_tpidr_patch(pc_addr, instr);
+                    base.add(i).write(trap::UDF_MARKER);
+                    x18_patched += 1;
+                }
             }
         }
     }
@@ -342,6 +378,9 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
     }
     if tpidr_patched > 0 {
         eprintln!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
+    }
+    if x18_patched > 0 {
+        eprintln!("fakelinux: patched {} x18 instructions", x18_patched);
     }
 }
 
@@ -352,10 +391,17 @@ fn rewrite_svc_instructions(start: u64, size: u64) {
 /// The caller must ensure the memory is writable before calling this.
 /// After patching, the caller should set the final permissions and invalidate icache.
 pub fn patch_new_code(start: u64, len: u64) {
+    // Try to extract code ranges from ELF section headers if the mapped
+    // memory starts with an ELF header. This prevents x18 patching from
+    // corrupting non-code data (e.g. .dynstr) in the same mapping.
+    let code_ranges = extract_code_ranges_from_memory(start, len);
+
     let count = len / 4;
     let base = start as *mut u32;
     let mut svc_patched = 0u64;
     let mut tpidr_patched = 0u64;
+    let mut x18_patched = 0u64;
+    let have_code_ranges = !code_ranges.is_empty();
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -368,15 +414,61 @@ pub fn patch_new_code(start: u64, len: u64) {
                 add_runtime_tpidr_patch(pc_addr, instr);
                 base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
+            } else if !std::env::var("FAKELINUX_NO_X18").is_ok() && trap::references_x18(instr) {
+                let pc_addr = base.add(i) as u64;
+                if !have_code_ranges || addr_in_code_ranges(pc_addr, &code_ranges) {
+                    add_runtime_tpidr_patch(pc_addr, instr);
+                    base.add(i).write(trap::UDF_MARKER);
+                    x18_patched += 1;
+                }
             }
         }
     }
-    if svc_patched > 0 || tpidr_patched > 0 {
+    if svc_patched > 0 || tpidr_patched > 0 || x18_patched > 0 {
         eprintln!(
-            "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR",
-            start, len, svc_patched, tpidr_patched
+            "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR, {} x18",
+            start, len, svc_patched, tpidr_patched, x18_patched
         );
     }
+}
+
+/// Try to extract code ranges from ELF section headers in mapped memory.
+/// Returns empty vec if the memory doesn't start with a valid ELF header.
+fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> {
+    const SHF_EXECINSTR: u64 = 4;
+    let data = unsafe { std::slice::from_raw_parts(base_addr as *const u8, len as usize) };
+
+    // Check ELF magic
+    if data.len() < 64 || data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return Vec::new();
+    }
+
+    let e_shoff = elf::read_u64_pub(data, 40) as usize;
+    let e_shentsize = elf::read_u16_pub(data, 58) as usize;
+    let e_shnum = elf::read_u16_pub(data, 60) as usize;
+
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 || e_shoff >= data.len() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        if off + 64 > data.len() { break; }
+        let sh_type = elf::read_u32_pub(data, off + 4);
+        let sh_flags = elf::read_u64_pub(data, off + 8);
+        let sh_addr = elf::read_u64_pub(data, off + 16);
+        let sh_size = elf::read_u64_pub(data, off + 32);
+        // SHT_PROGBITS with EXECINSTR
+        if sh_type == 1 && sh_flags & SHF_EXECINSTR != 0 && sh_size > 0 {
+            // sh_addr is the VMA in the ELF; map to actual memory address
+            let mem_addr = base_addr + sh_addr;
+            if mem_addr >= base_addr && mem_addr < base_addr + len {
+                ranges.push((mem_addr, sh_size));
+            }
+        }
+    }
+    ranges
 }
 
 fn setup_stack(

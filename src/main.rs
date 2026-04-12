@@ -57,6 +57,7 @@ fn main() {
 
     // Initialize per-thread pthread keys before anything else
     trap::init_tpidr_key();
+    trap::init_x18_key();
     thread::init_tid_key();
     thread::init_clear_tid_key();
 
