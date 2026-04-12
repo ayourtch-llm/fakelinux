@@ -1594,14 +1594,29 @@ fn do_sched_getaffinity(_pid: i32, cpusetsize: u32, mask_ptr: u64) -> u64 {
     cpusetsize as u64
 }
 
-fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, _sig: u64) -> u64 {
-    // Convert Linux timespec to macOS timespec (same layout on aarch64)
-    // The 6th arg on Linux is a struct { sigset_t*, size_t } but we ignore it.
+fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, sig: u64) -> u64 {
+    // Linux pselect6 6th arg is struct { sigset_t*, size_t } — a pointer to
+    // {sigmask_ptr, sigsetsize}. We extract the sigmask if provided.
     let timeout_ptr = if timeout == 0 {
         std::ptr::null()
     } else {
         timeout as *const libc::timespec
     };
+
+    // Extract sigmask from the Linux pselect6 wrapper struct
+    let sigmask_ptr: *const libc::sigset_t = if sig != 0 {
+        let sigmask_pp = unsafe { *(sig as *const u64) };
+        if sigmask_pp != 0 {
+            sigmask_pp as *const libc::sigset_t
+        } else {
+            std::ptr::null()
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    let rdbits_before = if readfds != 0 { unsafe { *(readfds as *const u64) } } else { 0 };
+    let wrbits_before = if writefds != 0 { unsafe { *(writefds as *const u64) } } else { 0 };
 
     let ret = unsafe {
         libc::pselect(
@@ -1610,9 +1625,18 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
             if writefds == 0 { std::ptr::null_mut() } else { writefds as *mut libc::fd_set },
             if exceptfds == 0 { std::ptr::null_mut() } else { exceptfds as *mut libc::fd_set },
             timeout_ptr,
-            std::ptr::null(), // ignore sigmask
+            sigmask_ptr,
         )
     };
+
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (ret > 0 || nfds > 3) {
+        let rdbits_after = if readfds != 0 { unsafe { *(readfds as *const u64) } } else { 0 };
+        let wrbits_after = if writefds != 0 { unsafe { *(writefds as *const u64) } } else { 0 };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: pselect6 nfds={} rd:{:#x}→{:#x} wr:{:#x}→{:#x} ret={}\n",
+            nfds, rdbits_before, rdbits_after, wrbits_before, wrbits_after, ret));
+    }
+
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
