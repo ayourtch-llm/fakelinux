@@ -563,29 +563,136 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
     }
 }
 
+// ─── Termios flag translation (Linux ↔ macOS) ──────────────────────────────
+// Linux (asm-generic) and macOS (BSD) use different bit positions for termios
+// flags and different c_cc indices.
+
+/// c_cc index mapping: (linux_index, macos_index)
+const CC_LINUX_TO_MAC: [(usize, usize); 16] = [
+    (0,  8),   // VINTR
+    (1,  9),   // VQUIT
+    (2,  3),   // VERASE
+    (3,  5),   // VKILL
+    (4,  0),   // VEOF
+    (5,  17),  // VTIME
+    (6,  16),  // VMIN
+    // 7 = VSWTC — Linux-only
+    (8,  12),  // VSTART
+    (9,  13),  // VSTOP
+    (10, 10),  // VSUSP
+    (11, 1),   // VEOL
+    (12, 6),   // VREPRINT
+    (13, 15),  // VDISCARD
+    (14, 4),   // VWERASE
+    (15, 14),  // VLNEXT
+    (16, 2),   // VEOL2
+];
+
+/// Translate bits from one flag set to another using a mapping table.
+/// Each entry is (source_bit, dest_bit).
+fn translate_flags(val: u32, map: &[(u32, u32)]) -> u32 {
+    let mut out: u32 = 0;
+    for &(src, dst) in map {
+        if val & src != 0 { out |= dst; }
+    }
+    out
+}
+
+// c_iflag: Linux → macOS  (mostly the same except IXON, IXOFF, IUTF8)
+const IFLAG_L2M: [(u32, u32); 13] = [
+    (0x001, 0x001),   // IGNBRK
+    (0x002, 0x002),   // BRKINT
+    (0x004, 0x004),   // IGNPAR
+    (0x008, 0x008),   // PARMRK
+    (0x010, 0x010),   // INPCK
+    (0x020, 0x020),   // ISTRIP
+    (0x040, 0x040),   // INLCR
+    (0x080, 0x080),   // IGNCR
+    (0x100, 0x100),   // ICRNL
+    (0x200, 0x200),   // IUCLC → not on macOS, map to self (harmless)
+    (0x400, 0x200),   // IXON: Linux 0x400 → macOS 0x200
+    (0x800, 0x800),   // IXANY
+    (0x1000, 0x400),  // IXOFF: Linux 0x1000 → macOS 0x400
+];
+
+// c_iflag: macOS → Linux
+const IFLAG_M2L: [(u32, u32); 12] = [
+    (0x001, 0x001),   // IGNBRK
+    (0x002, 0x002),   // BRKINT
+    (0x004, 0x004),   // IGNPAR
+    (0x008, 0x008),   // PARMRK
+    (0x010, 0x010),   // INPCK
+    (0x020, 0x020),   // ISTRIP
+    (0x040, 0x040),   // INLCR
+    (0x080, 0x080),   // IGNCR
+    (0x100, 0x100),   // ICRNL
+    (0x200, 0x400),   // IXON: macOS 0x200 → Linux 0x400
+    (0x400, 0x1000),  // IXOFF: macOS 0x400 → Linux 0x1000
+    (0x800, 0x800),   // IXANY
+];
+
+// c_oflag: Linux → macOS
+const OFLAG_L2M: [(u32, u32); 2] = [
+    (0x01, 0x01),     // OPOST
+    (0x04, 0x02),     // ONLCR: Linux 0x4 → macOS 0x2
+];
+
+// c_oflag: macOS → Linux
+const OFLAG_M2L: [(u32, u32); 2] = [
+    (0x01, 0x01),     // OPOST
+    (0x02, 0x04),     // ONLCR: macOS 0x2 → Linux 0x4
+];
+
+// c_lflag: Linux → macOS  (completely different bit assignments!)
+const LFLAG_L2M: [(u32, u32); 11] = [
+    (0x0001, 0x0080),     // ISIG: Linux 0x1 → macOS 0x80
+    (0x0002, 0x0100),     // ICANON: Linux 0x2 → macOS 0x100
+    (0x0008, 0x0008),     // ECHO (same)
+    (0x0010, 0x0002),     // ECHOE: Linux 0x10 → macOS 0x02
+    (0x0020, 0x0004),     // ECHOK: Linux 0x20 → macOS 0x04
+    (0x0040, 0x0010),     // ECHONL: Linux 0x40 → macOS 0x10
+    (0x0080, 0x80000000), // NOFLSH: Linux 0x80 → macOS 0x80000000
+    (0x0100, 0x00400000), // TOSTOP: Linux 0x100 → macOS 0x400000
+    (0x8000, 0x0400),     // IEXTEN: Linux 0x8000 → macOS 0x400
+    (0x0200, 0x0040),     // ECHOCTL: Linux 0x200 → macOS 0x40
+    (0x0400, 0x0001),     // ECHOKE: Linux 0x400 → macOS 0x01
+];
+
+// c_lflag: macOS → Linux
+const LFLAG_M2L: [(u32, u32); 11] = [
+    (0x0080, 0x0001),     // ISIG
+    (0x0100, 0x0002),     // ICANON
+    (0x0008, 0x0008),     // ECHO
+    (0x0002, 0x0010),     // ECHOE
+    (0x0004, 0x0020),     // ECHOK
+    (0x0010, 0x0040),     // ECHONL
+    (0x80000000, 0x0080), // NOFLSH
+    (0x00400000, 0x0100), // TOSTOP
+    (0x0400, 0x8000),     // IEXTEN
+    (0x0040, 0x0200),     // ECHOCTL
+    (0x0001, 0x0400),     // ECHOKE
+];
+
+// c_cflag: mostly compatible for common flags (CS5-CS8, CSTOPB, CREAD, PARENB, etc.)
+// Both use the same bit positions for the common flags, so pass through directly.
+
 /// Convert macOS termios to Linux aarch64 kernel termios (36 bytes) at guest address.
-/// Kernel layout (TCGETS): u32 iflag, u32 oflag, u32 cflag, u32 lflag,
-///                          u8 c_line, u8 c_cc[NCCS=19]
-/// Total: 36 bytes.  Note: the kernel struct does NOT include c_ispeed/c_ospeed;
-/// those live only in struct termios2 (TCGETS2).  Userspace musl defines a larger
-/// struct (NCCS=32 + speeds = 60 bytes), but the kernel only writes 36 bytes, so
-/// we must not overflow into the caller's stack canary or saved registers.
 fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
     const KERNEL_NCCS: usize = 19;
     unsafe {
         let p = linux_ptr as *mut u8;
-        (p as *mut u32).write_unaligned(mac.c_iflag as u32);
-        (p.add(4) as *mut u32).write_unaligned(mac.c_oflag as u32);
+        (p as *mut u32).write_unaligned(translate_flags(mac.c_iflag as u32, &IFLAG_M2L));
+        (p.add(4) as *mut u32).write_unaligned(translate_flags(mac.c_oflag as u32, &OFLAG_M2L));
         (p.add(8) as *mut u32).write_unaligned(mac.c_cflag as u32);
-        (p.add(12) as *mut u32).write_unaligned(mac.c_lflag as u32);
-        // c_line (Linux-specific, byte at offset 16)
-        *p.add(16) = 0;
-        // c_cc: copy first KERNEL_NCCS entries from macOS
+        (p.add(12) as *mut u32).write_unaligned(translate_flags(mac.c_lflag as u32, &LFLAG_M2L));
+        *p.add(16) = 0; // c_line
         let cc_dst = p.add(17);
-        for i in 0..KERNEL_NCCS.min(mac.c_cc.len()) {
-            *cc_dst.add(i) = mac.c_cc[i];
+        std::ptr::write_bytes(cc_dst, 0, KERNEL_NCCS);
+        for &(linux_i, mac_i) in &CC_LINUX_TO_MAC {
+            if linux_i < KERNEL_NCCS && mac_i < mac.c_cc.len() {
+                *cc_dst.add(linux_i) = mac.c_cc[mac_i];
+            }
         }
-        // Total written: 16 + 1 + 19 = 36 bytes
     }
 }
 
@@ -595,17 +702,22 @@ fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
     unsafe {
         let p = linux_ptr as *const u8;
         let mut mac: libc::termios = std::mem::zeroed();
-        mac.c_iflag = (p as *const u32).read_unaligned() as u64;
-        mac.c_oflag = (p.add(4) as *const u32).read_unaligned() as u64;
-        mac.c_cflag = (p.add(8) as *const u32).read_unaligned() as u64;
-        mac.c_lflag = (p.add(12) as *const u32).read_unaligned() as u64;
-        // c_cc: copy KERNEL_NCCS entries from Linux
+        // Preserve current speeds and unmapped fields
+        let _ = libc::tcgetattr(0, &mut mac);
+        let linux_iflag = (p as *const u32).read_unaligned();
+        let linux_oflag = (p.add(4) as *const u32).read_unaligned();
+        let linux_cflag = (p.add(8) as *const u32).read_unaligned();
+        let linux_lflag = (p.add(12) as *const u32).read_unaligned();
+        mac.c_iflag = translate_flags(linux_iflag, &IFLAG_L2M) as u64;
+        mac.c_oflag = translate_flags(linux_oflag, &OFLAG_L2M) as u64;
+        mac.c_cflag = linux_cflag as u64;
+        mac.c_lflag = translate_flags(linux_lflag, &LFLAG_L2M) as u64;
         let cc_src = p.add(17);
-        for i in 0..KERNEL_NCCS.min(mac.c_cc.len()) {
-            mac.c_cc[i] = *cc_src.add(i);
+        for &(linux_i, mac_i) in &CC_LINUX_TO_MAC {
+            if linux_i < KERNEL_NCCS && mac_i < mac.c_cc.len() {
+                mac.c_cc[mac_i] = *cc_src.add(linux_i);
+            }
         }
-        // Derive speeds from cflag CBAUD bits (kernel doesn't store them separately)
-        // For now leave as 0 — macOS tcsetattr will use the cflag baud bits
         mac
     }
 }
