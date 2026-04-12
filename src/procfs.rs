@@ -143,6 +143,7 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/self/mountinfo" => Some(generate_mountinfo()),
         "/proc/meminfo" => Some(generate_meminfo()),
         "/proc/uptime" => Some(generate_uptime()),
+        "/proc/stat" => Some(generate_proc_stat()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         _ => {
             // /proc/self/fd/N → not a regular file open, ignore
@@ -350,6 +351,24 @@ fn generate_uptime() -> Vec<u8> {
     let secs = ts.tv_sec as f64 + ts.tv_nsec as f64 / 1_000_000_000.0;
     // Format: uptime_seconds idle_seconds
     format!("{:.2} {:.2}\n", secs, secs * 0.9).into_bytes()
+}
+
+fn generate_proc_stat() -> Vec<u8> {
+    // btime = wall clock time minus uptime (approximate boot time)
+    let mut real_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut mono_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_REALTIME, &mut real_ts);
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_ts);
+    }
+    let btime = real_ts.tv_sec - mono_ts.tv_sec;
+    format!(
+        "cpu  0 0 0 0 0 0 0 0 0 0\n\
+         btime {}\n\
+         processes 1\n",
+        btime,
+    )
+    .into_bytes()
 }
 
 /// Handle stat/fstatat on /proc paths. Returns Some(()) if handled.

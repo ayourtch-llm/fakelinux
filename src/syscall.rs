@@ -348,19 +348,62 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_CLOCK_NANOSLEEP => do_clock_nanosleep(args[0] as i32, args[1] as i32, args[2], args[3]),
         SYS_SETSID => {
             let ret = unsafe { libc::setsid() };
-            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+            if ret < 0 {
+                translate::linux_errno()
+            } else if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                // setsid returns the new session ID (= caller's PID); return virtual PID
+                pidns::current_vpid() as u64
+            } else {
+                ret as u64
+            }
         }
         SYS_GETPGID => {
-            let ret = unsafe { libc::getpgid(args[0] as i32) };
-            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+            let pid_arg = args[0] as i32;
+            let real_pid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) && pid_arg != 0 {
+                pidns::translate_pid_arg(pid_arg)
+            } else {
+                pid_arg
+            };
+            let ret = unsafe { libc::getpgid(real_pid) };
+            if ret < 0 {
+                translate::linux_errno()
+            } else if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::real_to_virtual(ret).unwrap_or(ret) as u64
+            } else {
+                ret as u64
+            }
         }
         SYS_SETPGID => {
-            let ret = unsafe { libc::setpgid(args[0] as i32, args[1] as i32) };
+            let pid_arg = args[0] as i32;
+            let pgid_arg = args[1] as i32;
+            let real_pid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) && pid_arg != 0 {
+                pidns::translate_pid_arg(pid_arg)
+            } else {
+                pid_arg
+            };
+            let real_pgid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) && pgid_arg != 0 {
+                pidns::translate_pid_arg(pgid_arg)
+            } else {
+                pgid_arg
+            };
+            let ret = unsafe { libc::setpgid(real_pid, real_pgid) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         SYS_GETSID => {
-            let ret = unsafe { libc::getsid(args[0] as i32) };
-            if ret < 0 { translate::linux_errno() } else { ret as u64 }
+            let pid_arg = args[0] as i32;
+            let real_pid = if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) && pid_arg != 0 {
+                pidns::translate_pid_arg(pid_arg)
+            } else {
+                pid_arg
+            };
+            let ret = unsafe { libc::getsid(real_pid) };
+            if ret < 0 {
+                translate::linux_errno()
+            } else if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                pidns::real_to_virtual(ret).unwrap_or(ret) as u64
+            } else {
+                ret as u64
+            }
         }
         SYS_FSYNC => {
             let ret = unsafe { libc::fsync(args[0] as i32) };
