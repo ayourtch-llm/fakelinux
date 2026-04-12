@@ -256,6 +256,24 @@ pub fn unregister_vpid(vpid: i32) {
     }
 }
 
+/// List all active virtual PIDs in the container.
+/// Returns a vec of (vpid, real_pid) pairs for entries where real_pid != 0.
+pub fn list_active_pids() -> Vec<(i32, i32)> {
+    if !CONTAINER_MODE.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let t = table();
+    let max = t.next_vpid.load(Ordering::Acquire).min(MAX_ENTRIES as i32);
+    let mut result = Vec::new();
+    for vpid in 1..max {
+        let real = t.entries[vpid as usize].load(Ordering::Relaxed);
+        if real != 0 {
+            result.push((vpid, real));
+        }
+    }
+    result
+}
+
 /// Translate a virtual PID argument from a syscall to a real PID.
 /// Special values: -1 (any child), 0 (same process group), positive vpid.
 pub fn translate_pid_arg(vpid: i32) -> i32 {

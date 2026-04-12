@@ -102,21 +102,43 @@ fn pipe_content(content: &[u8]) -> i32 {
     read_fd
 }
 
-/// Open /proc as a directory containing our PID as an entry.
-/// Creates a temp directory with symlinks/dirs for each "process".
+/// Open /proc as a directory containing entries for all active container processes.
+/// Creates a temp directory with subdirs for each active virtual PID.
 fn try_open_proc_dir() -> Option<i32> {
     let real_pid = unsafe { libc::getpid() };
     let vpid = visible_pid();
     let dir_path = format!("/tmp/.fakelinux-proc-{}", real_pid);
     let c_dir = std::ffi::CString::new(dir_path.as_str()).ok()?;
 
-    // Create the temp dir and a subdirectory for our visible PID
-    unsafe { libc::mkdir(c_dir.as_ptr(), 0o755); }
-    let pid_dir = format!("{}/{}", dir_path, vpid);
-    let c_pid_dir = std::ffi::CString::new(pid_dir.as_str()).ok()?;
-    unsafe { libc::mkdir(c_pid_dir.as_ptr(), 0o755); }
+    // Remove stale dir if it exists, then create fresh
+    unsafe {
+        // Best-effort cleanup of old entries
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(&dir_path);
+        libc::mkdir(c_dir.as_ptr(), 0o755);
+    }
 
-    // Also create "self" symlink
+    // Create subdirectories for all active PIDs in the container
+    let active_pids = crate::pidns::list_active_pids();
+    if active_pids.is_empty() {
+        // Non-container mode: just create our own PID entry
+        let pid_dir = format!("{}/{}", dir_path, vpid);
+        let c_pid_dir = std::ffi::CString::new(pid_dir.as_str()).ok()?;
+        unsafe { libc::mkdir(c_pid_dir.as_ptr(), 0o755); }
+    } else {
+        for &(active_vpid, _real_pid) in &active_pids {
+            let pid_dir = format!("{}/{}", dir_path, active_vpid);
+            let c_pid_dir = std::ffi::CString::new(pid_dir.as_str()).ok()?;
+            unsafe { libc::mkdir(c_pid_dir.as_ptr(), 0o755); }
+        }
+    }
+
+    // Create "self" symlink pointing to our vpid
     let self_link = format!("{}/self", dir_path);
     let c_self = std::ffi::CString::new(self_link.as_str()).ok()?;
     let c_target = std::ffi::CString::new(format!("{}", vpid)).ok()?;
@@ -146,9 +168,63 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/stat" => Some(generate_proc_stat()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         _ => {
+            // Check if this is /proc/<vpid>/stat or /proc/<vpid>/status for
+            // another process in the container
+            if let Some(content) = generate_for_other_pid(path) {
+                return Some(content);
+            }
             // /proc/self/fd/N → not a regular file open, ignore
             None
         }
+    }
+}
+
+/// Generate /proc/<vpid>/stat or /proc/<vpid>/status for a container process
+/// that isn't the current process.
+fn generate_for_other_pid(path: &str) -> Option<Vec<u8>> {
+    if !crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let rest = path.strip_prefix("/proc/")?;
+    let slash_pos = rest.find('/')?;
+    let pid_str = &rest[..slash_pos];
+    let vpid: i32 = pid_str.parse().ok()?;
+    let subpath = &rest[slash_pos..]; // e.g. "/stat" or "/status"
+
+    // Verify this vpid is active in the container
+    let _real_pid = crate::pidns::virtual_to_real(vpid)?;
+
+    // Find the parent vpid for this process
+    // For simplicity, assume ppid=1 for all children, ppid=0 for init
+    let vppid = if vpid == 1 { 0 } else { 1 };
+
+    match subpath {
+        "/stat" => {
+            Some(format!(
+                "{vpid} (fakelinux-guest) S {vppid} {vpid} {vpid} 0 -1 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 -1 0 0 0 0 0 0 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                vpid = vpid,
+                vppid = vppid,
+            ).into_bytes())
+        }
+        "/status" => {
+            Some(format!(
+                "Name:\tfakelinux-guest\n\
+                 Pid:\t{vpid}\n\
+                 Tgid:\t{vpid}\n\
+                 PPid:\t{vppid}\n\
+                 Uid:\t0\t0\t0\t0\n\
+                 Gid:\t0\t0\t0\t0\n\
+                 VmSize:\t    0 kB\n\
+                 Threads:\t1\n",
+                vpid = vpid,
+                vppid = vppid,
+            ).into_bytes())
+        }
+        "/cmdline" => {
+            // Minimal cmdline
+            Some(b"fakelinux-guest\0".to_vec())
+        }
+        _ => None,
     }
 }
 
@@ -247,9 +323,9 @@ fn generate_status() -> Vec<u8> {
 fn generate_stat() -> Vec<u8> {
     let pid = visible_pid();
     let ppid = visible_ppid();
-    // Minimal /proc/self/stat line (field 1 = pid, field 2 = (name), field 3 = state, ...)
+    // /proc/self/stat: 52 fields required by procps/libproc2
     format!(
-        "{pid} (fakelinux-guest) R {ppid} {pid} {pid} 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{pid} (fakelinux-guest) R {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 -1 0 0 0 0 0 0 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = pid,
         ppid = ppid,
     )
