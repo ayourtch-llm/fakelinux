@@ -279,29 +279,50 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         }
         SYS_FCHMOD => {
             let ret = unsafe { libc::fchmod(args[0] as i32, args[1] as libc::mode_t) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            if ret == 0 { 0 }
+            else if creds::do_geteuid() == 0 { 0 }
+            else { translate::linux_errno() }
         }
         SYS_FCHMODAT => {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
-            let ret = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t, args[3] as i32) };
+            let mac_dirfd = translate::translate_dirfd(args[0] as i32);
+            // Linux fchmodat has AT_SYMLINK_NOFOLLOW=0x100 in flags (arg3), but macOS
+            // fchmodat doesn't support this flag and returns EINVAL. Strip it.
+            let mac_flags = (args[3] as i32) & !0x100;
+            let ret = unsafe { libc::fchmodat(mac_dirfd, eff_path, args[2] as libc::mode_t, mac_flags) };
             if ret == 0 { 0 }
             else if _hold.is_some() {
-                let ret2 = unsafe { libc::fchmodat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t, args[3] as i32) };
-                if ret2 < 0 { translate::linux_errno() } else { 0 }
-            } else { translate::linux_errno() }
+                let ret2 = unsafe { libc::fchmodat(mac_dirfd, args[1] as *const i8, args[2] as libc::mode_t, mac_flags) };
+                if ret2 == 0 { 0 }
+                // Virtual root: silently succeed if real op fails with EPERM/ENOENT
+                else if creds::do_geteuid() == 0 { 0 }
+                else { translate::linux_errno() }
+            }
+            // Virtual root: silently succeed if real op fails with EPERM/ENOENT
+            else if creds::do_geteuid() == 0 { 0 }
+            else { translate::linux_errno() }
         }
         SYS_FCHOWN => {
             let ret = unsafe { libc::fchown(args[0] as i32, args[1] as u32, args[2] as u32) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            if ret == 0 { 0 }
+            // Virtual root: silently succeed if real op fails
+            else if creds::do_geteuid() == 0 { 0 }
+            else { translate::linux_errno() }
         }
         SYS_FCHOWNAT => {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
-            let ret = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as u32, args[3] as u32, args[4] as i32) };
+            let mac_dirfd = translate::translate_dirfd(args[0] as i32);
+            let ret = unsafe { libc::fchownat(mac_dirfd, eff_path, args[2] as u32, args[3] as u32, args[4] as i32) };
             if ret == 0 { 0 }
             else if _hold.is_some() {
-                let ret2 = unsafe { libc::fchownat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
-                if ret2 < 0 { translate::linux_errno() } else { 0 }
-            } else { translate::linux_errno() }
+                let ret2 = unsafe { libc::fchownat(mac_dirfd, args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
+                if ret2 == 0 { 0 }
+                else if creds::do_geteuid() == 0 { 0 }
+                else { translate::linux_errno() }
+            }
+            // Virtual root: silently succeed if real op fails
+            else if creds::do_geteuid() == 0 { 0 }
+            else { translate::linux_errno() }
         }
         SYS_WAIT4 => {
             let pid_arg = args[0] as i64;
@@ -872,13 +893,41 @@ fn linux_termios_to_mac(linux_ptr: u64) -> libc::termios {
 fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
     // Linux-specific fcntl commands (>=1024) have no macOS equivalent.
     // F_SETPIPE_SZ=1031, F_GETPIPE_SZ=1032, F_ADD_SEALS=1033, etc.
-    // Return -EINVAL — returning success with bogus values can confuse callers.
     if linux_cmd >= 1024 {
+        // F_DUPFD_CLOEXEC is 1030 on Linux
+        if linux_cmd == translate::LINUX_F_DUPFD_CLOEXEC {
+            let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32) };
+            return if ret < 0 { translate::linux_errno() } else { ret as u64 };
+        }
         return (-22_i64) as u64; // -EINVAL
     }
     // F_SETOWN_EX / F_GETOWN_EX
     if linux_cmd == 15 { return 0; }
     if linux_cmd == 16 { return (-22_i64) as u64; }
+
+    // F_GETLK / F_SETLK / F_SETLKW — need struct flock translation
+    if linux_cmd == translate::LINUX_F_GETLK
+        || linux_cmd == translate::LINUX_F_SETLK
+        || linux_cmd == translate::LINUX_F_SETLKW
+    {
+        let mac_cmd = match linux_cmd {
+            translate::LINUX_F_GETLK => libc::F_GETLK,
+            translate::LINUX_F_SETLK => libc::F_SETLK,
+            translate::LINUX_F_SETLKW => libc::F_SETLKW,
+            _ => unreachable!(),
+        };
+        let mut mac_flock = translate::linux_flock_to_mac(arg);
+        let ret = unsafe { libc::fcntl(fd, mac_cmd, &mut mac_flock as *mut libc::flock) };
+        if ret < 0 {
+            return translate::linux_errno();
+        }
+        // For F_GETLK, write back the result
+        if linux_cmd == translate::LINUX_F_GETLK {
+            translate::mac_flock_to_linux(&mac_flock, arg);
+        }
+        return ret as u64;
+    }
+
     if let Some(mac_cmd) = translate::translate_fcntl_cmd(linux_cmd) {
         let ret = unsafe { libc::fcntl(fd, mac_cmd, arg as i32) };
         if ret < 0 { translate::linux_errno() } else { ret as u64 }

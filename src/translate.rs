@@ -79,6 +79,10 @@ pub const LINUX_F_GETFD: i32 = 1;
 pub const LINUX_F_SETFD: i32 = 2;
 pub const LINUX_F_GETFL: i32 = 3;
 pub const LINUX_F_SETFL: i32 = 4;
+pub const LINUX_F_GETLK: i32 = 5;
+pub const LINUX_F_SETLK: i32 = 6;
+pub const LINUX_F_SETLKW: i32 = 7;
+pub const LINUX_F_DUPFD_CLOEXEC: i32 = 1030;
 
 pub fn translate_fcntl_cmd(linux_cmd: i32) -> Option<i32> {
     match linux_cmd {
@@ -87,7 +91,55 @@ pub fn translate_fcntl_cmd(linux_cmd: i32) -> Option<i32> {
         LINUX_F_SETFD => Some(libc::F_SETFD),
         LINUX_F_GETFL => Some(libc::F_GETFL),
         LINUX_F_SETFL => Some(libc::F_SETFL),
+        LINUX_F_DUPFD_CLOEXEC => Some(libc::F_DUPFD_CLOEXEC),
+        // F_GETLK/F_SETLK/F_SETLKW need struct flock translation — handled separately
+        LINUX_F_GETLK | LINUX_F_SETLK | LINUX_F_SETLKW => None,
         _ => None,
+    }
+}
+
+/// Translate Linux struct flock (aarch64) to macOS struct flock.
+/// Linux aarch64: { i16 l_type, i16 l_whence, i64 l_start, i64 l_len, i32 l_pid } = 28 bytes
+/// macOS:         { i64 l_start, i64 l_len, i32 l_pid, i16 l_type, i16 l_whence } = 24 bytes
+pub fn linux_flock_to_mac(linux_ptr: u64) -> libc::flock {
+    unsafe {
+        let p = linux_ptr as *const u8;
+        let l_type = (p as *const i16).read_unaligned();
+        let l_whence = (p.add(2) as *const i16).read_unaligned();
+        let l_start = (p.add(4) as *const i64).read_unaligned();    // offset 4 on aarch64 (padded)
+        let l_len = (p.add(16) as *const i64).read_unaligned();     // offset 8+8=16 — actually let me re-check
+        let l_pid = (p.add(24) as *const i32).read_unaligned();
+        // Actually Linux aarch64 struct flock layout:
+        // offset 0:  i16 l_type
+        // offset 2:  i16 l_whence
+        // offset 4:  padding (4 bytes to align l_start to 8)
+        // offset 8:  i64 l_start
+        // offset 16: i64 l_len
+        // offset 24: i32 l_pid
+        let l_start = (p.add(8) as *const i64).read_unaligned();
+        let l_len = (p.add(16) as *const i64).read_unaligned();
+        let l_pid = (p.add(24) as *const i32).read_unaligned();
+        libc::flock {
+            l_start,
+            l_len,
+            l_pid,
+            l_type,
+            l_whence,
+        }
+    }
+}
+
+/// Write macOS struct flock back to Linux struct flock format.
+pub fn mac_flock_to_linux(mac: &libc::flock, linux_ptr: u64) {
+    unsafe {
+        let p = linux_ptr as *mut u8;
+        (p as *mut i16).write_unaligned(mac.l_type);
+        (p.add(2) as *mut i16).write_unaligned(mac.l_whence);
+        // padding at offset 4-7 (zero it)
+        std::ptr::write_bytes(p.add(4), 0, 4);
+        (p.add(8) as *mut i64).write_unaligned(mac.l_start);
+        (p.add(16) as *mut i64).write_unaligned(mac.l_len);
+        (p.add(24) as *mut i32).write_unaligned(mac.l_pid);
     }
 }
 

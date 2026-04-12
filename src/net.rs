@@ -14,6 +14,48 @@ use crate::translate;
 const LINUX_SOCK_NONBLOCK: i32 = 0x800;
 const LINUX_SOCK_CLOEXEC: i32 = 0x80000;
 
+// ─── sockaddr translation ────────────────────────────────────────────────────
+//
+// Linux sockaddr:  { u16 sa_family; u8 sa_data[14]; }
+// macOS sockaddr:  { u8 sa_len; u8 sa_family; u8 sa_data[14]; }
+//
+// For AF_INET (2), AF_INET6 (10/30), AF_UNIX (1):
+// Linux stores family as u16 LE at offset 0. macOS stores len at offset 0,
+// family as u8 at offset 1. The rest of the struct (port, addr) is at the
+// same offsets. We fix up in-place by writing sin_len and shifting family.
+
+/// Patch a Linux sockaddr buffer in-place to macOS format before passing to kernel.
+/// Returns the macOS sa_family for callers that need it.
+fn linux_sockaddr_to_mac(addr_ptr: u64, addrlen: u32) -> u8 {
+    if addr_ptr == 0 || addrlen < 2 {
+        return 0;
+    }
+    unsafe {
+        let p = addr_ptr as *mut u8;
+        // Linux: offset 0 = sa_family as u16 LE → low byte is the family
+        let family = *p;
+        // macOS: offset 0 = sa_len, offset 1 = sa_family (u8)
+        *p = addrlen as u8;     // sin_len
+        *p.add(1) = family;     // sin_family
+        family
+    }
+}
+
+/// Patch a macOS sockaddr buffer in-place back to Linux format after kernel call.
+fn mac_sockaddr_to_linux(addr_ptr: u64, addrlen: u32) {
+    if addr_ptr == 0 || addrlen < 2 {
+        return;
+    }
+    unsafe {
+        let p = addr_ptr as *mut u8;
+        // macOS: offset 0 = sa_len, offset 1 = sa_family
+        let family = *p.add(1);
+        // Linux: offset 0 = sa_family as u16 LE
+        *p = family;
+        *p.add(1) = 0;
+    }
+}
+
 /// Extract base socket type and apply SOCK_NONBLOCK/SOCK_CLOEXEC after creation.
 fn extract_sock_flags(type_: i32) -> (i32, bool, bool) {
     let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
@@ -55,6 +97,7 @@ pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
 }
 
 pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
+    linux_sockaddr_to_mac(addr_ptr, addrlen);
     let ret = unsafe {
         libc::bind(
             fd,
@@ -62,6 +105,7 @@ pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
             addrlen as libc::socklen_t,
         )
     };
+    mac_sockaddr_to_linux(addr_ptr, addrlen); // restore for guest
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -98,6 +142,11 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
     if ret < 0 {
         return translate::linux_errno();
     }
+    // Convert returned macOS sockaddr to Linux format
+    if addr_ptr != 0 && addrlen_ptr != 0 {
+        let alen = unsafe { *(addrlen_ptr as *const u32) };
+        mac_sockaddr_to_linux(addr_ptr, alen);
+    }
     let nonblock = flags & LINUX_SOCK_NONBLOCK != 0;
     let cloexec = flags & LINUX_SOCK_CLOEXEC != 0;
     apply_sock_flags(ret, nonblock, cloexec);
@@ -105,6 +154,7 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
 }
 
 pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
+    linux_sockaddr_to_mac(addr_ptr, addrlen);
     let ret = unsafe {
         libc::connect(
             fd,
@@ -112,6 +162,7 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
             addrlen as libc::socklen_t,
         )
     };
+    mac_sockaddr_to_linux(addr_ptr, addrlen); // restore for guest
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -120,6 +171,9 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
 }
 
 pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u32) -> u64 {
+    if dest_addr != 0 {
+        linux_sockaddr_to_mac(dest_addr, addrlen);
+    }
     let ret = unsafe {
         libc::sendto(
             fd,
@@ -134,6 +188,9 @@ pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrle
             addrlen as libc::socklen_t,
         )
     };
+    if dest_addr != 0 {
+        mac_sockaddr_to_linux(dest_addr, addrlen); // restore for guest
+    }
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -170,6 +227,11 @@ pub fn do_recvfrom(
     if ret < 0 {
         translate::linux_errno()
     } else {
+        // Convert returned macOS sockaddr to Linux format
+        if src_addr != 0 && addrlen_ptr != 0 {
+            let alen = unsafe { *(addrlen_ptr as *const u32) };
+            mac_sockaddr_to_linux(src_addr, alen);
+        }
         ret as u64
     }
 }
@@ -219,6 +281,10 @@ pub fn do_getsockname(fd: i32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     if ret < 0 {
         translate::linux_errno()
     } else {
+        if addr_ptr != 0 && addrlen_ptr != 0 {
+            let alen = unsafe { *(addrlen_ptr as *const u32) };
+            mac_sockaddr_to_linux(addr_ptr, alen);
+        }
         0
     }
 }
@@ -234,6 +300,10 @@ pub fn do_getpeername(fd: i32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     if ret < 0 {
         translate::linux_errno()
     } else {
+        if addr_ptr != 0 && addrlen_ptr != 0 {
+            let alen = unsafe { *(addrlen_ptr as *const u32) };
+            mac_sockaddr_to_linux(addr_ptr, alen);
+        }
         0
     }
 }
