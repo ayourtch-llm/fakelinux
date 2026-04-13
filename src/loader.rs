@@ -691,9 +691,16 @@ fn setup_stack(
     guest_args: &[String],
 ) -> Result<u64, ElfError> {
     let stack_size: usize = 8 * 1024 * 1024;
+    // Allocate the guest stack at a high address, far from where macOS places
+    // normal mmap results. This prevents the guest's TLS block (allocated by
+    // ld-linux via mmap) from landing adjacent to the stack. On real Linux,
+    // the kernel ensures TLS and stack are in separate regions. Without this
+    // hint, macOS can place them adjacent, and glibc's _Fork child path
+    // writes to [TPIDR-0x668] which corrupts __libc_fork's stack canary.
+    let stack_hint: *mut libc::c_void = 0x7F_F000_0000u64 as *mut _;
     let stack_base = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            stack_hint,
             stack_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
