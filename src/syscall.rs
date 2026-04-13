@@ -651,16 +651,35 @@ fn do_close(fd: i32) -> u64 {
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
-fn do_close_range(first: u32, last: u32, _flags: u32) -> u64 {
-    // Close all fds from first to last (inclusive).
+fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+
     // Clamp to a reasonable range to avoid iterating millions of fds.
     let last = last.min(first.saturating_add(65536));
-    for fd in first..=last {
-        let fd = fd as i32;
-        eventfd::on_close(fd);
-        epoll::on_close(fd);
-        procfs::on_close(fd);
-        unsafe { libc::close(fd); }
+
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        // CLOSE_RANGE_CLOEXEC: only close fds that have FD_CLOEXEC set.
+        // glibc's __libc_fork uses this in the child to clean up CLOEXEC fds
+        // without closing pipes/fds the child needs for exec.
+        for fd in first..=last {
+            let fd = fd as i32;
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0 {
+                eventfd::on_close(fd);
+                epoll::on_close(fd);
+                procfs::on_close(fd);
+                unsafe { libc::close(fd); }
+            }
+        }
+    } else {
+        // Close all fds in range unconditionally.
+        for fd in first..=last {
+            let fd = fd as i32;
+            eventfd::on_close(fd);
+            epoll::on_close(fd);
+            procfs::on_close(fd);
+            unsafe { libc::close(fd); }
+        }
     }
     0
 }
@@ -1198,18 +1217,35 @@ fn do_dup(fd: i32) -> u64 {
 }
 
 fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
-    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
-        let pid = unsafe { libc::getpid() };
-        raw_eprintln_fmt(format_args!("fakelinux: [{}] dup3({}, {}, {:#x})\n", pid, oldfd, newfd, flags));
-    }
     // macOS doesn't have dup3; use dup2 + fcntl for O_CLOEXEC
     let ret = unsafe { libc::dup2(oldfd, newfd) };
     if ret < 0 {
-        return translate::linux_errno();
+        let err = translate::linux_errno();
+        if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            let pid = unsafe { libc::getpid() };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] dup3({}, {}, {:#x}) FAILED err={:#x}\n",
+                pid, oldfd, newfd, flags, err));
+        }
+        return err;
     }
     if flags & 0o2000000 != 0 {
         // O_CLOEXEC
         unsafe { libc::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC); }
+    }
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        // Check what newfd actually points to after dup
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let kind = if unsafe { libc::fstat(newfd, &mut st) } == 0 {
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFIFO => 'P', libc::S_IFREG => 'F',
+                libc::S_IFCHR => 'C', libc::S_IFSOCK => 'S', _ => '?',
+            }
+        } else { '!' };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] dup3({}, {}, {:#x})={} type={}\n",
+            pid, oldfd, newfd, flags, ret, kind));
     }
     newfd as u64
 }
