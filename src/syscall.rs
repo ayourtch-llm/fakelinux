@@ -1146,6 +1146,11 @@ fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) ->
 fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 {
     let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
 
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        raw_eprintln_fmt(format_args!("fakelinux: readlinkat({}, {:?})\n",
+            linux_dirfd, path));
+    }
+
     // Check /proc paths first
     if let Some(result) = procfs::try_readlink(path.to_bytes(), buf, bufsiz) {
         return result;
@@ -1162,29 +1167,20 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
             raw_eprintln_fmt(format_args!("fakelinux: readlinkat({}, {:?}) → {:?}\n",
                 linux_dirfd, path, std::str::from_utf8(target).unwrap_or("?")));
         }
-        // If the symlink target is an absolute path, translate it through rootfs
-        // so that glibc's realpath() stays within the rootfs
-        let target = unsafe { std::slice::from_raw_parts(buf as *const u8, ret as usize) };
-        if target.starts_with(b"/") && !target.starts_with(b"/proc") && !target.starts_with(b"/dev") && !target.starts_with(b"/tmp") {
-            if let Some(root) = rootfs::get_root() {
-                // Return the rootfs-translated target instead of the raw one
-                // But only if we're reading a symlink inside the rootfs
-                if _hold.is_some() {
-                    // The path was translated, so the symlink is inside rootfs
-                    // Return the raw target (absolute within guest filesystem)
-                    // glibc's realpath will call readlinkat again with this path,
-                    // and our translate_path will handle it
-                    return ret as u64;
-                }
-            }
-        }
         return ret as u64;
     }
+    // Only fall back to the original (untranslated) path if the translated path
+    // gave ENOENT — NOT for EINVAL (which means "exists but not a symlink").
+    // Without this check, readlinkat("/var") on the HOST returns macOS's
+    // /var → /private/var symlink, breaking glibc's realpath().
     if _hold.is_some() {
-        let ret2 = unsafe {
-            libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
-        };
-        if ret2 >= 0 { return ret2 as u64; }
+        let errno = unsafe { *libc::__error() };
+        if errno == libc::ENOENT {
+            let ret2 = unsafe {
+                libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
+            };
+            if ret2 >= 0 { return ret2 as u64; }
+        }
     }
     translate::linux_errno()
 }
