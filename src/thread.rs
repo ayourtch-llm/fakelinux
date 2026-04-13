@@ -398,6 +398,9 @@ pub fn init_trampolines(base_addr: u64) {
 fn do_fork(_flags: u64) -> u64 {
     // Don't fork here (signal context). Mark pending and return a sentinel.
     // The trap handler will redirect sigreturn to the fork trampoline.
+    let pid = unsafe { libc::getpid() };
+    let msg = format!("fakelinux: [{}] do_fork(flags={:#x}) called\n", pid, _flags);
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     FORK.mark_pending();
     0xFFFF_FFFF_0000_F0C0
 }
@@ -472,6 +475,12 @@ extern "C" fn fork_trampoline_entry() -> ! {
         pid as u64
     };
     FORK.set_x0(return_pid);
+    if crate::syscall::trace_enabled() {
+        let pid_val = unsafe { libc::getpid() };
+        let msg = format!("fakelinux: [{}] fork_trampoline returning x0={} (pid_from_fork={})\n",
+            pid_val, return_pid, pid);
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+    }
     unsafe { FORK.restore_and_resume(); }
 }
 
