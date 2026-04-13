@@ -403,9 +403,22 @@ static FORK_CHILD_TID_PTR: AtomicU64 = AtomicU64::new(0);
 fn do_fork(flags: u64, child_tid_ptr: u64) -> u64 {
     // Don't fork here (signal context). Mark pending and return a sentinel.
     // The trap handler will redirect sigreturn to the fork trampoline.
-    let pid = unsafe { libc::getpid() };
-    let msg = format!("fakelinux: [{}] do_fork(flags={:#x}) called\n", pid, flags);
-    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+    // IMPORTANT: No heap allocation (format!/String) in signal context!
+    // macOS's malloc is not async-signal-safe. Using it here poisons malloc
+    // internal state, causing macOS's fork atfork handlers to misbehave
+    // (closing fds, corrupting child state).
+    if crate::syscall::trace_enabled() {
+        let pid = unsafe { libc::getpid() };
+        let mut buf = [0u8; 80];
+        let n = {
+            use std::io::Write;
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            let _ = c.write_fmt(format_args!(
+                "fakelinux: [{}] do_fork(flags={:#x}) called\n", pid, flags));
+            c.position() as usize
+        };
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+    }
     FORK_FLAGS.store(flags, Ordering::SeqCst);
     FORK_CHILD_TID_PTR.store(child_tid_ptr, Ordering::SeqCst);
     FORK.mark_pending();
@@ -429,16 +442,24 @@ extern "C" fn fork_trampoline_entry() -> ! {
         0
     };
 
-    // Probe pipe fds before fork for debugging
+    // Probe pipe fds before fork for debugging.
+    // Use stack buffer only — no heap allocation (safe for potential signal context).
     if crate::syscall::trace_enabled() {
         for fd in [5_i32, 6, 7, 8, 9, 10] {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::fstat(fd, &mut st) };
             if ret == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO {
                 let pid_val = unsafe { libc::getpid() };
-                let msg = format!("fakelinux: [{}] FORK_PROBE pre-fork fd={} ino={}\n",
-                    pid_val, fd, st.st_ino);
-                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                let mut buf = [0u8; 80];
+                let n = {
+                    use std::io::Write;
+                    let mut c = std::io::Cursor::new(&mut buf[..]);
+                    let _ = c.write_fmt(format_args!(
+                        "fakelinux: [{}] FORK_PROBE pre-fork fd={} ino={}\n",
+                        pid_val, fd, st.st_ino));
+                    c.position() as usize
+                };
+                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
             }
         }
     }
