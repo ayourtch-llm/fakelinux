@@ -66,6 +66,18 @@ pub fn init_tpidr_key() {
 
 /// Set the per-thread guest TPIDR value.
 pub fn set_thread_tpidr(val: u64) {
+    // Log TPIDR changes for debugging TLS/stack overlap issues
+    if crate::syscall::trace_enabled() {
+        let pid = unsafe { libc::getpid() };
+        let sp: u64;
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
+        let mut buf = [0u8; 120];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: [{}] SET_TPIDR={:#x} sp={:#x} delta={:#x}\n",
+            pid, val, sp, val.wrapping_sub(sp)
+        ));
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+    }
     if !TPIDR_KEY_INIT.load(Ordering::SeqCst) {
         // Fallback to global before key is initialized
         GUEST_TPIDR.store(val, Ordering::SeqCst);

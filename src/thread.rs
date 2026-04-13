@@ -478,6 +478,18 @@ extern "C" fn fork_trampoline_entry() -> ! {
         }
     }
 
+    // Save __libc_fork's stack canary before fork.
+    // glibc's _Fork child path writes the robust list head to [TPIDR-0x668].
+    // When the guest's TLS is allocated near the stack (macOS mmap placement),
+    // this can overwrite the stack canary at [__libc_fork_sp + 0xd8].
+    // We save the canary value and restore it in the child after fork.
+    //
+    // Layout: guest_sp (from SavedRegs) = _Fork's sp = __libc_fork_sp - 16
+    // → canary at [guest_sp + 16 + 0xd8] = [guest_sp + 0xe8]
+    let guest_sp = FORK.get_saved_sp();
+    let canary_addr = guest_sp + 0xe8;
+    let saved_canary = unsafe { (canary_addr as *const u64).read() };
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         // Restore CLOEXEC flags before returning error
@@ -501,6 +513,15 @@ extern "C" fn fork_trampoline_entry() -> ! {
     }
 
     if pid == 0 {
+        // Restore __libc_fork's stack canary if it was corrupted by the
+        // STP in _Fork's child path (see diary for full explanation).
+        // The STP writes [TPIDR-0x668]; if TLS is near the stack, this
+        // overwrites the canary at [__libc_fork_sp+0xd8] = [guest_sp+0xe8].
+        let current_canary = unsafe { (canary_addr as *const u64).read() };
+        if current_canary != saved_canary {
+            unsafe { (canary_addr as *mut u64).write(saved_canary); }
+        }
+
         // Probe pipe fds in child right after fork.
         // Use stack buffer only — no heap allocation after fork.
         if crate::syscall::trace_enabled() {
