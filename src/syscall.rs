@@ -427,7 +427,21 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 pgid_arg
             };
             let ret = unsafe { libc::setpgid(real_pid, real_pgid) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
+            if ret < 0 {
+                let errno = unsafe { *libc::__error() };
+                if TRACE.load(std::sync::atomic::Ordering::Relaxed) || errno != 0 {
+                    let pid = unsafe { libc::getpid() };
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: [{}] setpgid({} [real {}], {} [real {}]) = errno {}\n",
+                        pid, pid_arg, real_pid, pgid_arg, real_pgid, errno));
+                }
+                // EACCES (13 on macOS) = child already exec'd. This is normal
+                // in our re-exec model — the child sets its own pgid before exec.
+                if errno == libc::EACCES {
+                    return 0; // pretend success
+                }
+                translate::linux_errno()
+            } else { 0 }
         }
         SYS_GETSID => {
             let pid_arg = args[0] as i32;
@@ -1142,7 +1156,30 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
     let ret = unsafe {
         libc::readlinkat(mac_dirfd, eff_path, buf as *mut i8, bufsiz as usize)
     };
-    if ret >= 0 { return ret as u64; }
+    if ret >= 0 {
+        if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            let target = unsafe { std::slice::from_raw_parts(buf as *const u8, ret as usize) };
+            raw_eprintln_fmt(format_args!("fakelinux: readlinkat({}, {:?}) → {:?}\n",
+                linux_dirfd, path, std::str::from_utf8(target).unwrap_or("?")));
+        }
+        // If the symlink target is an absolute path, translate it through rootfs
+        // so that glibc's realpath() stays within the rootfs
+        let target = unsafe { std::slice::from_raw_parts(buf as *const u8, ret as usize) };
+        if target.starts_with(b"/") && !target.starts_with(b"/proc") && !target.starts_with(b"/dev") && !target.starts_with(b"/tmp") {
+            if let Some(root) = rootfs::get_root() {
+                // Return the rootfs-translated target instead of the raw one
+                // But only if we're reading a symlink inside the rootfs
+                if _hold.is_some() {
+                    // The path was translated, so the symlink is inside rootfs
+                    // Return the raw target (absolute within guest filesystem)
+                    // glibc's realpath will call readlinkat again with this path,
+                    // and our translate_path will handle it
+                    return ret as u64;
+                }
+            }
+        }
+        return ret as u64;
+    }
     if _hold.is_some() {
         let ret2 = unsafe {
             libc::readlinkat(mac_dirfd, pathname as *const i8, buf as *mut i8, bufsiz as usize)
