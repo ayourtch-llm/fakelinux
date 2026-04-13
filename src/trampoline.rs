@@ -194,6 +194,21 @@ impl Trampoline {
     /// the deferred work.
     pub unsafe fn restore_and_resume(&self) -> ! {
         let r = &*self.regs.get();
+        // Debug: verify x0 in SavedRegs right before the asm restore.
+        // Use stack buffer only — no heap allocation after fork.
+        if crate::syscall::trace_enabled() {
+            let pid = libc::getpid();
+            let mut buf = [0u8; 120];
+            let n = {
+                use std::io::Write;
+                let mut c = std::io::Cursor::new(&mut buf[..]);
+                let _ = c.write_fmt(format_args!(
+                    "fakelinux: [{}] RESTORE x0={:#x} pc={:#x}\n",
+                    pid, r.x[0], r.pc));
+                c.position() as usize
+            };
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
         restore_all_regs(r as *const SavedRegs as u64, r.pc);
     }
 }

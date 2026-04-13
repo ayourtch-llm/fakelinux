@@ -449,16 +449,24 @@ extern "C" fn fork_trampoline_entry() -> ! {
     }
 
     if pid == 0 {
-        // Probe pipe fds in child right after fork
+        // Probe pipe fds in child right after fork.
+        // Use stack buffer only — no heap allocation after fork.
         if crate::syscall::trace_enabled() {
             for fd in [0_i32, 1, 5, 6, 7, 8, 9, 10] {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 let ret = unsafe { libc::fstat(fd, &mut st) };
                 if ret == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO {
                     let pid_val = unsafe { libc::getpid() };
-                    let msg = format!("fakelinux: [{}] FORK_PROBE child fd={} ino={}\n",
-                        pid_val, fd, st.st_ino);
-                    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                    let mut buf = [0u8; 80];
+                    let n = {
+                        use std::io::Write;
+                        let mut c = std::io::Cursor::new(&mut buf[..]);
+                        let _ = c.write_fmt(format_args!(
+                            "fakelinux: [{}] FORK_PROBE child fd={} ino={}\n",
+                            pid_val, fd, st.st_ino));
+                        c.position() as usize
+                    };
+                    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
                 }
             }
         }
@@ -505,21 +513,20 @@ extern "C" fn fork_trampoline_entry() -> ! {
     };
     FORK.set_x0(return_pid);
     if crate::syscall::trace_enabled() {
+        // Use raw write only — no heap allocation (format!/String) after fork.
+        // Rust's allocator may have poisoned locks inherited from the parent.
         let pid_val = unsafe { libc::getpid() };
         let resume_pc = FORK.get_saved_pc();
-        // Dump 12 instructions starting at resume_pc (enough to see past set_robust_list SVC)
-        let mut instrs = String::new();
-        for i in 0..12u64 {
-            let addr = resume_pc + i * 4;
-            let instr = unsafe { *(addr as *const u32) };
-            instrs.push_str(&format!(" {:#010x}", instr));
-        }
-        let saved_x5 = FORK.get_saved_x(5);
-        let saved_sp = FORK.get_saved_sp();
-        let saved_lr = FORK.get_saved_x(28); // x28 for now; lr is separate
-        let msg = format!("fakelinux: [{}] fork_trampoline x0={} pid={} pc={:#x} x5={:#x} sp={:#x} instrs:{}\n",
-            pid_val, return_pid, pid, resume_pc, saved_x5, saved_sp, instrs);
-        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+        let mut buf = [0u8; 200];
+        let n = {
+            use std::io::Write;
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            let _ = c.write_fmt(format_args!(
+                "fakelinux: [{}] fork_trampoline x0={} pid={} pc={:#x}\n",
+                pid_val, return_pid, pid, resume_pc));
+            c.position() as usize
+        };
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
     }
     unsafe { FORK.restore_and_resume(); }
 }

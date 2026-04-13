@@ -1178,6 +1178,13 @@ unsafe extern "C" fn trap_handler(
 
         // Not in patch table → this was a SVC #0
         let nr = mctx.ss.x[8];
+
+        // Debug: capture w2 before emulation for set_robust_list (nr=99).
+        // After fork, glibc saves the fork return in w2 before calling
+        // set_robust_list. Verify w2 is preserved across the handler.
+        let is_set_robust = nr == 99;
+        let w2_before = mctx.ss.x[2];
+
         let args = [
             mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];
@@ -1193,6 +1200,20 @@ unsafe extern "C" fn trap_handler(
         } else {
             mctx.ss.x[0] = result as u64;
             mctx.ss.pc = pc + 4;
+        }
+
+        // Log set_robust_list: verify w2 preserved and PC advanced correctly
+        if is_set_robust && crate::syscall::trace_enabled() {
+            let pid = libc::getpid();
+            let w2_after = mctx.ss.x[2];
+            let pc_after = mctx.ss.pc;
+            let x0_after = mctx.ss.x[0];
+            let mut buf = [0u8; 256];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: [{}] SET_ROBUST pc={:#x}->{:#x} x0={:#x} w2={:#x}->{:#x} result={:#x}\n",
+                pid, pc, pc_after, x0_after, w2_before, w2_after, result
+            ));
+            libc::write(2, buf.as_ptr() as *const _, n);
         }
     } else if instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
         // MSR tpidr_el0, Xn — guest is writing to TPIDR_EL0
