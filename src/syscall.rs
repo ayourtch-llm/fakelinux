@@ -1198,6 +1198,10 @@ fn do_dup(fd: i32) -> u64 {
 }
 
 fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!("fakelinux: [{}] dup3({}, {}, {:#x})\n", pid, oldfd, newfd, flags));
+    }
     // macOS doesn't have dup3; use dup2 + fcntl for O_CLOEXEC
     let ret = unsafe { libc::dup2(oldfd, newfd) };
     if ret < 0 {
