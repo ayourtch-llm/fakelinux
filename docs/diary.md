@@ -283,6 +283,74 @@ Investigation confirmed:
 - Instruction dump at fork resume PC to verify glibc code isn't corrupted
 - Binary analysis of glibc's `__libc_fork` to understand the fork check pattern
 
+#### Fork child runs parent code — deep investigation (2026-04-13)
+
+**Symptom**: After fork(), the child process runs the parent's code path
+(close(5), write(6, config), read(7, InRelease)) instead of exec'ing gpgv.
+This causes apt-get update to hang after downloading InRelease files.
+
+**Investigation path** (many false leads before finding the real cause):
+
+1. **Initial theory: execve fallback bug** — Commit 029107e fixed `do_execve`
+   returning the current binary for non-existent files. This fixed one issue
+   but the fork child problem persisted.
+
+2. **Heap allocation after fork** — `format!`/`String` in `fork_trampoline_entry`'s
+   child path allocated on the heap after `libc::fork()`. Rust's allocator inherits
+   potentially-poisoned mutex state from the parent. Fixed by replacing all heap
+   allocations with stack-buffer `Cursor::write_fmt`. Also fixed `do_fork()` which
+   runs in signal handler context (not async-signal-safe).
+
+3. **FD_CLOEXEC closed by macOS fork** — macOS's `fork()` atfork handlers close
+   `FD_CLOEXEC` fds in the child. Linux does NOT (CLOEXEC only fires at exec).
+   Guest code creates pipes with `O_CLOEXEC` expecting them to survive fork.
+   Fixed by stripping CLOEXEC from all fds before `libc::fork()` and restoring
+   in the parent after.
+
+4. **CLONE_CHILD_SETTID not implemented** — glibc expects the kernel to write
+   the child's TID to `pthread->tid` during clone. We now handle this in the
+   fork trampoline child path.
+
+5. **RwLock poisoning after fork** — `TPIDR_PATCHES_RUNTIME` (an `RwLock`) could
+   be poisoned after fork if a panic occurred while holding it. Added recovery
+   via `into_inner()` on poison error in `tpidr_lookup`.
+
+**ROOT CAUSE FOUND**: glibc's `_Fork` child path writes the robust list head
+to `[TPIDR - 0x668]` via `STP x0, x0, [x6, #0xd8]` where `x6 = TPIDR - 0x740`.
+On real Linux, TPIDR points to a TLS region far from the stack. Under fakelinux,
+the guest's emulated TPIDR can point to glibc's TLS block allocated ON or NEAR
+the stack. When TPIDR is exactly 0x740 bytes above `__libc_fork`'s SP, the STP
+overwrites `[SP + 0xd8]` — the **stack canary** saved at `__libc_fork`'s entry.
+
+The stack canary check at `c1d20` (`b.ne __stack_chk_fail`) fires, **skipping**
+`mov w0, w19` (which would set the fork return to 0). `__libc_fork` returns
+garbage to the caller, who sees non-zero and takes the parent path.
+
+This is **intermittent** because it depends on the relative positions of TPIDR
+and SP, which vary with ASLR, stack depth, and process state.
+
+**Verification**: Added `FORK_SVC#N` tracing that logs the first 10 SVCs after
+fork in each child. Working children show `nr=134` (rt_sigaction) as SVC#1
+with x19=0 (fork return). Failing children show `nr=79` (fstatat) as SVC#1
+with x19=pointer (inside __libc_fork's atfork handlers, x19 used as iterator).
+The failing child's SVC#7 is `close(5)` — the parent code.
+
+**Fix needed**: Ensure the guest's TLS/TPIDR region does not overlap with the
+stack. Options:
+- Allocate TLS at a fixed high address far from stack
+- Detect and relocate TLS if it's too close to SP
+- Intercept the dynamic linker's TLS setup
+
+**Diagnostic traces added** (all guarded by `FAKELINUX_TRACE`):
+- `SET_ROBUST`: w2 before/after set_robust_list handler
+- `RESTORE`: x0 and pc from SavedRegs before asm restore
+- `ASM_X0`: x0 value stored before restore_all_regs
+- `FORK_SVC#N`: first 10 SVCs in fork child with nr, x0, x19, pc
+- `EARLY_FD`: fd CLOEXEC flags immediately after libc::fork()
+- `FORK_PROBE child`: fd type (P/F/C/S) and role (r/w/B)
+- `FORK_CHILD vpid`: virtual PID state after fork
+- `dup3()`: PID-annotated dup3 trace
+
 #### Signal fixes (2026-04-13)
 
 Three signal-related bugs were fixed (may not be root cause of hang but improve correctness):
