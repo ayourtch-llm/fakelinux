@@ -165,6 +165,13 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
         SYS_CLOSE_RANGE => do_close_range(args[0] as u32, args[1] as u32, args[2] as u32),
         SYS_FACCESSAT2 => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
+        SYS_GETTIMEOFDAY => {
+            // gettimeofday(tv, tz) — pass through to macOS
+            // struct timeval is { i64 tv_sec, i64 tv_usec } on both Linux aarch64 and macOS
+            let ret = unsafe { libc::gettimeofday(args[0] as *mut libc::timeval, std::ptr::null_mut()) };
+            if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        SYS_FADVISE64 => 0, // advisory hint, ignore
         SYS_SCHED_SETSCHEDULER => 0, // stub success
         SYS_SCHED_SETAFFINITY => 0, // stub success
         SYS_SCHED_GETAFFINITY => do_sched_getaffinity(args[0] as i32, args[1] as u32, args[2]),
