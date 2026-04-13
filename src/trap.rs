@@ -507,6 +507,33 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         return true;
     }
 
+    // Add/subtract with carry: sf_op_S_11010000_Rm_000000_Rn_Rd
+    // ADC (op=0,S=0), ADCS (op=0,S=1), SBC (op=1,S=0), SBCS (op=1,S=1)
+    if orig_instr & 0x1FE0_FC00 == 0x1A00_0000 {
+        let sf = (orig_instr >> 31) & 1;
+        let op = (orig_instr >> 30) & 1;
+        let s = (orig_instr >> 29) & 1;
+        let rm = ((orig_instr >> 16) & 0x1F) as usize;
+        let rn = ((orig_instr >> 5) & 0x1F) as usize;
+        let rd = (orig_instr & 0x1F) as usize;
+        let a = read_gpr(regs, rn);
+        let b = read_gpr(regs, rm);
+        let carry = (regs.cpsr >> 29) & 1; // C flag
+        let result = if op == 0 {
+            // ADC: Rd = Rn + Rm + C
+            a.wrapping_add(b).wrapping_add(carry as u64)
+        } else {
+            // SBC: Rd = Rn - Rm - !C = Rn + ~Rm + C
+            a.wrapping_add(!b).wrapping_add(carry as u64)
+        };
+        let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
+        if s == 1 {
+            update_nzcv(regs, a, b, result, op == 1, sf == 1);
+        }
+        if rd != 31 { write_gpr(regs, rd, result); }
+        return true;
+    }
+
     // Conditional select: sf_op_S_11010100_Rm_cond_op2_Rn_Rd
     if orig_instr & 0x1FE0_0000 == 0x1A80_0000 {
         let sf = (orig_instr >> 31) & 1;
