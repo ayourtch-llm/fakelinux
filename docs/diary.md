@@ -160,6 +160,14 @@ If you see `SIGILL at pc=... instr=...`, check:
 2. Are x18 instructions handled?
 3. Is the code region properly identified as code vs data?
 
+## Session Notes
+
+- [2026-04-13: Major debugging session](session-2026-04-13.md) — 12 bugs fixed
+  (execve ENOENT, shebang scripts, symlink resolution, readlinkat fallback,
+  signal preservation, CLONE_CHILD_SETTID, RwLock poisoning, heap-after-fork,
+  Mach-O fallback, setpgid EACCES, xattr stubs, realpath). Detailed root cause
+  analysis and debugging techniques for each.
+
 ## Recent Fixes
 
 ### fcntl F_GETFL/F_SETFL Flag Translation (2024-04-12)
