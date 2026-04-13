@@ -50,9 +50,18 @@ pub fn tpidr_lookup(pc: u64) -> Option<u32> {
         }
     }
     // Check runtime table (for dynamically loaded code)
-    if let Ok(table) = TPIDR_PATCHES_RUNTIME.read() {
-        if let Ok(i) = table.binary_search_by_key(&pc, |&(addr, _)| addr) {
-            return Some(table[i].1);
+    match TPIDR_PATCHES_RUNTIME.read() {
+        Ok(table) => {
+            if let Ok(i) = table.binary_search_by_key(&pc, |&(addr, _)| addr) {
+                return Some(table[i].1);
+            }
+        }
+        Err(poisoned) => {
+            // RwLock poisoned (can happen after fork) — read through poison
+            let table = poisoned.into_inner();
+            if let Ok(i) = table.binary_search_by_key(&pc, |&(addr, _)| addr) {
+                return Some(table[i].1);
+            }
         }
     }
     None

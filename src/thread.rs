@@ -173,7 +173,7 @@ pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64, regs: &crate::trap::ThreadState64) -> u64 {
     // Fork: clone without CLONE_VM
     if flags & CLONE_VM == 0 {
-        return do_fork(flags);
+        return do_fork(flags, child_tid_ptr);
     }
 
     // CLONE_VM | CLONE_VFORK (without CLONE_THREAD): vfork-like clone.
@@ -182,7 +182,7 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
     // exits. We treat this as a regular fork — the child will re-exec
     // fakelinux anyway, so sharing the address space briefly is fine.
     if flags & CLONE_VFORK != 0 && flags & CLONE_THREAD == 0 {
-        return do_fork(flags);
+        return do_fork(flags, child_tid_ptr);
     }
 
     // Thread creation requires CLONE_THREAD
@@ -252,7 +252,7 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
 pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64) -> u64 {
     // Fork path doesn't need regs — it uses the trampoline.
     if flags & CLONE_VM == 0 {
-        return do_fork(flags);
+        return do_fork(flags, child_tid_ptr);
     }
     // Thread creation without regs: cannot work properly.
     // This should not be called for CLONE_THREAD; syscall.rs should use do_clone_with_regs.
@@ -395,12 +395,19 @@ pub fn init_trampolines(base_addr: u64) {
 
 // ─── Fork trampoline ────────────────────────────────────────────────────────
 
-fn do_fork(_flags: u64) -> u64 {
+/// Saved clone args for use by the fork trampoline (set in signal context,
+/// used outside signal context after sigreturn).
+static FORK_FLAGS: AtomicU64 = AtomicU64::new(0);
+static FORK_CHILD_TID_PTR: AtomicU64 = AtomicU64::new(0);
+
+fn do_fork(flags: u64, child_tid_ptr: u64) -> u64 {
     // Don't fork here (signal context). Mark pending and return a sentinel.
     // The trap handler will redirect sigreturn to the fork trampoline.
     let pid = unsafe { libc::getpid() };
-    let msg = format!("fakelinux: [{}] do_fork(flags={:#x}) called\n", pid, _flags);
+    let msg = format!("fakelinux: [{}] do_fork(flags={:#x}) called\n", pid, flags);
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+    FORK_FLAGS.store(flags, Ordering::SeqCst);
+    FORK_CHILD_TID_PTR.store(child_tid_ptr, Ordering::SeqCst);
     FORK.mark_pending();
     0xFFFF_FFFF_0000_F0C0
 }
@@ -459,6 +466,28 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
+
+        // Handle CLONE_CHILD_SETTID: write the child's TID to the
+        // child_tid_ptr in the child's address space. On real Linux, the kernel
+        // writes the child's TID here atomically during clone(). glibc depends
+        // on this to update pthread->tid after fork.
+        let fork_flags = FORK_FLAGS.load(Ordering::SeqCst);
+        let child_tid_ptr = FORK_CHILD_TID_PTR.load(Ordering::SeqCst);
+        if fork_flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
+            // Write the child's real macOS PID. glibc uses this internally
+            // (pthread->tid) to detect child vs parent after fork. Must be
+            // the real PID, not the virtual PID — current_vpid() would return
+            // the PARENT's vpid here since the child hasn't set up its own yet.
+            let child_tid = unsafe { libc::getpid() };
+            unsafe { (child_tid_ptr as *mut i32).write(child_tid); }
+        }
+        // Also handle CLONE_CHILD_CLEARTID: set the clear-child-tid address
+        // so that when this child eventually exits, the TID is cleared and
+        // a futex wake is performed.
+        if fork_flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+            do_set_tid_address(child_tid_ptr);
+        }
+
         // Child inherits the shm mmap via MAP_SHARED and has correct
         // FAKELINUX_VPID/VPPID env vars for execve.
     }
@@ -478,15 +507,18 @@ extern "C" fn fork_trampoline_entry() -> ! {
     if crate::syscall::trace_enabled() {
         let pid_val = unsafe { libc::getpid() };
         let resume_pc = FORK.get_saved_pc();
-        // Dump 8 instructions starting at resume_pc
+        // Dump 12 instructions starting at resume_pc (enough to see past set_robust_list SVC)
         let mut instrs = String::new();
-        for i in 0..8u64 {
+        for i in 0..12u64 {
             let addr = resume_pc + i * 4;
             let instr = unsafe { *(addr as *const u32) };
             instrs.push_str(&format!(" {:#010x}", instr));
         }
-        let msg = format!("fakelinux: [{}] fork_trampoline x0={} pid={} pc={:#x} instrs:{}\n",
-            pid_val, return_pid, pid, resume_pc, instrs);
+        let saved_x5 = FORK.get_saved_x(5);
+        let saved_sp = FORK.get_saved_sp();
+        let saved_lr = FORK.get_saved_x(28); // x28 for now; lr is separate
+        let msg = format!("fakelinux: [{}] fork_trampoline x0={} pid={} pc={:#x} x5={:#x} sp={:#x} instrs:{}\n",
+            pid_val, return_pid, pid, resume_pc, saved_x5, saved_sp, instrs);
         unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
     unsafe { FORK.restore_and_resume(); }

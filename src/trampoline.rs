@@ -173,6 +173,16 @@ impl Trampoline {
         unsafe { (*self.regs.get()).pc }
     }
 
+    /// Get a saved register value by index (0-28).
+    pub fn get_saved_x(&self, n: usize) -> u64 {
+        unsafe { (*self.regs.get()).x[n] }
+    }
+
+    /// Get the saved SP value.
+    pub fn get_saved_sp(&self) -> u64 {
+        unsafe { (*self.regs.get()).sp }
+    }
+
     /// Override x0 in the saved register state (e.g. to set the syscall return value
     /// or fork pid).
     pub fn set_x0(&self, val: u64) {
