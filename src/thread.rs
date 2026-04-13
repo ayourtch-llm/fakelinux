@@ -443,9 +443,40 @@ extern "C" fn fork_trampoline_entry() -> ! {
         }
     }
 
+    // CRITICAL: Strip FD_CLOEXEC from all fds before fork.
+    // On Linux, FD_CLOEXEC only fires at exec(), not fork(). But macOS's fork()
+    // runs atfork handlers that close CLOEXEC fds in the child. Guest code (like
+    // apt's gpgv method) creates pipes with O_CLOEXEC expecting them to survive
+    // fork but close on exec. We must preserve Linux semantics.
+    let mut saved_cloexec = [0i32; 256]; // fd → old flags (-1 = not open)
+    for fd in 0..256i32 {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        saved_cloexec[fd as usize] = flags;
+        if flags > 0 && flags & libc::FD_CLOEXEC != 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC); }
+        }
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        // Restore CLOEXEC flags before returning error
+        for fd in 0..256i32 {
+            let old = saved_cloexec[fd as usize];
+            if old > 0 && old & libc::FD_CLOEXEC != 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
+            }
+        }
         unsafe { libc::_exit(127); }
+    }
+
+    // Restore FD_CLOEXEC in the parent (child will exec → fds close then)
+    if pid != 0 {
+        for fd in 0..256i32 {
+            let old = saved_cloexec[fd as usize];
+            if old > 0 && old & libc::FD_CLOEXEC != 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
+            }
+        }
     }
 
     if pid == 0 {
