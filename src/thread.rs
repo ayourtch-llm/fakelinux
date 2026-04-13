@@ -452,18 +452,67 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Probe pipe fds in child right after fork.
         // Use stack buffer only — no heap allocation after fork.
         if crate::syscall::trace_enabled() {
-            for fd in [0_i32, 1, 5, 6, 7, 8, 9, 10] {
+            let pid_val = unsafe { libc::getpid() };
+            for fd in [0_i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 let ret = unsafe { libc::fstat(fd, &mut st) };
-                if ret == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO {
-                    let pid_val = unsafe { libc::getpid() };
+                if ret == 0 {
+                    // Determine fd type and read/write role
+                    let kind = match st.st_mode & libc::S_IFMT {
+                        libc::S_IFIFO => b'P',  // pipe
+                        libc::S_IFREG => b'F',  // file
+                        libc::S_IFCHR => b'C',  // char device
+                        libc::S_IFSOCK => b'S', // socket
+                        _ => b'?',
+                    };
+                    // Check read/write capability via fcntl
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    let rw = if flags < 0 { b'?' }
+                        else if flags & libc::O_ACCMODE == libc::O_RDONLY { b'r' }
+                        else if flags & libc::O_ACCMODE == libc::O_WRONLY { b'w' }
+                        else { b'B' }; // both (O_RDWR)
+                    let mut buf = [0u8; 100];
+                    let n = {
+                        use std::io::Write;
+                        let mut c = std::io::Cursor::new(&mut buf[..]);
+                        let _ = c.write_fmt(format_args!(
+                            "fakelinux: [{}] FORK_PROBE child fd={} {}={}\n",
+                            pid_val, fd, kind as char, rw as char));
+                        c.position() as usize
+                    };
+                    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                }
+            }
+            // Also log vpid state
+            if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                let vpid = crate::pidns::current_vpid();
+                let mut buf = [0u8; 80];
+                let n = {
+                    use std::io::Write;
+                    let mut c = std::io::Cursor::new(&mut buf[..]);
+                    let _ = c.write_fmt(format_args!(
+                        "fakelinux: [{}] FORK_CHILD vpid={} real_pid={}\n",
+                        pid_val, vpid, pid_val));
+                    c.position() as usize
+                };
+                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+            }
+        }
+
+        // Early fd probe: check fds BEFORE init_child_after_fork
+        if crate::syscall::trace_enabled() {
+            let pid_val = unsafe { libc::getpid() };
+            for fd in 3_i32..=10 {
+                let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if ret >= 0 {
+                    let cloexec = if ret & libc::FD_CLOEXEC != 0 { 'X' } else { '-' };
                     let mut buf = [0u8; 80];
                     let n = {
                         use std::io::Write;
                         let mut c = std::io::Cursor::new(&mut buf[..]);
                         let _ = c.write_fmt(format_args!(
-                            "fakelinux: [{}] FORK_PROBE child fd={} ino={}\n",
-                            pid_val, fd, st.st_ino));
+                            "fakelinux: [{}] EARLY_FD fd={} cloexec={}\n",
+                            pid_val, fd, cloexec));
                         c.position() as usize
                     };
                     unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
