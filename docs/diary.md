@@ -72,7 +72,25 @@ The binary path must be a macOS filesystem path. Use the full relative path:
 ./target/debug/fakelinux --container ./ubuntu-rootfs/usr/bin/apt-get update
 ```
 
-#### DNS Resolution Fails
+#### Symlinks with Absolute Targets Break Out of Rootfs
+
+`cat /etc/alternatives/which` fails with "No such file or directory" even though
+`ls /etc/alternatives/which` works. The symlink target is an absolute path like
+`/usr/bin/which.debianutils`. macOS resolves symlinks on the HOST filesystem, not
+in the rootfs. Our rootfs translation intercepts syscall path arguments but not
+kernel-level symlink resolution.
+
+Also related: `realpath` fails on rootfs paths (`flAbsPath on /var/lib/dpkg/status failed`)
+because glibc's realpath walks the path from "/" using openat+readlinkat+fstatat, and
+symlink targets escape the rootfs.
+
+### setpgid Returns ESRCH in Interactive Bash
+
+`bash: child setpgid (1 to 1): No such process` — bash tries to set the child's
+process group but gets ESRCH. Our setpgid implementation may not handle the PID
+translation correctly in container mode.
+
+### DNS Resolution Fails
 
 Create `/etc/resolv.conf` in the rootfs:
 ```bash
@@ -161,7 +179,8 @@ and size were being mishandled, causing incorrect signal masks.
 
 ### apt-get update Hangs After Downloading Release Files (Active Investigation 2026-04-13)
 
-**Status**: Downloads complete successfully, then hangs. Root cause partially identified.
+**Status**: Downloads complete, hangs during gpgv verification. Multiple bugs found and fixed;
+one remaining issue in fork child code path routing.
 
 **Symptoms**:
 1. Resolves DNS and connects to Ubuntu mirrors ✓
@@ -203,12 +222,46 @@ for http and gpgv methods). Then:
 - `[gpgv_method] write(1, count=189) = -1 (EPIPE)` — pipe broken
 - `pselect6 nfds=7 rd:0x60→0x0 ret=0 tv=0s+500000000ns` — watching wrong fds
 
-**Still unknown**: Which process closes fds 5 and 6. Options:
-- The real `gpgv` binary (child of gpgv method) might inherit and close them
-- The parent might close them as part of worker lifecycle management
-- A stale fd cleanup path in our emulation
+**Root causes found and fixed (2026-04-13)**:
 
-PID-annotated close() tracing was added to identify the culprit.
+1. **execve ENOENT bug (FIXED)**: `do_execve` fell back to the current binary for ALL
+   non-ELF files, including files that don't exist. This broke glibc's `execvp` PATH
+   search: the first non-existent PATH entry (e.g., `/usr/local/sbin/gpgv`) would succeed
+   with the WRONG binary (the current process's binary), preventing execvp from finding
+   the correct binary at `/usr/bin/gpgv`. Fix: return -ENOENT for missing files, only
+   use fallback when file exists but isn't ELF (Mach-O binary on macOS).
+
+   This also caused the user-reported bug where `vi` in interactive bash gave a nested
+   bash session instead of "command not found".
+
+2. **Pipe fd aliasing (was caused by #1)**: Before the fix, the gpgv method re-exec'd
+   ITSELF instead of the gpgv tool. The extra process layer caused pipe endpoints to
+   mismatch between parent and child, leading to EPIPE and infinite pselect loop.
+
+**Remaining issue: fork child runs parent code path**
+
+After fixing #1, the gpgv method now correctly has no nested processes. But the method's
+fork child (which should exec the real gpgv tool) instead runs the METHOD's processing
+code (reading InRelease, writing parsed data). The child never calls execve.
+
+Investigation confirmed:
+- Fork trampoline correctly sets x0=0 for child (verified with trace)
+- glibc's fork wrapper instructions at resume_pc are intact (not corrupted by patcher):
+  `CMN x0, #1, LSL #12; B.HI; MOV w2, w0; CBNZ w0, parent_label`
+- The CBNZ w0 should NOT branch for w0=0, routing to child path
+- Yet the child executes parent code (write config, read InRelease, process data)
+
+**Theories for remaining issue**:
+- A register (x5, used for thread pointer math in glibc's fork child path) might be
+  incorrectly saved/restored through the fork trampoline
+- The set_robust_list SVC in glibc's child path might somehow affect the return path
+- The MOV w0, w2 after set_robust_list should restore fork return=0, but w2 might
+  have been corrupted
+
+**What to investigate next**:
+- Add per-syscall tracing in the child process immediately after fork
+- Verify x0 and x2 values through each instruction of glibc's fork child path
+- Check if the set_robust_list handler corrupts any registers
 
 **Debugging techniques used**:
 - `FAKELINUX_TRACE=1` with filtered grep for specific syscalls
@@ -216,6 +269,11 @@ PID-annotated close() tracing was added to identify the culprit.
 - Saved full trace to `/tmp/apt_trace.log` and used line-number searches
 - `ps aux | grep fakelinux` during hang to see live child processes
 - `pselect6` timeout value logging to distinguish spin (0ns) from poll (500ms)
+- `lsof -p PID | grep PIPE` during hang to verify pipe connectivity
+- Pipe inode tracking (fstat st_ino) through fork/exec to detect pipe mismatch
+- Fork trampoline x0 logging to verify child gets correct return value
+- Instruction dump at fork resume PC to verify glibc code isn't corrupted
+- Binary analysis of glibc's `__libc_fork` to understand the fork check pattern
 
 #### Signal fixes (2026-04-13)
 
