@@ -937,6 +937,28 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
     }
 
     // ─── CCMP/CCMN (register) ───────────────────────────────────���───
+    // ─── TBZ/TBNZ ────────────────────────────────────────────────────
+    // b5_011011_op_b40_imm14_Rt  (op: 0=TBZ, 1=TBNZ)
+    if orig_instr & 0x7E00_0000 == 0x3600_0000 {
+        let b5 = (orig_instr >> 31) & 1;
+        let op = (orig_instr >> 24) & 1; // 0=TBZ, 1=TBNZ
+        let b40 = ((orig_instr >> 19) & 0x1F) as u32;
+        let bit_pos = (b5 << 5) | b40;
+        let imm14 = ((orig_instr >> 5) & 0x3FFF) as u64;
+        let offset = sign_extend(imm14, 14) << 2;
+        let rt = (orig_instr & 0x1F) as usize;
+        let val = read_gpr(regs, rt);
+        let bit_set = (val >> bit_pos) & 1 != 0;
+        let take_branch = if op == 0 { !bit_set } else { bit_set };
+        if take_branch {
+            regs.pc = instr_pc.wrapping_add(offset);
+        } else {
+            regs.pc = instr_pc + 4;
+        }
+        return true;
+    }
+
+    // ─── CCMP/CCMN (register) ───────────────────────────────────────
     // sf_op_S_11010010_Rm_cond_0_o2_Rn_o3_nzcv  (S=1, bit11=0=reg, o2=0, o3=0)
     if orig_instr & 0x3FE0_0C10 == 0x3A40_0000 {
         let sf = (orig_instr >> 31) & 1;
