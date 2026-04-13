@@ -1292,27 +1292,42 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             } else {
                 std::ffi::CString::new(path_bytes).unwrap()
             };
-            // Check if the file is an ELF; if not, fall back to guest binary
-            // (busybox sh finds /usr/bin/uname on macOS, which is Mach-O)
+            // Check if the file is an ELF binary.
+            // Three cases:
+            //   1. File exists and is ELF → use it (normal case)
+            //   2. File exists but NOT ELF → fall back to guest binary
+            //      (busybox sh finds /usr/bin/uname on macOS, which is Mach-O)
+            //   3. File doesn't exist → return -ENOENT so glibc's execvp
+            //      can try the next PATH component
             let check_str = check_path.to_str().unwrap_or("");
-            let is_elf = std::fs::read(check_str)
+            let file_data = std::fs::read(check_str);
+            let is_elf = file_data.as_ref()
                 .map(|d| d.len() >= 4 && d[..4] == [0x7f, b'E', b'L', b'F'])
                 .unwrap_or(false);
+            let file_exists = file_data.is_ok();
             if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                let pid = unsafe { libc::getpid() };
                 raw_eprintln_fmt(format_args!(
-                    "fakelinux: execve path={:?} resolved={:?} is_elf={}\n",
-                    std::str::from_utf8(path_bytes).unwrap_or("?"), check_str, is_elf));
+                    "fakelinux: [{}] execve path={:?} resolved={:?} exists={} is_elf={}\n",
+                    pid, std::str::from_utf8(path_bytes).unwrap_or("?"),
+                    check_str, file_exists, is_elf));
             }
             if is_elf {
                 check_path
-            } else {
+            } else if file_exists {
+                // File exists but is not ELF (e.g., Mach-O binary on macOS).
+                // Fall back to the current guest binary (busybox applet pattern).
                 let fallback = procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap());
                 if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    let pid = unsafe { libc::getpid() };
                     raw_eprintln_fmt(format_args!(
-                        "fakelinux: execve FALLBACK to {:?}\n",
-                        fallback.to_str().unwrap_or("?")));
+                        "fakelinux: [{}] execve FALLBACK (non-ELF) → {:?}\n",
+                        pid, fallback.to_str().unwrap_or("?")));
                 }
                 fallback
+            } else {
+                // File doesn't exist — return ENOENT so execvp can try next PATH entry
+                return (-2_i64) as u64; // -ENOENT
             }
         }
     };
@@ -1754,6 +1769,7 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
     if ret == 0 && rdbits_before == 0x60 && nfds == 7 {
         static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let pid = unsafe { libc::getpid() };
             for fd in [5_i32, 6] {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 let fstat_ret = unsafe { libc::fstat(fd, &mut st) };
@@ -1765,10 +1781,17 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
                         _ => "other",
                     }
                 } else { "EBADF" };
-                let pid = unsafe { libc::getpid() };
+                // Try non-blocking read to probe pipe state
+                let old_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                unsafe { libc::fcntl(fd, libc::F_SETFL, old_flags | libc::O_NONBLOCK); }
+                let mut probe_buf = [0u8; 1];
+                let read_ret = unsafe { libc::read(fd, probe_buf.as_mut_ptr() as *mut _, 1) };
+                let read_errno = if read_ret < 0 { unsafe { *libc::__error() } } else { 0 };
+                unsafe { libc::fcntl(fd, libc::F_SETFL, old_flags); }
                 raw_eprintln_fmt(format_args!(
-                    "fakelinux: [{}] HANG PROBE fd={} type={} ino={}\n",
-                    pid, fd, fd_type, if fstat_ret == 0 { st.st_ino } else { 0 }));
+                    "fakelinux: [{}] HANG PROBE fd={} type={} ino={} read_probe={} errno={}\n",
+                    pid, fd, fd_type, if fstat_ret == 0 { st.st_ino } else { 0 },
+                    read_ret, read_errno));
             }
         }
     }
