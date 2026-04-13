@@ -766,16 +766,32 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
     const LINUX_TIOCSWINSZ: u64 = 0x5414;
     const LINUX_FIONREAD: u64 = 0x541B;
     const LINUX_FIONBIO: u64 = 0x5421;
+    // TCGETS2: _IOR('T', 0x2a, struct termios2) — used by newer glibc for isatty()
+    const LINUX_TCGETS2: u64 = 0x802c542a;
+    const LINUX_TCSETS2: u64 = 0x402c542b;
 
     match request {
-        LINUX_TCGETS => {
+        LINUX_TCGETS | LINUX_TCGETS2 => {
             let mut mac_t: libc::termios = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::tcgetattr(fd, &mut mac_t) };
-            if ret < 0 { return translate::linux_errno(); }
+            if ret < 0 {
+                let err = translate::linux_errno();
+                if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    let pid = unsafe { libc::getpid() };
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: [{}] ioctl({}, TCGETS) FAILED err={:#x}\n", pid, fd, err));
+                }
+                return err;
+            }
+            if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                let pid = unsafe { libc::getpid() };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] ioctl({}, TCGETS) OK\n", pid, fd));
+            }
             mac_termios_to_linux(&mac_t, arg);
             0
         }
-        LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
+        LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF | LINUX_TCSETS2 => {
             let mac_t = linux_termios_to_mac(arg);
             let action = match request {
                 LINUX_TCSETS => libc::TCSANOW,
@@ -968,6 +984,13 @@ fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
                 *cc_dst.add(linux_i) = mac.c_cc[mac_i];
             }
         }
+        // For TCGETS2 (struct termios2): add c_ispeed and c_ospeed at offset 36 and 40.
+        // These are optional — the caller's buffer is 44 bytes for termios2.
+        // Write speeds from macOS cfgetispeed/cfgetospeed.
+        let ispeed = libc::cfgetispeed(mac) as u32;
+        let ospeed = libc::cfgetospeed(mac) as u32;
+        (p.add(36) as *mut u32).write_unaligned(ispeed);
+        (p.add(40) as *mut u32).write_unaligned(ospeed);
     }
 }
 
