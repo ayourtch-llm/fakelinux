@@ -788,7 +788,7 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
                 raw_eprintln_fmt(format_args!(
                     "fakelinux: [{}] ioctl({}, TCGETS) OK\n", pid, fd));
             }
-            mac_termios_to_linux(&mac_t, arg);
+            mac_termios_to_linux(&mac_t, arg, request == LINUX_TCGETS2);
             0
         }
         LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF | LINUX_TCSETS2 => {
@@ -968,7 +968,7 @@ const LFLAG_M2L: [(u32, u32); 11] = [
 // Both use the same bit positions for the common flags, so pass through directly.
 
 /// Convert macOS termios to Linux aarch64 kernel termios (36 bytes) at guest address.
-fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
+fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64, is_termios2: bool) {
     const KERNEL_NCCS: usize = 19;
     unsafe {
         let p = linux_ptr as *mut u8;
@@ -985,12 +985,13 @@ fn mac_termios_to_linux(mac: &libc::termios, linux_ptr: u64) {
             }
         }
         // For TCGETS2 (struct termios2): add c_ispeed and c_ospeed at offset 36 and 40.
-        // These are optional — the caller's buffer is 44 bytes for termios2.
-        // Write speeds from macOS cfgetispeed/cfgetospeed.
-        let ispeed = libc::cfgetispeed(mac) as u32;
-        let ospeed = libc::cfgetospeed(mac) as u32;
-        (p.add(36) as *mut u32).write_unaligned(ispeed);
-        (p.add(40) as *mut u32).write_unaligned(ospeed);
+        // Only write these for termios2 — regular termios is only 36 bytes.
+        if is_termios2 {
+            let ispeed = libc::cfgetispeed(mac) as u32;
+            let ospeed = libc::cfgetospeed(mac) as u32;
+            (p.add(36) as *mut u32).write_unaligned(ispeed);
+            (p.add(40) as *mut u32).write_unaligned(ospeed);
+        }
     }
 }
 
