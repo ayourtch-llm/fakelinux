@@ -1315,13 +1315,90 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             if is_elf {
                 check_path
             } else if file_exists {
-                // File exists but is not ELF (e.g., Mach-O binary on macOS).
+                let data = file_data.as_ref().unwrap();
+                // Check for shebang script (#!)
+                if data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
+                    // Parse shebang: "#!/path/to/interpreter [optional-arg]\n"
+                    let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len().min(256));
+                    let shebang_line = std::str::from_utf8(&data[2..line_end]).unwrap_or("").trim();
+                    let (interp, interp_arg) = if let Some(space) = shebang_line.find(' ') {
+                        (&shebang_line[..space], Some(shebang_line[space+1..].trim()))
+                    } else {
+                        (shebang_line, None)
+                    };
+
+                    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                        let pid = unsafe { libc::getpid() };
+                        raw_eprintln_fmt(format_args!(
+                            "fakelinux: [{}] execve SHEBANG interp={:?} arg={:?} script={:?}\n",
+                            pid, interp, interp_arg, check_str));
+                    }
+
+                    // Resolve the interpreter path through rootfs translation
+                    let interp_resolved = if let Some(translated) = rootfs::translate_path(interp.as_bytes()) {
+                        unsafe { std::ffi::CString::from_vec_with_nul_unchecked(translated) }
+                    } else {
+                        std::ffi::CString::new(interp).unwrap_or_default()
+                    };
+
+                    // Build new argv: fakelinux <interpreter> [interp_arg] <script_path> <original_args...>
+                    let self_exe = std::env::current_exe().unwrap_or_default();
+                    let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap_or("fakelinux")).unwrap();
+                    let script_path_c = std::ffi::CString::new(check_str).unwrap_or_default();
+                    let interp_arg_c = interp_arg.map(|a| std::ffi::CString::new(a).unwrap_or_default());
+
+                    let mut shebang_argv: Vec<*const i8> = Vec::new();
+                    shebang_argv.push(self_exe_c.as_ptr());
+                    shebang_argv.push(interp_resolved.as_ptr());
+                    if let Some(ref arg_c) = interp_arg_c {
+                        shebang_argv.push(arg_c.as_ptr());
+                    }
+                    shebang_argv.push(script_path_c.as_ptr());
+                    // Add original argv[1..] (skip argv[0])
+                    let mut guest_argv = argv_ptr as *const *const i8;
+                    unsafe {
+                        if !(*guest_argv).is_null() {
+                            guest_argv = guest_argv.add(1); // skip argv[0]
+                        }
+                        while !(*guest_argv).is_null() {
+                            shebang_argv.push(*guest_argv);
+                            guest_argv = guest_argv.add(1);
+                        }
+                    }
+                    shebang_argv.push(std::ptr::null());
+
+                    // Encode signal state for the new process
+                    {
+                        let mut ign_mask: u64 = 0;
+                        for sig in 1..65u64 {
+                            let sa = signal::guest_sigaction(sig as usize);
+                            if sa.handler == 1 { ign_mask |= 1u64 << (sig - 1); }
+                        }
+                        if ign_mask != 0 { std::env::set_var("FAKELINUX_SIGIGN", format!("{:#x}", ign_mask)); }
+                        else { std::env::remove_var("FAKELINUX_SIGIGN"); }
+                        let sigmask = signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst);
+                        if sigmask != 0 { std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask)); }
+                        else { std::env::remove_var("FAKELINUX_SIGMASK"); }
+                    }
+
+                    extern "C" { static environ: *const *const i8; }
+                    unsafe {
+                        libc::execve(
+                            self_exe_c.as_ptr(),
+                            shebang_argv.as_ptr() as *const *const i8,
+                            environ as *const *const i8,
+                        );
+                    }
+                    return translate::linux_errno();
+                }
+
+                // File exists, not ELF, not script → Mach-O or other.
                 // Fall back to the current guest binary (busybox applet pattern).
                 let fallback = procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap());
                 if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                     let pid = unsafe { libc::getpid() };
                     raw_eprintln_fmt(format_args!(
-                        "fakelinux: [{}] execve FALLBACK (non-ELF) → {:?}\n",
+                        "fakelinux: [{}] execve FALLBACK (non-ELF, non-script) → {:?}\n",
                         pid, fallback.to_str().unwrap_or("?")));
                 }
                 fallback
