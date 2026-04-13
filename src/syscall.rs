@@ -1431,12 +1431,27 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 }
 
                 // File exists, not ELF, not script → Mach-O or other.
-                // Fall back to the current guest binary (busybox applet pattern).
+                if rootfs::get_root().is_some() {
+                    // With FAKELINUX_ROOT, we're in full rootfs mode. A non-ELF
+                    // file (e.g., Mach-O /opt/homebrew/bin/gpgv on macOS host)
+                    // should NOT be executed. Return ENOENT so execvp tries
+                    // the next PATH entry and eventually finds the rootfs ELF.
+                    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                        let pid = unsafe { libc::getpid() };
+                        raw_eprintln_fmt(format_args!(
+                            "fakelinux: [{}] execve SKIP non-ELF {:?} (rootfs mode)\n",
+                            pid, check_str));
+                    }
+                    return (-2_i64) as u64; // -ENOENT
+                }
+                // Without FAKELINUX_ROOT (SYSROOT-only mode), fall back to the
+                // current guest binary (busybox applet pattern: host has Mach-O
+                // /usr/bin/uname, we re-exec the guest busybox instead).
                 let fallback = procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap());
                 if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                     let pid = unsafe { libc::getpid() };
                     raw_eprintln_fmt(format_args!(
-                        "fakelinux: [{}] execve FALLBACK (non-ELF, non-script) → {:?}\n",
+                        "fakelinux: [{}] execve FALLBACK (non-ELF, sysroot mode) → {:?}\n",
                         pid, fallback.to_str().unwrap_or("?")));
                 }
                 fallback
