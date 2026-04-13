@@ -1,6 +1,15 @@
 // Linux AArch64 syscall numbers
 pub const SYS_IO_SETUP: u64 = 0;
 pub const SYS_SETXATTR: u64 = 5;
+pub const SYS_LSETXATTR: u64 = 6;
+pub const SYS_FSETXATTR: u64 = 7;
+pub const SYS_GETXATTR: u64 = 8;
+pub const SYS_LGETXATTR: u64 = 9;
+pub const SYS_FGETXATTR: u64 = 10;
+pub const SYS_LISTXATTR: u64 = 11;
+pub const SYS_LLISTXATTR: u64 = 12;
+pub const SYS_FLISTXATTR: u64 = 13;
+pub const SYS_REMOVEXATTR: u64 = 14;
 pub const SYS_IOCTL: u64 = 29;
 pub const SYS_FCNTL: u64 = 25;
 pub const SYS_FACCESSAT: u64 = 48;

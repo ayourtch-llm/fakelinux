@@ -140,6 +140,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_GETTID => thread::current_tid() as u64,
         SYS_SET_TID_ADDRESS => thread::do_set_tid_address(args[0]),
         SYS_SET_ROBUST_LIST => 0,
+        // xattr stubs: return -ENODATA (no data) for get/list, success for set/remove
+        SYS_GETXATTR | SYS_LGETXATTR | SYS_FGETXATTR => (-61_i64) as u64, // -ENODATA
+        SYS_LISTXATTR | SYS_LLISTXATTR | SYS_FLISTXATTR => 0, // empty list
+        SYS_SETXATTR | SYS_LSETXATTR | SYS_FSETXATTR => 0,
+        SYS_REMOVEXATTR => 0,
         SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGRETURN => {
