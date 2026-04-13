@@ -1185,6 +1185,21 @@ unsafe extern "C" fn trap_handler(
         let is_set_robust = nr == 99;
         let w2_before = mctx.ss.x[2];
 
+        // Debug: check DEBUG_RESTORED_X0 — the actual x0 loaded by the asm
+        if is_set_robust {
+            let asm_x0 = crate::trampoline::DEBUG_RESTORED_X0.swap(-1, Ordering::SeqCst);
+            if asm_x0 != -1 {
+                let pid = libc::getpid();
+                let mctx_x0 = mctx.ss.x[0];
+                let mut buf = [0u8; 160];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] ASM_X0={:#x} mctx_x0={:#x} w2={:#x}\n",
+                    pid, asm_x0 as u64, mctx_x0, w2_before
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
+
         let args = [
             mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];

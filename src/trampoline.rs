@@ -20,7 +20,11 @@
 //!   unsafe { MY_TRAMP.restore_and_resume(); }
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+/// Debug: the x0 value that restore_all_regs actually loaded, written by the asm.
+/// -1 means "not yet set". Check this from the trap handler to verify x0.
+pub static DEBUG_RESTORED_X0: AtomicI64 = AtomicI64::new(-1);
 
 const PAGE_SIZE: usize = 16384;
 
@@ -194,6 +198,10 @@ impl Trampoline {
     /// the deferred work.
     pub unsafe fn restore_and_resume(&self) -> ! {
         let r = &*self.regs.get();
+        // Debug: store x0 from SavedRegs for verification in the trap handler.
+        // This is a volatile write: the trap handler checks it at the next UDF.
+        DEBUG_RESTORED_X0.store(r.x[0] as i64, Ordering::SeqCst);
+
         // Debug: verify x0 in SavedRegs right before the asm restore.
         // Use stack buffer only — no heap allocation after fork.
         if crate::syscall::trace_enabled() {
@@ -209,6 +217,8 @@ impl Trampoline {
             };
             libc::write(2, buf.as_ptr() as *const _, n);
         }
+        // Ensure the x0 write above is visible before the asm loads it
+        std::sync::atomic::fence(Ordering::SeqCst);
         restore_all_regs(r as *const SavedRegs as u64, r.pc);
     }
 }
