@@ -597,6 +597,8 @@ extern "C" fn fork_trampoline_entry() -> ! {
             do_set_tid_address(child_tid_ptr);
         }
 
+        // Enable SVC tracing for first 10 SVCs in the fork child
+        crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
         // Child inherits the shm mmap via MAP_SHARED and has correct
         // FAKELINUX_VPID/VPPID env vars for execve.
     }

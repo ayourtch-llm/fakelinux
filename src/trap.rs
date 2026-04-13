@@ -8,6 +8,9 @@ use crate::syscall;
 /// because the ucontext contains trap handler registers, not guest registers.
 pub static IN_TRAP: AtomicBool = AtomicBool::new(false);
 
+/// Debug counter: trace first N SVC syscalls in a fork child.
+pub static FORK_SVC_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Diagnostic: the x18 instruction currently being emulated (for crash dumps).
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
@@ -1178,6 +1181,22 @@ unsafe extern "C" fn trap_handler(
 
         // Not in patch table → this was a SVC #0
         let nr = mctx.ss.x[8];
+
+        // Debug: track fork children's first few SVCs to see when they
+        // diverge from the expected child code path.
+        {
+            let cnt = FORK_SVC_COUNT.load(Ordering::Relaxed);
+            if cnt > 0 {
+                FORK_SVC_COUNT.fetch_sub(1, Ordering::Relaxed);
+                let pid = libc::getpid();
+                let mut buf = [0u8; 160];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] FORK_SVC#{} nr={} x0={:#x} x19={:#x} pc={:#x}\n",
+                    pid, 10 - cnt, nr, mctx.ss.x[0], mctx.ss.x[19], pc
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
 
         // Debug: capture w2 before emulation for set_robust_list (nr=99).
         // After fork, glibc saves the fork return in w2 before calling
