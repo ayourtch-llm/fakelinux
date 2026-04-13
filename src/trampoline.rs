@@ -168,6 +168,11 @@ impl Trampoline {
         r.pc = resume_pc;
     }
 
+    /// Get the saved PC value.
+    pub fn get_saved_pc(&self) -> u64 {
+        unsafe { (*self.regs.get()).pc }
+    }
+
     /// Override x0 in the saved register state (e.g. to set the syscall return value
     /// or fork pid).
     pub fn set_x0(&self, val: u64) {

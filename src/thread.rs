@@ -477,8 +477,16 @@ extern "C" fn fork_trampoline_entry() -> ! {
     FORK.set_x0(return_pid);
     if crate::syscall::trace_enabled() {
         let pid_val = unsafe { libc::getpid() };
-        let msg = format!("fakelinux: [{}] fork_trampoline returning x0={} (pid_from_fork={})\n",
-            pid_val, return_pid, pid);
+        let resume_pc = FORK.get_saved_pc();
+        // Dump 8 instructions starting at resume_pc
+        let mut instrs = String::new();
+        for i in 0..8u64 {
+            let addr = resume_pc + i * 4;
+            let instr = unsafe { *(addr as *const u32) };
+            instrs.push_str(&format!(" {:#010x}", instr));
+        }
+        let msg = format!("fakelinux: [{}] fork_trampoline x0={} pid={} pc={:#x} instrs:{}\n",
+            pid_val, return_pid, pid, resume_pc, instrs);
         unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
     unsafe { FORK.restore_and_resume(); }
