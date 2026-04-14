@@ -1225,9 +1225,9 @@ fn decode_bitmask_imm(instr: u32, is_64: bool) -> Option<u64> {
 unsafe fn load_mem(addr: u64, size: u32) -> u64 {
     match size {
         0 => *(addr as *const u8) as u64,
-        1 => *(addr as *const u16) as u64,
-        2 => *(addr as *const u32) as u64,
-        3 => *(addr as *const u64),
+        1 => (addr as *const u16).read_unaligned() as u64,
+        2 => (addr as *const u32).read_unaligned() as u64,
+        3 => (addr as *const u64).read_unaligned(),
         _ => 0,
     }
 }
@@ -1235,9 +1235,9 @@ unsafe fn load_mem(addr: u64, size: u32) -> u64 {
 unsafe fn store_mem(addr: u64, size: u32, val: u64) {
     match size {
         0 => *(addr as *mut u8) = val as u8,
-        1 => *(addr as *mut u16) = val as u16,
-        2 => *(addr as *mut u32) = val as u32,
-        3 => *(addr as *mut u64) = val,
+        1 => (addr as *mut u16).write_unaligned(val as u16),
+        2 => (addr as *mut u32).write_unaligned(val as u32),
+        3 => (addr as *mut u64).write_unaligned(val),
         _ => {}
     }
 }
