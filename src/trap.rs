@@ -31,6 +31,23 @@ pub static FORK_RETURN_PROBE_ORIG: std::sync::atomic::AtomicU32 = std::sync::ato
 pub static FORK_LR_WATCH_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static FORK_LR_WATCH_EXPECTED: AtomicU64 = AtomicU64::new(0);
 
+/// Debug: address of __libc_fork's first instruction (sub sp, sp, #0x140 at c1b50).
+/// Patched to UDF to intercept every call to __libc_fork and log x30 (caller's LR).
+pub static FORK_ENTRY_PROBE: AtomicU64 = AtomicU64::new(0);
+pub static FORK_ENTRY_PROBE_ORIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Remaining count for FORK_ENTRY_PROBE re-arming.
+pub static FORK_ENTRY_PROBE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Track x30 across traps for FORK_ENTRY_PROBE LR recovery.
+static X30_LAST: AtomicU64 = AtomicU64::new(0);
+/// Last x30 value that looked like ExecFork's return address (code addr ending in 0x77DC).
+static X30_LAST_GOOD_EXEC_FORK: AtomicU64 = AtomicU64::new(0);
+
+/// Address of libapt-pkg's B instruction at offset 0xB7EE4. Set by patch_new_code
+/// when it detects libapt-pkg. Used to detect corruption.
+pub static LIBAPT_B_WATCH: AtomicU64 = AtomicU64::new(0);
+pub static LIBAPT_B_REPORTED: AtomicBool = AtomicBool::new(false);
+
 /// Diagnostic: the x18 instruction currently being emulated (for crash dumps).
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
@@ -249,6 +266,14 @@ fn read_gpr_sp(regs: &ThreadState64, n: usize) -> u64 {
 
 /// Write a GPR value, but register 31 writes to SP instead of being ignored.
 fn write_gpr_sp(regs: &mut ThreadState64, n: usize, val: u64) {
+    if n == 30 {
+        let pc = regs.pc;
+        let pid = unsafe { libc::getpid() };
+        let mut buf = [0u8; 160];
+        let sz = raw_fmt(&mut buf, format_args!(
+            "fakelinux: [{}] WRITE_X30_SP val={:#x} pc={:#x}\n", pid, val, pc));
+        unsafe { libc::write(2, buf.as_ptr() as *const _, sz); }
+    }
     if n == 31 { regs.sp = val; }
     else if n == 18 { set_thread_x18(val); }
     else { write_reg(regs, n, val); }
@@ -256,6 +281,15 @@ fn write_gpr_sp(regs: &mut ThreadState64, n: usize, val: u64) {
 
 /// Write a GPR value, storing x18 to per-thread storage instead of mcontext.
 fn write_gpr(regs: &mut ThreadState64, n: usize, val: u64) {
+    // DEBUG: log any write to x30 (LR) — this catches corruption of the return address
+    if n == 30 {
+        let pc = regs.pc;
+        let pid = unsafe { libc::getpid() };
+        let mut buf = [0u8; 160];
+        let sz = raw_fmt(&mut buf, format_args!(
+            "fakelinux: [{}] WRITE_X30 val={:#x} pc={:#x}\n", pid, val, pc));
+        unsafe { libc::write(2, buf.as_ptr() as *const _, sz); }
+    }
     if n == 18 {
         set_thread_x18(val);
     } else {
@@ -280,6 +314,25 @@ pub fn references_x18(instr: u32) -> bool {
         || matches!(top_byte, 0x0e | 0x2e | 0x4e | 0x6e | 0x0f | 0x2f | 0x4f | 0x6f
                             | 0x5e | 0x7e | 0x5f | 0x7f | 0x1e | 0x1f);
     if is_simd_scalar_or_vec { return false; }
+
+    // Exclude B/BL (unconditional branch): bits[31:26] = x00101.
+    // These have NO register operands (only imm26), but disarm64 may report
+    // ADDRESS-class operands whose bit fields overlap with register positions.
+    let bits_31_26 = instr >> 26;
+    if bits_31_26 == 0b000101 || bits_31_26 == 0b100101 { return false; }  // B / BL
+
+    // Exclude B.cond (conditional branch): bits[31:24] = 01010100.
+    // Only has an immediate offset, no register operands.
+    if (instr >> 24) & 0xFF == 0x54 { return false; }
+
+    // Exclude CBZ/CBNZ: bits[31:25] = 0x1101x. Has Rt but it's used as a test source,
+    // and if Rt=18 we need to check — so don't exclude these.
+
+    // Exclude TBZ/TBNZ: bits[31:25] = 0x11011x. Same consideration as CBZ/CBNZ.
+
+    // Exclude ADRP/ADR: bits[31:28] = 0x9 or 0x1. Only has Rd and page offset.
+    if (instr >> 24) & 0x9F == 0x90 { return false; }  // ADRP
+    if (instr >> 24) & 0x9F == 0x10 { return false; }  // ADR
 
     let Some(decoded) = disarm64::decoder::decode(instr) else { return false; };
     let defn = decoded.definition();
@@ -1200,6 +1253,167 @@ unsafe extern "C" fn trap_handler(
     let mctx = &mut *uctx.uc_mcontext;
     let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
+
+    // Check if libapt-pkg's B instruction has been corrupted.
+    {
+        let watch = LIBAPT_B_WATCH.load(Ordering::Relaxed);
+        if watch != 0 && !LIBAPT_B_REPORTED.load(Ordering::Relaxed) {
+            let cur = (watch as *const u32).read();
+            if cur != 0x1400000F {
+                LIBAPT_B_REPORTED.store(true, Ordering::Relaxed);
+                let pid = libc::getpid();
+                let sp = mctx.ss.sp;
+                let mut buf = [0u8; 300];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] B_CORRUPTED! addr={:#x} was=0x1400000f now={:#010x} trap_pc={:#x}\n",
+                    pid, watch, cur, pc
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
+    }
+
+    // Track x30 across traps to detect when it first becomes a heap address.
+    // X30_LAST also used by FORK_ENTRY_PROBE to recover the correct LR.
+    {
+        static X30_REPORTED: AtomicBool = AtomicBool::new(false);
+        let x30 = mctx.ss.lr;
+        let x30_last = X30_LAST.swap(x30, Ordering::Relaxed);
+        // Save x30 if it looks like ExecFork's return (code addr ending in 0x77DC)
+        if x30 >= 0x1_0000_0000 && x30 <= 0x1_0600_0000 && (x30 & 0xFFFF) == 0x77DC {
+            X30_LAST_GOOD_EXEC_FORK.store(x30, Ordering::Relaxed);
+        }
+        // Check if x30 just changed to a heap address (0x50000xxxx range)
+        if x30 >= 0x5_0000_0000 && x30 < 0x6_0000_0000
+            && !(x30_last >= 0x5_0000_0000 && x30_last < 0x6_0000_0000)
+            && !X30_REPORTED.swap(true, Ordering::Relaxed)
+        {
+            let pid = libc::getpid();
+            let sp = mctx.ss.sp;
+            let mut buf = [0u8; 300];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: [{}] X30_BECAME_HEAP! pc={:#x} sp={:#x} x30_was={:#x} x30_now={:#x} instr={:#x}\n",
+                pid, pc, sp, x30_last, x30, instr
+            ));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
+    }
+
+    // Global LR watch: check [FORK_LR_WATCH_ADDR] at every single trap to detect
+    // the exact instruction that corrupts __libc_fork's saved LR.
+    {
+        let lw_addr = FORK_LR_WATCH_ADDR.load(Ordering::Relaxed);
+        let lw_exp = FORK_LR_WATCH_EXPECTED.load(Ordering::Relaxed);
+        if lw_addr != 0 && lw_exp != 0 {
+            let lw_cur = (lw_addr as *const u64).read();
+            if lw_cur != lw_exp {
+                let pid = libc::getpid();
+                let sp = mctx.ss.sp;
+                let lr = mctx.ss.lr;
+                let mut buf = [0u8; 300];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] LR_WATCH_HIT! pc={:#x} sp={:#x} lr={:#x} expected={:#x} got={:#x}\n",
+                    pid, pc, sp, lr, lw_exp, lw_cur
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+                // Update expected so we only report the FIRST corruption
+                FORK_LR_WATCH_EXPECTED.store(lw_cur, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Check if this is our __libc_fork ENTRY probe (at c1b50: sub sp, sp, #0x140).
+    // This fires at __libc_fork's very first instruction, BEFORE any register saves.
+    // At this point, x30 should have the caller's return address (set by their BL).
+    let entry_probe = FORK_ENTRY_PROBE.load(Ordering::Relaxed);
+    if entry_probe != 0 && pc == entry_probe {
+        let pid = libc::getpid();
+        let sp = mctx.ss.sp;  // caller's SP (before sub)
+        let lr_reg = mctx.ss.lr;  // should be ExecFork + 0x18 = libapt_base + 0xB77DC
+        let fp_reg = mctx.ss.fp;  // current FP
+        let mut buf = [0u8; 300];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: [{}] FORK_ENTRY! sp={:#x} lr_reg(x30)={:#x} fp_reg(x29)={:#x}\n",
+            pid, sp, lr_reg, fp_reg
+        ));
+        libc::write(2, buf.as_ptr() as *const _, n);
+
+        // If LR looks corrupted (not a code address), fix it.
+        // The X30_LAST tracker stores x30 from the PREVIOUS trap. If the previous
+        // trap was during ExecFork's fork@plt call, X30_LAST = ExecFork + 0x18
+        // = libapt_base + 0xB77DC. This is the CORRECT LR for __libc_fork.
+        if lr_reg < 0x1_0000_0000 || lr_reg > 0x1_0600_0000 {
+            // Strategy: compute correct LR from libc base.
+            // ExecFork's BL fork@plt goes to fork@plt which does br to __libc_fork.
+            // The BL is at libapt_base + 0xB77D8, so LR = libapt_base + 0xB77DC.
+            // We know libc_base from the probe: probe_addr = libc_base + 0xC1B50.
+            // We need to find libapt_base. Strategy: scan the stack for a value
+            // that matches the pattern libapt_base + 0xB77DC (code range, ends in 0x7DC with
+            // nibbles matching). The correct LR was on the stack before corruption.
+            //
+            // Actually simpler: ExecFork's return address was in x30 before corruption.
+            // The BL fork@plt at b77d8 produces LR = base + b77dc. The low 12 bits
+            // are 0x7DC. Scan the stack for any code-range value with low 12 bits = 0x7DC.
+            let mut correct_lr: u64 = 0;
+            // Scan stack from SP upward (ExecFork's frame and caller frames)
+            for off in (0..=0x400u64).step_by(8) {
+                let val = ((sp + off) as *const u64).read();
+                if val >= 0x1_0000_0000 && val <= 0x1_0600_0000 && (val & 0xFFF) == 0x7DC {
+                    correct_lr = val;
+                    break;
+                }
+            }
+            if correct_lr != 0 {
+                mctx.ss.lr = correct_lr;
+                // Also fix ExecFork's saved LR at [SP+8].
+                // ExecFork saved its caller's LR there. The correct value
+                // depends on which function called ExecFork. For the gpgv method,
+                // ExecFork(void) at libapt+0xB7C10 calls ExecFork(set<int>).
+                // The return from that call is at libapt+0xB7CB8.
+                let libapt_base = correct_lr - 0xB77DC;
+                let exec_fork_caller_lr = libapt_base + 0xB7CB8;
+                let cur_saved_lr = ((sp + 8) as *const u64).read();
+                if cur_saved_lr < 0x1_0000_0000 || cur_saved_lr > 0x1_0600_0000 {
+                    ((sp + 8) as *mut u64).write(exec_fork_caller_lr);
+                }
+                let mut buf2 = [0u8; 400];
+                let n2 = raw_fmt(&mut buf2, format_args!(
+                    "fakelinux: [{}] FORK_ENTRY FIX_LR! lr={:#x}→{:#x} exec_caller={:#x}→{:#x}\n",
+                    pid, lr_reg, correct_lr, cur_saved_lr, exec_fork_caller_lr
+                ));
+                libc::write(2, buf2.as_ptr() as *const _, n2);
+            } else {
+                let mut buf2 = [0u8; 200];
+                let n2 = raw_fmt(&mut buf2, format_args!(
+                    "fakelinux: [{}] FORK_ENTRY BAD_LR! lr={:#x} (no fix found)\n",
+                    pid, lr_reg
+                ));
+                libc::write(2, buf2.as_ptr() as *const _, n2);
+            }
+        }
+
+        // Emulate: sub sp, sp, #0x140
+        mctx.ss.sp = sp - 0x140;
+        mctx.ss.pc = pc + 4;
+
+        // Re-arm or disable the probe
+        let remaining = FORK_ENTRY_PROBE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        if remaining <= 1 {
+            // Last fire — restore original instruction permanently
+            let orig = FORK_ENTRY_PROBE_ORIG.load(Ordering::Relaxed);
+            let page = entry_probe & !0x3FFF;
+            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+            (entry_probe as *mut u32).write(orig);
+            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+            sys_icache_invalidate(entry_probe as *mut _, 4);
+            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+            FORK_ENTRY_PROBE.store(0, Ordering::Relaxed);
+        }
+        // Otherwise, keep the UDF in place for next call
+
+        IN_TRAP.store(false, Ordering::SeqCst);
+        return;
+    }
 
     // Check if this is our __libc_fork return probe
     let probe_addr = FORK_RETURN_PROBE.load(Ordering::Relaxed);

@@ -67,6 +67,37 @@ pub fn tpidr_lookup(pc: u64) -> Option<u32> {
     None
 }
 
+/// Find the base address of a library that has a TPIDR patch at the given offset.
+/// Searches the runtime patch table for any (addr, _) where addr & 0xFFFFF == offset & 0xFFFFF
+/// and returns addr - offset. Used to find libapt-pkg base when the stack is corrupted.
+pub fn find_tpidr_patch_base(offset: u64) -> u64 {
+    // The offset is the known position of a TPIDR instruction within the library.
+    // We search for a patched address whose low bits match the offset.
+    match TPIDR_PATCHES_RUNTIME.read() {
+        Ok(table) => {
+            for &(addr, _) in table.iter() {
+                if addr >= offset && (addr - offset) & 0xFFF == 0 {
+                    // Page-aligned base. Verify: addr = base + offset
+                    // The base should be page-aligned.
+                    let candidate_base = addr - offset;
+                    if candidate_base & 0x3FFF == 0 { // 16KB aligned
+                        return candidate_base;
+                    }
+                }
+            }
+        }
+        Err(poisoned) => {
+            let table = poisoned.into_inner();
+            for &(addr, _) in table.iter() {
+                if addr >= offset && (addr - offset) & 0x3FFF == 0 {
+                    return addr - offset;
+                }
+            }
+        }
+    }
+    0
+}
+
 const PAGE_SIZE: u64 = 16384; // macOS aarch64
 
 fn page_align_down(addr: u64) -> u64 {
@@ -424,6 +455,12 @@ pub fn patch_new_code(start: u64, len: u64) {
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
+            // DEBUG: check if offset 0xB7EE4 has unexpected content
+            let offset = (i as u64) * 4;
+            if offset == 0xB7EE4 {
+                eprintln!("fakelinux: OFFSET_CHECK 0xB7EE4 at {:#x}: instr={:#010x} (expected 0x1400000F)",
+                    base.add(i) as u64, instr);
+            }
             if instr == trap::SVC_0 {
                 base.add(i).write(trap::UDF_MARKER);
                 svc_patched += 1;
@@ -439,6 +476,8 @@ pub fn patch_new_code(start: u64, len: u64) {
                 // symbol tables, etc.). Only patch if we have confirmed code ranges.
                 // SVC/TPIDR patterns are specific enough to scan everything safely.
                 if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges) {
+                    let offset = pc_addr - start;
+                    eprintln!("fakelinux:   x18 patch at {:#x} (offset {:#x}) instr={:#010x}", pc_addr, offset, instr);
                     add_runtime_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
                     x18_patched += 1;
@@ -454,6 +493,45 @@ pub fn patch_new_code(start: u64, len: u64) {
             start, len, svc_patched, tpidr_patched, x18_patched,
             if x18_skipped > 0 { format!(" ({} x18 skipped, no code ranges)", x18_skipped) } else { String::new() }
         );
+    }
+
+    // Detect libapt-pkg and set up B instruction watch.
+    // libapt-pkg is identified by its BL fork@plt encoding at offset 0xB77D8.
+    if len > 0xB7EE8 {
+        unsafe {
+            let bl_fork = (start as *const u8).add(0xB77D8) as *const u32;
+            if bl_fork.read() == 0x97FE0E22 {
+                let watch_addr = start + 0xB7EE4;
+                let cur = (watch_addr as *const u32).read();
+                eprintln!("fakelinux: libapt-pkg detected at {:#x}, B@{:#x}={:#010x}", start, watch_addr, cur);
+                trap::LIBAPT_B_WATCH.store(watch_addr, std::sync::atomic::Ordering::Relaxed);
+                trap::LIBAPT_B_REPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Set up FORK_ENTRY_PROBE: patch __libc_fork's FIRST instruction `sub sp, sp, #0x140`
+    // at offset 0xC1B50 to UDF. This fires at __libc_fork entry, allowing us to check
+    // if x30 (LR) is already corrupted when the function is entered.
+    // Detect libc by high SVC count (>400) — only libc has hundreds of SVCs.
+    if svc_patched > 400 {
+        let probe_offset = 0xC1B50u64;
+        if probe_offset + 4 <= len {
+            unsafe {
+                let probe_addr = start + probe_offset;
+                let orig_instr = (probe_addr as *const u32).read();
+                // Verify it's the expected instruction: sub sp, sp, #0x140 = 0xD10503FF
+                if orig_instr == 0xD10503FF {
+                    trap::FORK_ENTRY_PROBE_ORIG.store(orig_instr, std::sync::atomic::Ordering::Relaxed);
+                    trap::FORK_ENTRY_PROBE.store(probe_addr, std::sync::atomic::Ordering::Relaxed);
+                    trap::FORK_ENTRY_PROBE_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
+                    (probe_addr as *mut u32).write(trap::UDF_MARKER);
+                    eprintln!("fakelinux: FORK_ENTRY_PROBE set at {:#x} (libc base {:#x})", probe_addr, start);
+                } else {
+                    eprintln!("fakelinux: FORK_ENTRY_PROBE: unexpected instr {:#x} at {:#x}", orig_instr, probe_addr);
+                }
+            }
+        }
     }
 }
 

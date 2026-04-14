@@ -484,6 +484,69 @@ extern "C" fn fork_trampoline_entry() -> ! {
     let canary_addr = guest_sp + 0xe8;
     let saved_canary = unsafe { (canary_addr as *const u64).read() };
 
+    // Also save __libc_fork's LR before macOS fork to detect corruption.
+    // __libc_fork_sp = guest_sp + 0x10, saved LR at [__libc_fork_sp + 0xE8]
+    let lr_addr = guest_sp + 0x10 + 0xE8;
+    let lr_before_macos_fork = unsafe { (lr_addr as *const u64).read() };
+
+    // Log the pre-fork LR value and surrounding stack frame
+    {
+        let pid_val = unsafe { libc::getpid() };
+        let libc_fork_sp = guest_sp + 0x10;
+        let saved_fp = unsafe { ((libc_fork_sp + 0xE0) as *const u64).read() };
+        // Read ExecFork's saved LR from its frame above __libc_fork's frame.
+        // ExecFork: stp x29, x30, [sp, #-64]! → ExecFork_SP = __libc_fork_SP + 0x140
+        // ExecFork's saved LR at [ExecFork_SP + 8] = [libc_fork_sp + 0x148]
+        let exec_fork_lr = unsafe { ((libc_fork_sp + 0x148) as *const u64).read() };
+        let mut buf = [0u8; 400];
+        let n = {
+            use std::io::Write;
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            let _ = c.write_fmt(format_args!(
+                "fakelinux: [{}] PRE_FORK_LR lr={:#x} fp={:#x} exec_fork_lr={:#x} guest_sp={:#x}\n",
+                pid_val, lr_before_macos_fork, saved_fp, exec_fork_lr, guest_sp));
+            c.position() as usize
+        };
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+
+        // If LR looks corrupted (not in code range 0x100000000-0x105000000), dump stack
+        if lr_before_macos_fork < 0x1_0000_0000 || lr_before_macos_fork > 0x1_0500_0000 {
+            // Dump 8 qwords around the corrupted LR slot for analysis
+            let mut buf2 = [0u8; 800];
+            let n2 = {
+                use std::io::Write;
+                let mut c = std::io::Cursor::new(&mut buf2[..]);
+                let _ = c.write_fmt(format_args!(
+                    "fakelinux: [{}] STACK_DUMP libc_fork_sp={:#x}:\n",
+                    pid_val, libc_fork_sp));
+                // Dump from sp+0x00 to sp+0x148 in 8-byte steps
+                for off in (0..=0x148u64).step_by(8) {
+                    let val = unsafe { ((libc_fork_sp + off) as *const u64).read() };
+                    let _ = c.write_fmt(format_args!(
+                        "  [sp+{:#04x}] = {:#018x}{}\n",
+                        off, val,
+                        match off {
+                            0xD8 => " (canary)",
+                            0xE0 => " (x29/FP)",
+                            0xE8 => " (x30/LR) *** CORRUPTED ***",
+                            0xF0 => " (x19)",
+                            0xF8 => " (x20)",
+                            0x100 => " (x21)",
+                            0x108 => " (x22)",
+                            0x130 => " (x27)",
+                            0x138 => " (x28)",
+                            0x140 => " (ExecFork x29)",
+                            0x148 => " (ExecFork x30/LR)",
+                            _ => "",
+                        }
+                    ));
+                }
+                c.position() as usize
+            };
+            unsafe { libc::write(2, buf2.as_ptr() as *const _, n2); }
+        }
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         // Restore CLOEXEC flags before returning error
@@ -514,6 +577,29 @@ extern "C" fn fork_trampoline_entry() -> ! {
         let current_canary = unsafe { (canary_addr as *const u64).read() };
         if current_canary != saved_canary {
             unsafe { (canary_addr as *mut u64).write(saved_canary); }
+        }
+
+        // Also check and restore __libc_fork's saved LR.
+        // Something corrupts [__libc_fork_sp+0xE8] to a heap address before fork.
+        let lr_after_macos_fork = unsafe { (lr_addr as *const u64).read() };
+        {
+            let pid_val = unsafe { libc::getpid() };
+            let mut buf = [0u8; 250];
+            let n = {
+                use std::io::Write;
+                let mut c = std::io::Cursor::new(&mut buf[..]);
+                let _ = c.write_fmt(format_args!(
+                    "fakelinux: [{}] POST_FORK_LR addr={:#x} before={:#x} after={:#x} match={}\n",
+                    pid_val, lr_addr, lr_before_macos_fork, lr_after_macos_fork,
+                    if lr_before_macos_fork == lr_after_macos_fork { 'Y' } else { 'N' }));
+                c.position() as usize
+            };
+            unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+        }
+        // If LR was corrupted, restore it to the pre-fork value.
+        // This is a WORKAROUND — the real fix is to find what corrupts it.
+        if lr_after_macos_fork != lr_before_macos_fork {
+            unsafe { (lr_addr as *mut u64).write(lr_before_macos_fork); }
         }
 
         // Probe pipe fds in child right after fork.
