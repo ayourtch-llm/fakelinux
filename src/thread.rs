@@ -615,6 +615,9 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Enable SVC tracing for first 10 SVCs in the fork child
         crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
         crate::trap::FORK_TRAP_COUNT.store(50, std::sync::atomic::Ordering::Relaxed);
+        // Store canary address/value for verification during FORK_TRAP logging
+        crate::trap::FORK_CANARY_ADDR.store(canary_addr, std::sync::atomic::Ordering::Relaxed);
+        crate::trap::FORK_CANARY_SAVED.store(saved_canary, std::sync::atomic::Ordering::Relaxed);
         // Child inherits the FAKELINUX_INIT_PID env var for execve.
     }
 

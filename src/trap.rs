@@ -15,6 +15,11 @@ pub static FORK_SVC_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 /// Gives a complete picture of every intercepted instruction.
 pub static FORK_TRAP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Debug: canary address and saved value from fork trampoline.
+/// Used to check if the stack canary gets corrupted during __libc_fork's child path.
+pub static FORK_CANARY_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static FORK_CANARY_SAVED: AtomicU64 = AtomicU64::new(0);
+
 /// Diagnostic: the x18 instruction currently being emulated (for crash dumps).
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
@@ -1205,8 +1210,8 @@ unsafe extern "C" fn trap_handler(
                     let pid = libc::getpid();
                     let mut buf = [0u8; 160];
                     let n = raw_fmt(&mut buf, format_args!(
-                        "fakelinux: [{}] FORK_TRAP#{} MSR pc={:#x} x{}={:#x} x0={:#x} x19={:#x}\n",
-                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19]
+                        "fakelinux: [{}] FORK_TRAP#{} MSR pc={:#x} x{}={:#x} x0={:#x} x19={:#x} sp={:#x}\n",
+                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.sp
                     ));
                     libc::write(2, buf.as_ptr() as *const _, n);
                 }
@@ -1225,8 +1230,8 @@ unsafe extern "C" fn trap_handler(
                     let pid = libc::getpid();
                     let mut buf = [0u8; 160];
                     let n = raw_fmt(&mut buf, format_args!(
-                        "fakelinux: [{}] FORK_TRAP#{} MRS pc={:#x} x{}={:#x} x0={:#x} x19={:#x}\n",
-                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19]
+                        "fakelinux: [{}] FORK_TRAP#{} MRS pc={:#x} x{}={:#x} x0={:#x} x19={:#x} sp={:#x}\n",
+                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.sp
                     ));
                     libc::write(2, buf.as_ptr() as *const _, n);
                 }
@@ -1283,16 +1288,21 @@ unsafe extern "C" fn trap_handler(
         // Not in patch table → this was a SVC #0
         let nr = mctx.ss.x[8];
 
-        // FORK_TRAP logging for SVC
+        // FORK_TRAP logging for SVC (with canary check)
         {
             let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
             if tcnt > 0 {
                 FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
                 let pid = libc::getpid();
-                let mut buf = [0u8; 160];
+                // Check canary
+                let caddr = FORK_CANARY_ADDR.load(Ordering::Relaxed);
+                let csaved = FORK_CANARY_SAVED.load(Ordering::Relaxed);
+                let ccurrent = if caddr != 0 { (caddr as *const u64).read() } else { csaved };
+                let canary_ok = if ccurrent == csaved { 'Y' } else { 'N' };
+                let mut buf = [0u8; 240];
                 let n = raw_fmt(&mut buf, format_args!(
-                    "fakelinux: [{}] FORK_TRAP#{} SVC pc={:#x} nr={} x0={:#x} x19={:#x} lr={:#x}\n",
-                    pid, 50 - tcnt, pc, nr, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.lr
+                    "fakelinux: [{}] FORK_TRAP#{} SVC pc={:#x} nr={} x0={:#x} x19={:#x} lr={:#x} sp={:#x} canary={}\n",
+                    pid, 50 - tcnt, pc, nr, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.lr, mctx.ss.sp, canary_ok
                 ));
                 libc::write(2, buf.as_ptr() as *const _, n);
             }
