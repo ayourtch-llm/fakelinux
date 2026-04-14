@@ -384,9 +384,17 @@ pub fn references_x18(instr: u32) -> bool {
                             | 0x5e | 0x7e | 0x5f | 0x7f);  // AdvSIMD scalar
     if is_simd_fp { return false; }
 
+    // Load/store fallback: check Rn and Rm for x18 in load/store instructions.
+    // Must distinguish load/store from data-processing instructions that share
+    // the same bits[28:27] values:
+    //   bits[28:27]=11 + bit[25]=1 → load/store single register
+    //   bits[28:27]=01 + bit[25]=0 → LDP/STP pair
+    // Data-processing (shifted register) has bit[25]=1 with bits[28:27]=01,
+    // so we must check bit[25] to distinguish.
     let bits28_27 = (instr >> 27) & 3;
-    let is_ldst_single = bits28_27 == 3; // bits[28:27]=11
-    let is_ldst_pair = bits28_27 == 1;   // bits[28:27]=01 (LDP/STP)
+    let bit25 = (instr >> 25) & 1;
+    let is_ldst_single = bits28_27 == 3 && bit25 == 1; // bits[28:25]=111x
+    let is_ldst_pair = bits28_27 == 1 && bit25 == 0;   // bits[28:25]=010x (LDP/STP)
     if is_ldst_single || is_ldst_pair {
         // Rn (base register, bits[9:5]) is always a GPR
         let rn = (instr >> 5) & 0x1F;
@@ -395,6 +403,15 @@ pub fn references_x18(instr: u32) -> bool {
     // For single-register load/store with register offset:
     // bits[28:27]=11, bit[24]=0, bit[21]=1 → Rm at bits[20:16]
     if is_ldst_single && (instr >> 24) & 1 == 0 && (instr >> 21) & 1 == 1 {
+        let rm = (instr >> 16) & 0x1F;
+        if rm == 18 { return true; }
+    }
+
+    // Fallback for data-processing (register) instructions not caught by disarm64:
+    // ADD/SUB shifted register, Logical shifted register — Rm at bits[20:16]
+    let bits28_25 = (instr >> 25) & 0xF;
+    if bits28_25 == 0b0101 || bits28_25 == 0b1101 {
+        // Data processing (register) group: check Rm at bits[20:16]
         let rm = (instr >> 16) & 0x1F;
         if rm == 18 { return true; }
     }
@@ -658,7 +675,11 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
                 if sf == 1 { ((a as i64) >> (b % 64)) as u64 }
                 else { (((a as i32) >> (b % 32)) as u32) as u64 }
             },
-            11 => a.rotate_right((b % bits as u64) as u32),  // RORV
+            11 => {                          // RORV
+                let shift = (b % bits as u64) as u32;
+                if sf == 1 { a.rotate_right(shift) }
+                else { (a as u32).rotate_right(shift) as u64 }
+            }
             _ => return false,
         };
         let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
@@ -1125,7 +1146,10 @@ fn apply_shift(val: u64, shift_type: u32, amount: u32, bits: u32) -> u64 {
             if bits == 64 { ((val as i64) >> amount) as u64 }
             else { (((val as i32) >> amount) as u32) as u64 }
         }
-        3 => val.rotate_right(amount),               // ROR
+        3 => {                                       // ROR
+            if bits == 64 { val.rotate_right(amount) }
+            else { (val as u32).rotate_right(amount) as u64 }
+        }
         _ => val,
     }
 }

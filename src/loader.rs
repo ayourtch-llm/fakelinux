@@ -395,6 +395,10 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     let have_code_ranges = !code_ranges.is_empty();
     let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok()
         || std::env::var("FAKELINUX_NO_X18_INITIAL").is_ok();
+    // For bisecting: FAKELINUX_X18_MAX_OFFSET limits x18 patching to offsets below this value
+    let x18_max_offset: u64 = std::env::var("FAKELINUX_X18_MAX_OFFSET")
+        .ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(u64::MAX);
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -412,9 +416,11 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
                 tpidr_patched += 1;
             } else if !skip_x18 && trap::references_x18(instr) {
                 let pc_addr = base.add(i) as u64;
+                let offset = (i as u64) * 4;
                 // Only patch x18 in actual code sections — data in the same segment
                 // (e.g. .dynstr, .rodata) could match x18 patterns and must not be corrupted.
-                if !have_code_ranges || addr_in_code_ranges(pc_addr, code_ranges) {
+                if (!have_code_ranges || addr_in_code_ranges(pc_addr, code_ranges))
+                    && offset < x18_max_offset {
                     add_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
                     x18_patched += 1;
