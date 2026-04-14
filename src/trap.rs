@@ -20,6 +20,17 @@ pub static FORK_TRAP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 pub static FORK_CANARY_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static FORK_CANARY_SAVED: AtomicU64 = AtomicU64::new(0);
 
+/// Debug: address of __libc_fork's `mov w0, w19` instruction (offset c1d28 in libc).
+/// When set, we patch it to UDF to intercept __libc_fork's return and log w19.
+pub static FORK_RETURN_PROBE: AtomicU64 = AtomicU64::new(0);
+/// The original instruction at FORK_RETURN_PROBE (to restore after intercepting).
+pub static FORK_RETURN_PROBE_ORIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Debug: address of __libc_fork's saved LR on the stack ([sp+0xE0]).
+/// Monitored at each FORK_TRAP to detect when it gets corrupted.
+pub static FORK_LR_WATCH_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static FORK_LR_WATCH_EXPECTED: AtomicU64 = AtomicU64::new(0);
+
 /// Diagnostic: the x18 instruction currently being emulated (for crash dumps).
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
@@ -1190,6 +1201,58 @@ unsafe extern "C" fn trap_handler(
     let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
 
+    // Check if this is our __libc_fork return probe
+    let probe_addr = FORK_RETURN_PROBE.load(Ordering::Relaxed);
+    if probe_addr != 0 && pc == probe_addr {
+        // We hit the probe! Log x19 (which becomes w0 via `mov w0, w19`)
+        let pid = libc::getpid();
+        let w19 = mctx.ss.x[19];
+        let x0 = mctx.ss.x[0];
+        let sp = mctx.ss.sp;
+        let lr = mctx.ss.lr;
+
+        // FIX: Check if the saved LR on __libc_fork's stack was corrupted.
+        // glibc's __libc_fork child path may temporarily use the LR save slot
+        // on the stack for thread-list cleanup. If malloc or atfork handlers
+        // corrupt this slot, __libc_fork would return to a garbage address.
+        // Restore it from our saved expected value.
+        let lw_addr = FORK_LR_WATCH_ADDR.load(Ordering::Relaxed);
+        let lw_exp = FORK_LR_WATCH_EXPECTED.load(Ordering::Relaxed);
+        if lw_addr != 0 {
+            let lw_cur = (lw_addr as *const u64).read();
+            if lw_cur != lw_exp {
+                // LR was corrupted! Restore it.
+                (lw_addr as *mut u64).write(lw_exp);
+                let mut buf = [0u8; 240];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] FORK_RETURN_PROBE FIX_LR! x19={:#x} corrupted_lr={:#x} restored_lr={:#x}\n",
+                    pid, w19, lw_cur, lw_exp
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            } else {
+                let mut buf = [0u8; 200];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] FORK_RETURN_PROBE x19={:#x} x0={:#x} sp={:#x} lr={:#x}\n",
+                    pid, w19, x0, sp, lr
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
+
+        // Restore original instruction and re-execute
+        let orig = FORK_RETURN_PROBE_ORIG.load(Ordering::Relaxed);
+        let page = probe_addr & !0x3FFF;
+        libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+        (probe_addr as *mut u32).write(orig);
+        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+        sys_icache_invalidate(probe_addr as *mut _, 4);
+        libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+        FORK_RETURN_PROBE.store(0, Ordering::Relaxed);
+        // Don't advance PC — re-execute the restored instruction
+        IN_TRAP.store(false, Ordering::SeqCst);
+        return;
+    }
+
     // For UDF_MARKER, check if this was originally a TPIDR access or a SVC
     if instr == UDF_MARKER {
         // Look up the original instruction in the patch table
@@ -1223,12 +1286,24 @@ unsafe extern "C" fn trap_handler(
                 let val = get_thread_tpidr();
                 write_gpr(&mut mctx.ss, rn, val);
                 mctx.ss.pc = pc + 4;
-                // FORK_TRAP logging for MRS
+                // FORK_TRAP logging for MRS (with LR watch)
                 let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
                 if tcnt > 0 {
                     FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
                     let pid = libc::getpid();
-                    let mut buf = [0u8; 160];
+                    // Check LR watch for corruption
+                    let lw_addr = FORK_LR_WATCH_ADDR.load(Ordering::Relaxed);
+                    let lw_exp = FORK_LR_WATCH_EXPECTED.load(Ordering::Relaxed);
+                    let lw_cur = if lw_addr != 0 { (lw_addr as *const u64).read() } else { lw_exp };
+                    if lw_cur != lw_exp && lw_addr != 0 {
+                        let mut buf = [0u8; 200];
+                        let n = raw_fmt(&mut buf, format_args!(
+                            "fakelinux: [{}] FORK_TRAP#{} LR_CORRUPTED! pc={:#x} expected={:#x} got={:#x}\n",
+                            pid, 50 - tcnt, pc, lw_exp, lw_cur
+                        ));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
+                    let mut buf = [0u8; 180];
                     let n = raw_fmt(&mut buf, format_args!(
                         "fakelinux: [{}] FORK_TRAP#{} MRS pc={:#x} x{}={:#x} x0={:#x} x19={:#x} sp={:#x}\n",
                         pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.sp

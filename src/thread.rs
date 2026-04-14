@@ -618,6 +618,50 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Store canary address/value for verification during FORK_TRAP logging
         crate::trap::FORK_CANARY_ADDR.store(canary_addr, std::sync::atomic::Ordering::Relaxed);
         crate::trap::FORK_CANARY_SAVED.store(saved_canary, std::sync::atomic::Ordering::Relaxed);
+
+        // Watch __libc_fork's saved LR on the stack to detect corruption.
+        // __libc_fork_sp = guest_sp + 0x10. stp x29,x30,[sp,#224] puts x30 at sp+232=sp+0xE8.
+        let lr_watch_addr = guest_sp + 0x10 + 0xE8;
+        // Read the LR BEFORE fork — this is the correct parent value
+        let lr_before_fork = unsafe { (lr_watch_addr as *const u64).read() };
+        // Read LR again AFTER fork — if macOS fork corrupted it, this will differ
+        let lr_after_fork = unsafe { (lr_watch_addr as *const u64).read() };
+        if lr_after_fork != lr_before_fork {
+            let pid_val = unsafe { libc::getpid() };
+            let mut buf = [0u8; 200];
+            let n = {
+                use std::io::Write;
+                let mut c = std::io::Cursor::new(&mut buf[..]);
+                let _ = c.write_fmt(format_args!(
+                    "fakelinux: [{}] LR_CORRUPT_AT_FORK! before={:#x} after={:#x} addr={:#x}\n",
+                    pid_val, lr_before_fork, lr_after_fork, lr_watch_addr));
+                c.position() as usize
+            };
+            unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+            // RESTORE the LR to the correct value
+            unsafe { (lr_watch_addr as *mut u64).write(lr_before_fork); }
+        }
+        crate::trap::FORK_LR_WATCH_ADDR.store(lr_watch_addr, std::sync::atomic::Ordering::Relaxed);
+        crate::trap::FORK_LR_WATCH_EXPECTED.store(lr_before_fork, std::sync::atomic::Ordering::Relaxed);
+
+        // Compute libc base from the set_robust_list SVC PC (known offset 0xBD510).
+        // Patch __libc_fork's `mov w0, w19` at offset 0xC1D28 to UDF to intercept the return.
+        let resume_pc = FORK.get_saved_pc(); // instruction after clone SVC = libc+0xBD4EC
+        let libc_base = resume_pc - 0xBD4EC;
+        let probe_addr = libc_base + 0xC1D28;
+        unsafe {
+            // Read original instruction
+            let orig = (probe_addr as *const u32).read();
+            crate::trap::FORK_RETURN_PROBE_ORIG.store(orig, std::sync::atomic::Ordering::Relaxed);
+            // Make the page writable, patch, flush icache, restore protection
+            let page = probe_addr & !0x3FFF; // 16KB page alignment
+            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+            (probe_addr as *mut u32).write(crate::trap::UDF_MARKER);
+            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+            sys_icache_invalidate(probe_addr as *mut _, 4);
+            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+            crate::trap::FORK_RETURN_PROBE.store(probe_addr, std::sync::atomic::Ordering::Relaxed);
+        }
         // Child inherits the FAKELINUX_INIT_PID env var for execve.
     }
 
