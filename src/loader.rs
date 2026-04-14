@@ -455,12 +455,6 @@ pub fn patch_new_code(start: u64, len: u64) {
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
-            // DEBUG: check if offset 0xB7EE4 has unexpected content
-            let offset = (i as u64) * 4;
-            if offset == 0xB7EE4 {
-                eprintln!("fakelinux: OFFSET_CHECK 0xB7EE4 at {:#x}: instr={:#010x} (expected 0x1400000F)",
-                    base.add(i) as u64, instr);
-            }
             if instr == trap::SVC_0 {
                 base.add(i).write(trap::UDF_MARKER);
                 svc_patched += 1;
@@ -476,8 +470,6 @@ pub fn patch_new_code(start: u64, len: u64) {
                 // symbol tables, etc.). Only patch if we have confirmed code ranges.
                 // SVC/TPIDR patterns are specific enough to scan everything safely.
                 if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges) {
-                    let offset = pc_addr - start;
-                    eprintln!("fakelinux:   x18 patch at {:#x} (offset {:#x}) instr={:#010x}", pc_addr, offset, instr);
                     add_runtime_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
                     x18_patched += 1;
@@ -493,21 +485,6 @@ pub fn patch_new_code(start: u64, len: u64) {
             start, len, svc_patched, tpidr_patched, x18_patched,
             if x18_skipped > 0 { format!(" ({} x18 skipped, no code ranges)", x18_skipped) } else { String::new() }
         );
-    }
-
-    // Detect libapt-pkg and set up B instruction watch.
-    // libapt-pkg is identified by its BL fork@plt encoding at offset 0xB77D8.
-    if len > 0xB7EE8 {
-        unsafe {
-            let bl_fork = (start as *const u8).add(0xB77D8) as *const u32;
-            if bl_fork.read() == 0x97FE0E22 {
-                let watch_addr = start + 0xB7EE4;
-                let cur = (watch_addr as *const u32).read();
-                eprintln!("fakelinux: libapt-pkg detected at {:#x}, B@{:#x}={:#010x}", start, watch_addr, cur);
-                trap::LIBAPT_B_WATCH.store(watch_addr, std::sync::atomic::Ordering::Relaxed);
-                trap::LIBAPT_B_REPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
     }
 
     // Set up FORK_ENTRY_PROBE: patch __libc_fork's FIRST instruction `sub sp, sp, #0x140`
