@@ -514,25 +514,10 @@ pub fn patch_new_code(start: u64, len: u64) {
     // at offset 0xC1B50 to UDF. This fires at __libc_fork entry, allowing us to check
     // if x30 (LR) is already corrupted when the function is entered.
     // Detect libc by high SVC count (>400) — only libc has hundreds of SVCs.
-    if svc_patched > 400 {
-        let probe_offset = 0xC1B50u64;
-        if probe_offset + 4 <= len {
-            unsafe {
-                let probe_addr = start + probe_offset;
-                let orig_instr = (probe_addr as *const u32).read();
-                // Verify it's the expected instruction: sub sp, sp, #0x140 = 0xD10503FF
-                if orig_instr == 0xD10503FF {
-                    trap::FORK_ENTRY_PROBE_ORIG.store(orig_instr, std::sync::atomic::Ordering::Relaxed);
-                    trap::FORK_ENTRY_PROBE.store(probe_addr, std::sync::atomic::Ordering::Relaxed);
-                    trap::FORK_ENTRY_PROBE_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
-                    (probe_addr as *mut u32).write(trap::UDF_MARKER);
-                    eprintln!("fakelinux: FORK_ENTRY_PROBE set at {:#x} (libc base {:#x})", probe_addr, start);
-                } else {
-                    eprintln!("fakelinux: FORK_ENTRY_PROBE: unexpected instr {:#x} at {:#x}", orig_instr, probe_addr);
-                }
-            }
-        }
-    }
+    // NOTE: FORK_ENTRY_PROBE removed. Investigation showed that x30=0x5000xxxx at
+    // __libc_fork entry is NOT corruption — the 0x5000xxxx range is the guest binary's
+    // text segment (loaded below brk). The probe was incorrectly "fixing" correct LRs
+    // to wrong libapt-pkg addresses, CAUSING the fork child to run wrong code.
 }
 
 /// Try to extract code ranges from ELF headers in mapped memory.

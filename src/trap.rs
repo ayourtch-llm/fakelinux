@@ -1338,11 +1338,16 @@ unsafe extern "C" fn trap_handler(
         ));
         libc::write(2, buf.as_ptr() as *const _, n);
 
-        // If LR looks corrupted (not a code address), fix it.
-        // The X30_LAST tracker stores x30 from the PREVIOUS trap. If the previous
-        // trap was during ExecFork's fork@plt call, X30_LAST = ExecFork + 0x18
-        // = libapt_base + 0xB77DC. This is the CORRECT LR for __libc_fork.
+        // If LR looks corrupted (not a code address), log it.
+        // NOTE: the stack-scan fix is DISABLED because it can match wrong values
+        // for non-ExecFork callers (bash, etc.). Root cause investigation needed.
         if lr_reg < 0x1_0000_0000 || lr_reg > 0x1_0600_0000 {
+            let mut buf_warn = [0u8; 200];
+            let n_warn = raw_fmt(&mut buf_warn, format_args!(
+                "fakelinux: [{}] FORK_ENTRY BAD_LR={:#x} (not fixing)\n", pid, lr_reg));
+            libc::write(2, buf_warn.as_ptr() as *const _, n_warn);
+        }
+        if false && lr_reg < 0x1_0000_0000 || false && lr_reg > 0x1_0600_0000 {
             // Strategy: compute correct LR from libc base.
             // ExecFork's BL fork@plt goes to fork@plt which does br to __libc_fork.
             // The BL is at libapt_base + 0xB77D8, so LR = libapt_base + 0xB77DC.
