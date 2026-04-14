@@ -1638,7 +1638,46 @@ unsafe extern "C" fn trap_handler(
             mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];
 
+        // Stack corruption detector: check if the syscall writes to guest memory
+        // that it shouldn't. We check a region 2KB-3KB above SP, which should be
+        // well beyond any function's local stack frame and firmly in caller/grandcaller
+        // saved-register territory. Only active in the gpgv method process (detected
+        // by LIBAPT_B_WATCH being set — that means we loaded libapt-pkg).
+        let guest_sp = mctx.ss.sp;
+        const N_CANARIES: usize = 16;
+        let mut stack_canaries = [0u64; N_CANARIES];
+        let do_canary = LIBAPT_B_WATCH.load(Ordering::Relaxed) != 0;
+        let canary_base = guest_sp + 0x4C0; // just above ld-linux's 0x340-byte ELF read buffer
+        if do_canary {
+            for j in 0..N_CANARIES {
+                stack_canaries[j] = ((canary_base + (j as u64) * 8) as *const u64).read();
+            }
+        }
+
         let result = syscall::emulate(nr, &args, mctx);
+
+        // Check if the syscall corrupted the stack far above SP
+        if do_canary {
+            static STACK_CORRUPT_REPORTED: AtomicBool = AtomicBool::new(false);
+            if !STACK_CORRUPT_REPORTED.load(Ordering::Relaxed) {
+                for j in 0..N_CANARIES {
+                    let addr = canary_base + (j as u64) * 8;
+                    let cur = (addr as *const u64).read();
+                    if cur != stack_canaries[j] {
+                        STACK_CORRUPT_REPORTED.store(true, Ordering::Relaxed);
+                        let pid = libc::getpid();
+                        let mut buf = [0u8; 400];
+                        let n = raw_fmt(&mut buf, format_args!(
+                            "fakelinux: [{}] SYSCALL_STACK_CORRUPT! nr={} pc={:#x} sp={:#x} offset=+{:#x} was={:#x} now={:#x} args=({:#x},{:#x},{:#x})\n",
+                            pid, nr, pc, guest_sp, (j as u64) * 8 + 0x4C0,
+                            stack_canaries[j], cur, args[0], args[1], args[2]
+                        ));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                        break;
+                    }
+                }
+            }
+        }
 
         // Check if any trampoline was requested (fork, patch, etc.)
         if crate::trampoline::check_and_redirect(mctx, uctx, result, pc + 4) {
