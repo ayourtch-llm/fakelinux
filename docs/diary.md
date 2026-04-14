@@ -168,6 +168,14 @@ If you see `SIGILL at pc=... instr=...`, check:
   Mach-O fallback, setpgid EACCES, xattr stubs, realpath). Detailed root cause
   analysis and debugging techniques for each.
 
+- [2026-04-14: Fork child investigation & PID simplification](session-2026-04-14.md)
+  — Container PID namespace simplified (only PID 1 virtual). TLS/stack overlap
+  theory DISPROVED (canary always intact). **ROOT CAUSE FOUND**: gpgv method
+  process has corrupted saved LR on stack (heap address 0x50000bxxx instead of
+  code address) BEFORE __libc_fork is called. __libc_fork returns to garbage,
+  child runs parent code. Investigation ongoing: what corrupts the gpgv method's
+  stack before fork.
+
 ## Recent Fixes
 
 ### fcntl F_GETFL/F_SETFL Flag Translation (2024-04-12)
