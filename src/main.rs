@@ -16,7 +16,7 @@ mod trampoline;
 mod trap;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
 
     // Parse --container flag (must come before the ELF path)
     let mut container_mode = false;
@@ -81,7 +81,17 @@ fn main() {
     }
     rootfs::init(&rootfs, &sysroot);
     syscall::init_sysroot(&sysroot);
-    procfs::init(elf_path);
+
+    // Strip rootfs prefix from the binary path so the guest sees guest paths
+    // (e.g., "/Users/.../ubuntu-rootfs/bin/dash" → "/bin/dash").
+    // The ELF file has already been read above using the original host path.
+    if rootfs::in_full_rootfs_mode() {
+        if let Some(guest_path) = rootfs::strip_root_prefix(args[guest_arg_start].as_bytes()) {
+            args[guest_arg_start] = String::from_utf8_lossy(&guest_path).to_string();
+        }
+    }
+
+    procfs::init(&args[guest_arg_start]);
 
     // Initialize per-thread pthread keys before anything else
     trap::init_tpidr_key();

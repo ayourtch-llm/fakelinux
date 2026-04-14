@@ -1469,9 +1469,12 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     };
 
                     // Build new argv: fakelinux <interpreter> [interp_arg] <script_path> <original_args...>
+                    // Use the original GUEST path for the script, not the host-translated path.
+                    // The interpreter (dash) will open this path, and fakelinux's openat will
+                    // translate it through rootfs. Using the host path would cause double-translation.
                     let self_exe = std::env::current_exe().unwrap_or_default();
                     let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap_or("fakelinux")).unwrap();
-                    let script_path_c = std::ffi::CString::new(check_str).unwrap_or_default();
+                    let script_path_c = std::ffi::CString::new(path_bytes).unwrap_or_default();
                     let interp_arg_c = interp_arg.map(|a| std::ffi::CString::new(a).unwrap_or_default());
 
                     let mut shebang_argv: Vec<*const i8> = Vec::new();
