@@ -257,7 +257,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let (eff_path, _hold) = effective_path_ptr(args[0]);
             let ret = unsafe { libc::chdir(eff_path) };
             if ret == 0 { 0 }
-            else if _hold.is_some() {
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::chdir(args[0] as *const i8) };
                 if ret2 < 0 { translate::linux_errno() } else { 0 }
             } else { translate::linux_errno() }
@@ -270,7 +270,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
             let ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
             if ret == 0 { 0 }
-            else if _hold.is_some() {
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
                 if ret2 < 0 { translate::linux_errno() } else { 0 }
             } else { translate::linux_errno() }
@@ -280,7 +280,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
             let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), eff_path, mac_flags) };
             if ret == 0 { 0 }
-            else if _hold.is_some() {
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, mac_flags) };
                 if ret2 < 0 { translate::linux_errno() } else { 0 }
             } else { translate::linux_errno() }
@@ -308,7 +308,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let mac_flags = (args[3] as i32) & !0x100;
             let ret = unsafe { libc::fchmodat(mac_dirfd, eff_path, args[2] as libc::mode_t, mac_flags) };
             if ret == 0 { 0 }
-            else if _hold.is_some() {
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::fchmodat(mac_dirfd, args[1] as *const i8, args[2] as libc::mode_t, mac_flags) };
                 if ret2 == 0 { 0 }
                 // Virtual root: silently succeed if real op fails with EPERM/ENOENT
@@ -331,7 +331,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let mac_dirfd = translate::translate_dirfd(args[0] as i32);
             let ret = unsafe { libc::fchownat(mac_dirfd, eff_path, args[2] as u32, args[3] as u32, args[4] as i32) };
             if ret == 0 { 0 }
-            else if _hold.is_some() {
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::fchownat(mac_dirfd, args[1] as *const i8, args[2] as u32, args[3] as u32, args[4] as i32) };
                 if ret2 == 0 { 0 }
                 else if creds::do_geteuid() == 0 { 0 }
@@ -628,7 +628,8 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     }
 
     // If translation was applied and the translated path failed, try the original
-    if _hold.is_some() {
+    // ONLY in SYSROOT-only mode. In full FAKELINUX_ROOT mode, never fall back to host.
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let ret2 = unsafe { libc::openat(mac_dirfd, pathname as *const i8, mac_flags, mode) };
         if ret2 >= 0 {
             return ret2 as u64;
@@ -738,8 +739,8 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
         }
     }
 
-    // If translation was applied and failed, try original path
-    if _hold.is_some() {
+    // If translation was applied and failed, try original path (SYSROOT-only mode)
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         unsafe {
             let mut mac_stat: libc::stat = std::mem::zeroed();
             let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
@@ -1165,8 +1166,8 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
             return 0;
         }
     }
-    // Fallback to original path if translated path failed
-    if _hold.is_some() {
+    // Fallback to original path if translated path failed (SYSROOT-only mode)
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         unsafe {
             let mut mac_stat: libc::stat = std::mem::zeroed();
             let ret = libc::fstatat(mac_dirfd, pathname as *const i8, &mut mac_stat, mac_flags);
@@ -1185,8 +1186,8 @@ fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) ->
     let (eff_path, _hold) = effective_path_ptr(pathname);
     let ret = unsafe { libc::faccessat(mac_dirfd, eff_path, mode, mac_flags) };
     if ret == 0 { return 0; }
-    // Fallback to original if translated path failed
-    if _hold.is_some() {
+    // Fallback to original if translated path failed (SYSROOT-only mode)
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let ret2 = unsafe { libc::faccessat(mac_dirfd, pathname as *const i8, mode, mac_flags) };
         if ret2 == 0 { return 0; }
     }
@@ -1223,7 +1224,8 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
     // gave ENOENT — NOT for EINVAL (which means "exists but not a symlink").
     // Without this check, readlinkat("/var") on the HOST returns macOS's
     // /var → /private/var symlink, breaking glibc's realpath().
-    if _hold.is_some() {
+    // In full FAKELINUX_ROOT mode, never fall back to host.
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let errno = unsafe { *libc::__error() };
         if errno == libc::ENOENT {
             let ret2 = unsafe {
@@ -1363,12 +1365,28 @@ fn do_getdents64(fd: i32, buf: u64, bufsize: u64) -> u64 {
 fn do_getcwd(buf: u64, size: u64) -> u64 {
     let ret = unsafe { libc::getcwd(buf as *mut i8, size as usize) };
     if ret.is_null() {
-        translate::linux_errno()
-    } else {
-        // Linux getcwd returns the length including null terminator
-        let len = unsafe { std::ffi::CStr::from_ptr(ret).to_bytes_with_nul().len() };
-        len as u64
+        return translate::linux_errno();
     }
+    let cwd = unsafe { std::ffi::CStr::from_ptr(ret).to_bytes() };
+
+    // In full rootfs mode, strip the rootfs prefix so the guest sees
+    // "/var/lib/apt" instead of "/Users/foo/ubuntu-rootfs/var/lib/apt"
+    if let Some(guest_path) = rootfs::strip_root_prefix(cwd) {
+        let needed = guest_path.len() + 1; // +1 for null terminator
+        if needed > size as usize {
+            // ERANGE
+            return (-34_i64) as u64;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(guest_path.as_ptr(), buf as *mut u8, guest_path.len());
+            *((buf as *mut u8).add(guest_path.len())) = 0;
+        }
+        return needed as u64;
+    }
+
+    // Linux getcwd returns the length including null terminator
+    let len = cwd.len() + 1;
+    len as u64
 }
 
 fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
@@ -2204,8 +2222,8 @@ fn do_statfs(pathname: u64, buf: u64) -> u64 {
             return 0;
         }
     }
-    // Fallback to original path if translation failed
-    if _hold.is_some() {
+    // Fallback to original path if translation failed (SYSROOT-only mode)
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         unsafe {
             let mut mac_statfs: libc::statfs = std::mem::zeroed();
             let ret = libc::statfs(pathname as *const i8, &mut mac_statfs);
@@ -2349,7 +2367,7 @@ fn do_symlinkat(target: u64, newdirfd: i32, linkpath: u64) -> u64 {
     let ret = unsafe { libc::symlinkat(target_ptr, dirfd, eff_path) };
     if ret == 0 {
         0
-    } else if _hold.is_some() {
+    } else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let ret2 = unsafe { libc::symlinkat(target_ptr, dirfd, linkpath as *const libc::c_char) };
         if ret2 < 0 { translate::linux_errno() } else { 0 }
     } else {
@@ -2412,7 +2430,7 @@ fn do_utimensat(dirfd: i32, pathname: u64, times_ptr: u64, flags: i32) -> u64 {
         // NULL times = set both to now; use utimes with NULL
         let ret = unsafe { libc::utimes(eff_path, std::ptr::null()) };
         if ret == 0 { return 0; }
-        if _hold.is_some() {
+        if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
             let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, std::ptr::null()) };
             if ret2 < 0 { return translate::linux_errno(); }
             return 0;
@@ -2476,7 +2494,7 @@ fn do_utimensat(dirfd: i32, pathname: u64, times_ptr: u64, flags: i32) -> u64 {
 
     let ret = unsafe { libc::utimes(eff_path, tv.as_ptr()) };
     if ret == 0 { return 0; }
-    if _hold.is_some() {
+    if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, tv.as_ptr()) };
         if ret2 < 0 { return translate::linux_errno(); }
         return 0;

@@ -19,6 +19,12 @@ pub fn get_root() -> Option<&'static str> {
     ROOT.get().map(|s| s.as_str())
 }
 
+/// Returns true when FAKELINUX_ROOT is set — full rootfs isolation mode.
+/// In this mode, guest filesystem access must NEVER fall back to the host.
+pub fn in_full_rootfs_mode() -> bool {
+    ROOT.get().map(|s| !s.is_empty()).unwrap_or(false)
+}
+
 /// Initialize the rootfs from environment variables.
 /// FAKELINUX_ROOT takes precedence over FAKELINUX_SYSROOT for full path translation.
 pub fn init(root: &str, sysroot: &str) {
@@ -243,4 +249,83 @@ fn is_library_path(path: &[u8]) -> bool {
         || path.starts_with(b"/usr/lib64/")
         || path.starts_with(b"/etc/ld.so.cache")
         || path.starts_with(b"/etc/ld.so.conf")
+}
+
+/// Strip the rootfs prefix from an absolute host path, returning the guest path.
+/// E.g., with root="/home/user/rootfs", "/home/user/rootfs/var/lib" → "/var/lib".
+/// Returns None if the path doesn't start with the rootfs prefix.
+pub fn strip_root_prefix(host_path: &[u8]) -> Option<Vec<u8>> {
+    let root = ROOT.get()?;
+    if root.is_empty() {
+        return None;
+    }
+    let root_bytes = root.as_bytes();
+    if host_path.starts_with(root_bytes) {
+        let rest = &host_path[root_bytes.len()..];
+        if rest.is_empty() {
+            // Path is exactly the root → guest "/"
+            Some(b"/".to_vec())
+        } else if rest[0] == b'/' {
+            Some(rest.to_vec())
+        } else {
+            // Root prefix doesn't end at a path boundary
+            None
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note: These tests use the module-level OnceLock statics, so they can only
+    // set ROOT/SYSROOT once across all tests in this module. We test the pure
+    // functions (is_library_path, strip_root_prefix logic) independently.
+
+    #[test]
+    fn test_is_library_path() {
+        assert!(is_library_path(b"/lib/x86_64-linux-gnu/libc.so.6"));
+        assert!(is_library_path(b"/usr/lib/aarch64-linux-gnu/libz.so"));
+        assert!(is_library_path(b"/etc/ld.so.cache"));
+        assert!(is_library_path(b"/etc/ld.so.conf"));
+        assert!(!is_library_path(b"/etc/resolv.conf"));
+        assert!(!is_library_path(b"/usr/bin/bash"));
+        assert!(!is_library_path(b"/var/lib/dpkg/status"));
+    }
+
+    #[test]
+    fn test_translate_path_skips_special_dirs() {
+        // /proc, /dev, /tmp should never be translated regardless of mode
+        assert!(translate_path(b"/proc/self/exe").is_none());
+        assert!(translate_path(b"/dev/null").is_none());
+        assert!(translate_path(b"/tmp/foo").is_none());
+    }
+
+    #[test]
+    fn test_translate_path_skips_relative() {
+        // Relative paths should never be translated
+        assert!(translate_path(b"foo/bar").is_none());
+        assert!(translate_path(b"./foo").is_none());
+    }
+
+    #[test]
+    fn test_strip_root_prefix_logic() {
+        // Test the prefix-stripping logic directly (without OnceLock)
+        let root = b"/home/user/rootfs";
+        let path = b"/home/user/rootfs/var/lib/apt";
+        assert!(path.starts_with(root.as_slice()));
+        let rest = &path[root.len()..];
+        assert_eq!(rest, b"/var/lib/apt");
+
+        // Path that is exactly the root
+        let path2 = b"/home/user/rootfs";
+        let rest2 = &path2[root.len()..];
+        assert!(rest2.is_empty());
+
+        // Path that doesn't match
+        let path3 = b"/other/path/var/lib";
+        assert!(!path3.starts_with(root.as_slice()));
+    }
 }
