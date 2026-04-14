@@ -428,19 +428,13 @@ fn do_fork(flags: u64, child_tid_ptr: u64) -> u64 {
 /// Runs outside signal context. Does the actual fork, sets x0 to the pid,
 /// restores guest registers, and jumps back to guest code.
 extern "C" fn fork_trampoline_entry() -> ! {
-    // In container mode, pre-allocate a vpid for the child and set env vars
-    // BEFORE fork so the child inherits them. We'll register the real PID
-    // and restore parent env after fork returns.
+    // In container mode, set the FAKELINUX_INIT_PID env var before fork so
+    // the child inherits it. In the simplified scheme vpid == real PID for
+    // all non-init processes, so no pre-allocation is needed.
     let container = crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed);
-    let child_vpid = if container {
-        // Allocate vpid with placeholder real_pid=0 (will be filled after fork)
-        let parent_vpid = crate::pidns::current_vpid();
-        let vpid = crate::pidns::register_fork(0); // placeholder
-        crate::pidns::set_child_env(vpid, parent_vpid);
-        vpid
-    } else {
-        0
-    };
+    if container {
+        crate::pidns::set_child_env();
+    }
 
     // Probe pipe fds before fork for debugging.
     // Use stack buffer only — no heap allocation (safe for potential signal context).
@@ -620,19 +614,14 @@ extern "C" fn fork_trampoline_entry() -> ! {
 
         // Enable SVC tracing for first 10 SVCs in the fork child
         crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
-        // Child inherits the shm mmap via MAP_SHARED and has correct
-        // FAKELINUX_VPID/VPPID env vars for execve.
+        crate::trap::FORK_TRAP_COUNT.store(50, std::sync::atomic::Ordering::Relaxed);
+        // Child inherits the FAKELINUX_INIT_PID env var for execve.
     }
 
     let return_pid = if pid == 0 {
         0u64
-    } else if container {
-        // Parent: now we know the child's real PID, update the shm entry
-        crate::pidns::update_entry(child_vpid, pid);
-        // Restore parent's own env vars
-        crate::pidns::restore_parent_env();
-        child_vpid as u64
     } else {
+        // In simplified PID scheme, vpid == real PID for all non-init processes.
         pid as u64
     };
     FORK.set_x0(return_pid);

@@ -141,13 +141,11 @@ fn main() {
     if container_mode {
         pidns::init_container();
         eprintln!("fakelinux: container mode (--container), virtual PID 1");
-    } else if let Ok(shm_name) = std::env::var("FAKELINUX_CONTAINER") {
-        let vpid: i32 = std::env::var("FAKELINUX_VPID")
+    } else if std::env::var("FAKELINUX_CONTAINER").is_ok() {
+        let init_pid: i32 = std::env::var("FAKELINUX_INIT_PID")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let vppid: i32 = std::env::var("FAKELINUX_VPPID")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        if vpid > 0 {
-            pidns::attach_container(&shm_name, vpid, vppid);
+        if init_pid > 0 {
+            pidns::attach_container(init_pid);
         }
     }
 

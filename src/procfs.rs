@@ -209,18 +209,11 @@ fn generate_dir_entries(kind: &VirtualDir) -> Vec<u8> {
             push_dirent64(&mut buf, 1, DT_DIR, b".");
             push_dirent64(&mut buf, 1, DT_DIR, b"..");
 
-            // Active PID entries
-            let active = crate::pidns::list_active_pids();
-            if active.is_empty() {
-                // Non-container mode: just our own PID
-                let pid_str = format!("{}", visible_pid());
-                push_dirent64(&mut buf, 100, DT_DIR, pid_str.as_bytes());
-            } else {
-                for &(vpid, _) in &active {
-                    let pid_str = format!("{}", vpid);
-                    push_dirent64(&mut buf, 100 + vpid as u64, DT_DIR, pid_str.as_bytes());
-                }
-            }
+            // PID entries: just expose the current process's virtual PID.
+            // In container mode vpid==1 for init, real PID otherwise.
+            let pid = visible_pid();
+            let pid_str = format!("{}", pid);
+            push_dirent64(&mut buf, 100 + pid as u64, DT_DIR, pid_str.as_bytes());
 
             // "self" symlink
             push_dirent64(&mut buf, 2, DT_LNK, b"self");

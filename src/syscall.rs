@@ -349,19 +349,13 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 pid_arg
             };
             let ret = thread::do_wait4(translated_pid, args[1], args[2] as i32, args[3]);
-            // Translate returned real PID back to virtual PID
+            // Translate returned real PID back to virtual PID.
+            // In the simplified scheme, only init (real PID → vpid 1) needs translation.
             if pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let ret_i64 = ret as i64;
                 if ret_i64 > 0 {
                     let real_pid = ret as i32;
-                    let vpid = pidns::real_to_virtual(real_pid).unwrap_or(real_pid);
-                    // Reap: mark entry as unused in shm table
-                    if vpid != real_pid {
-                        pidns::unregister_vpid(vpid);
-                    }
-                    // Restore parent's own env vars (fork may have set child's)
-                    pidns::restore_parent_env();
-                    vpid as u64
+                    pidns::real_to_virtual(real_pid).unwrap_or(real_pid) as u64
                 } else {
                     ret
                 }

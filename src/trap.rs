@@ -11,6 +11,10 @@ pub static IN_TRAP: AtomicBool = AtomicBool::new(false);
 /// Debug counter: trace first N SVC syscalls in a fork child.
 pub static FORK_SVC_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Debug counter: trace first N UDF traps (SVC+MRS/MSR) in a fork child.
+/// Gives a complete picture of every intercepted instruction.
+pub static FORK_TRAP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Diagnostic: the x18 instruction currently being emulated (for crash dumps).
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
@@ -1194,6 +1198,18 @@ unsafe extern "C" fn trap_handler(
                 let val = read_gpr(&mctx.ss, rn);
                 set_thread_tpidr(val);
                 mctx.ss.pc = pc + 4;
+                // FORK_TRAP logging for MSR
+                let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
+                if tcnt > 0 {
+                    FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
+                    let pid = libc::getpid();
+                    let mut buf = [0u8; 160];
+                    let n = raw_fmt(&mut buf, format_args!(
+                        "fakelinux: [{}] FORK_TRAP#{} MSR pc={:#x} x{}={:#x} x0={:#x} x19={:#x}\n",
+                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19]
+                    ));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
                 IN_TRAP.store(false, Ordering::SeqCst);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
@@ -1202,6 +1218,18 @@ unsafe extern "C" fn trap_handler(
                 let val = get_thread_tpidr();
                 write_gpr(&mut mctx.ss, rn, val);
                 mctx.ss.pc = pc + 4;
+                // FORK_TRAP logging for MRS
+                let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
+                if tcnt > 0 {
+                    FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
+                    let pid = libc::getpid();
+                    let mut buf = [0u8; 160];
+                    let n = raw_fmt(&mut buf, format_args!(
+                        "fakelinux: [{}] FORK_TRAP#{} MRS pc={:#x} x{}={:#x} x0={:#x} x19={:#x}\n",
+                        pid, 50 - tcnt, pc, rn, val, mctx.ss.x[0], mctx.ss.x[19]
+                    ));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
                 IN_TRAP.store(false, Ordering::SeqCst);
                 return;
             } else {
@@ -1215,6 +1243,18 @@ unsafe extern "C" fn trap_handler(
                 // Save emulating instruction for crash diagnostics
                 unsafe { CURRENT_X18_INSTR = orig_instr; CURRENT_X18_PC = pc; }
                 if emulate_x18_instruction(orig_instr, mctx) {
+                    // FORK_TRAP logging for x18
+                    let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
+                    if tcnt > 0 {
+                        FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
+                        let pid = libc::getpid();
+                        let mut buf = [0u8; 160];
+                        let n = raw_fmt(&mut buf, format_args!(
+                            "fakelinux: [{}] FORK_TRAP#{} X18 pc={:#x} instr={:#010x} x0={:#x} x19={:#x}\n",
+                            pid, 50 - tcnt, pc, orig_instr, mctx.ss.x[0], mctx.ss.x[19]
+                        ));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
                     if seq < 200 && std::env::var("FAKELINUX_TRACE_X18").is_ok() {
                         let mut buf = [0u8; 128];
                         let n = raw_fmt(&mut buf, format_args!(
@@ -1242,6 +1282,21 @@ unsafe extern "C" fn trap_handler(
 
         // Not in patch table → this was a SVC #0
         let nr = mctx.ss.x[8];
+
+        // FORK_TRAP logging for SVC
+        {
+            let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
+            if tcnt > 0 {
+                FORK_TRAP_COUNT.store(tcnt - 1, Ordering::Relaxed);
+                let pid = libc::getpid();
+                let mut buf = [0u8; 160];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] FORK_TRAP#{} SVC pc={:#x} nr={} x0={:#x} x19={:#x} lr={:#x}\n",
+                    pid, 50 - tcnt, pc, nr, mctx.ss.x[0], mctx.ss.x[19], mctx.ss.lr
+                ));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
 
         // Debug: track fork children's first few SVCs to see when they
         // diverge from the expected child code path.
