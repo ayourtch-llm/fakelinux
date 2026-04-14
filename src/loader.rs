@@ -393,7 +393,8 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     let mut tpidr_patched = 0u64;
     let mut x18_patched = 0u64;
     let have_code_ranges = !code_ranges.is_empty();
-    let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok();
+    let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok()
+        || std::env::var("FAKELINUX_NO_X18_INITIAL").is_ok();
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
