@@ -176,9 +176,24 @@ mod tests {
             return rn == 18;
         }
         
-        // For other instructions, check standard GPR register fields
-        // This will be expanded in later tasks with table-driven approach
-        // For now, return false as baseline
+        // ═══════════════════════════════════════════════════════════════════
+        // ADD/SUB shifted register instructions
+        // Encoding: bits[28:25]=0b01011 (0x0B), bit[24]=0
+        // Mask: 0x1F200000, Value: 0x0B000000
+        // ═══════════════════════════════════════════════════════════════════
+        if (instr & 0x1F200000) == 0x0B000000 {
+            // Rm (source register 2) at bits[20:16]
+            let rm = (instr >> 16) & 0x1F;
+            if rm == 18 { return true; }
+            // Rn (source register 1) at bits[5:0]
+            let rn = instr & 0x1F;
+            if rn == 18 { return true; }
+            // Rd (destination) at bits[4:0]
+            let rd = instr & 0x1F;
+            return rd == 18;
+        }
+        
+        // For other instructions, return false as baseline
         false
     }
     
@@ -265,5 +280,47 @@ mod tests {
             assert!(references_x18(*instr), 
                 "{} ({:#010x}) should detect x18 base register", desc, instr);
         }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Task 3: ADD/SUB shifted register instruction table entry
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Test ADD with shifted register where Rm=x18
+    /// Encoding: 0x0b1201ce = ADD w14, w14, w18
+    /// - bits[28:25] = 0b0100 (addsub shifted register group)
+    /// - bit[24] = 1 (add/sub with shifted register)
+    /// - bit[11] = 0 (ADD, not SUB)
+    /// - bits[10] = 0 (set flags? no)
+    /// - Rm = bits[20:16] = 0x12 = 18
+    #[test]
+    fn test_add_shifted_reg_x18() {
+        let instr = 0x0b1201ce; // ADD w14, w14, w18 — Rm=x18
+        assert!(references_x18(instr), "ADD with Rm=x18 should be detected");
+    }
+    
+    /// Test SUB with shifted register where Rm=x18
+    /// Encoding: 0x4b120000 = SUB w0, w0, w18
+    /// - bits[28:25] = 0b0100 (addsub shifted register group)
+    /// - bit[24] = 1 (add/sub with shifted register)
+    /// - bit[11] = 1 (SUB)
+    /// - Rm = bits[20:16] = 0x12 = 18
+    #[test]
+    fn test_sub_shifted_reg_x18() {
+        let instr = 0x4b120000; // SUB w0, w0, w18 — Rm=x18
+        assert!(references_x18(instr), "SUB with Rm=x18 should be detected");
+    }
+    
+    /// Test ADDS (add and set flags) with shifted register where Rm=x18
+    /// Encoding: 0x2b120131 = ADDS w17, w9, w18
+    /// - bits[28:25] = 0b0100 (addsub shifted register group)
+    /// - bit[24] = 1 (add/sub with shifted register)
+    /// - bit[11] = 0 (ADD)
+    /// - bit[10] = 1 (S bit set = ADDS)
+    /// - Rm = bits[20:16] = 0x12 = 18
+    #[test]
+    fn test_adds_shifted_reg_flags() {
+        let instr = 0x2b120131; // ADDS w17, w9, w18 — Rm=x18 with S bit set
+        assert!(references_x18(instr), "ADDS with Rm=x18 should be detected");
     }
 }
