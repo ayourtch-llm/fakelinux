@@ -2,6 +2,8 @@
 /alpine-rootfs
 /python-rootfs
 /sysroot
+/tmp
+/.apchat-large-outputs
 *.o
 busybox
 hello_*
