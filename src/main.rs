@@ -1,4 +1,5 @@
 mod creds;
+mod decoder;
 mod elf;
 mod epoll;
 mod eventfd;
