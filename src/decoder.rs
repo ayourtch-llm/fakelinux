@@ -209,6 +209,27 @@ mod tests {
             return rd == 18;
         }
         
+        // ═══════════════════════════════════════════════════════════════════
+        // Data Processing (1 source) instructions - REV, RBIT, CLZ, CLS, etc.
+        // Encoding: sf_1_0_11010110_00000_opcode(6)_Rn(5)_Rd(5)
+        // - bit[31] = sf (0=32-bit, 1=64-bit)
+        // - bit[30] = 1 (distinguishes from other DP groups)
+        // - bit[29] = 0 (S bit = 0 for DP1-source)
+        // - bits[28:21] = 11010110 (DP1-source group)
+        // - bits[20:16] = 00000 (opcode2, must be 0)
+        // - bits[15:10] = opcode (6-bit opcode for specific instruction)
+        // - bits[9:5] = Rn (source register)
+        // - bits[4:0] = Rd (destination register)
+        // Mask: 0x7FFF0000, Value: 0x5AC00000
+        // ═══════════════════════════════════════════════════════════════════
+        if (instr & 0x7FFF0000) == 0x5AC00000 {
+            // Check both Rd (bits[4:0]) and Rn (bits[9:5]) for x18
+            let rn = (instr >> 5) & 0x1F;
+            if rn == 18 { return true; }
+            let rd = instr & 0x1F;
+            return rd == 18;
+        }
+        
         // For other instructions, return false as baseline
         false
     }
@@ -444,5 +465,86 @@ mod tests {
         let sbfm = 0x13000000;
         assert!(!references_x18(sbfm), 
             "SBFM should not be detected as EXTR: {:#010x}", sbfm);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Task 5: Data Processing (1 source) instruction support
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Test REV, RBIT, CLZ instructions that reference x18.
+    /// 
+    /// Data Processing 1 source encoding:
+    /// - bits[31] = sf (0=32-bit, 1=64-bit)
+    /// - bit[30] = 1 (distinguishes from other DP groups)
+    /// - bit[29] = 0 (S bit = 0 for DP1-source)
+    /// - bits[28:21] = 11010110 (DP1-source group)
+    /// - bits[20:16] = 00000 (opcode2, must be 0 for main opcodes)
+    /// - bits[15:10] = opcode (6-bit opcode for specific instruction)
+    /// - bits[9:5] = Rn (source register)
+    /// - bits[4:0] = Rd (destination register)
+    /// 
+    /// Mask: 0x7FFF0000 (sf=*, bit30=1, S=0, bits[28:21]=11010110, opcode2=00000)
+    /// Value: 0x5AC00000 (sf=0, bit30=1, S=0, bits[28:21]=11010110, opcode2=00000)
+    #[test]
+    fn test_rev_rbit_clz_x18() {
+        // REV w18, w18 — byte reverse 32-bit
+        // 0x5ac00a52: opcode=001010 (0x0A=10=REV32)
+        let rev = 0x5ac00a52;
+        assert!(references_x18(rev), 
+            "REV with x18 should be detected: {:#010x}", rev);
+        
+        // RBIT w18, w18 — bit reverse 32-bit
+        // 0x5ac00252: opcode=000010 (0x02=2=RBIT)
+        let rbit = 0x5ac00252;
+        assert!(references_x18(rbit), 
+            "RBIT with x18 should be detected: {:#010x}", rbit);
+        
+        // CLZ w18, w18 — count leading zeros 32-bit
+        // 0x5ac01252: opcode=010010 (0x12=18=CLZ)
+        let clz = 0x5ac01252;
+        assert!(references_x18(clz), 
+            "CLZ with x18 should be detected: {:#010x}", clz);
+    }
+    
+    /// Test various Data Processing 1 source instructions with x18.
+    /// 
+    /// DP1-source opcodes (bits[15:10]):
+    /// - 0x00: RBIT (reverse bits)
+    /// - 0x02: REV16 (reverse bytes in each 16-bit half)
+    /// - 0x04: REV (REV32 in 32-bit mode)
+    /// - 0x06: REV32 (reverse bytes in each 32-bit word, 64-bit only)
+    /// - 0x08: REV64 (reverse all bytes, 64-bit only)
+    /// - 0x10: CLZ (count leading zeros)
+    /// - 0x12: CLS (count leading sign bits)
+    #[test]
+    fn test_dp1_source_various_x18() {
+        // Data Processing 1 source with x18
+        let dp1_cases = &[
+            (0x5ac00a52, "REV w18, w18 — byte reverse 32-bit"),
+            (0x5ac00252, "RBIT w18, w18 — bit reverse 32-bit"),
+            (0x5ac01252, "CLZ w18, w18 — count leading zeros 32-bit"),
+            (0xdac00a52, "REV x18, x18 — byte reverse 64-bit"),
+        ];
+        for &(instr, desc) in dp1_cases {
+            assert!(references_x18(instr), 
+                "DP1-source with x18 not detected: {} ({:#010x})", desc, instr);
+        }
+    }
+    
+    /// Test DP1-source instructions where x18 is in Rd (destination register).
+    /// Some crypto code might use patterns like: REV w18, w0 (result goes to x18).
+     #[test]
+    fn test_dp1_source_x18_as_rd() {
+        // REV w0, w18 — x18 as source only (Rd=0, Rn=18)
+        // 0x5ac00a40: opcode=0x0A, Rn=18, Rd=0
+        let rev_rn = 0x5ac00a40; // REV w0, w18
+        assert!(references_x18(rev_rn), 
+            "DP1-source with Rn=x18 should be detected: {:#010x}", rev_rn);
+        
+        // REV w18, w0 — x18 as destination only (Rd=18, Rn=0)
+        // 0x5ac00812: opcode=0x0A, Rn=0, Rd=18
+        let rev_rd = 0x5ac00812; // REV w18, w0
+        assert!(references_x18(rev_rd), 
+            "DP1-source with Rd=x18 should be detected: {:#010x}", rev_rd);
     }
 }
