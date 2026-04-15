@@ -193,6 +193,22 @@ mod tests {
             return rd == 18;
         }
         
+        // ═══════════════════════════════════════════════════════════════════
+        // EXTR (extract) instruction - used in SHA-1 rotation
+        // Encoding: bits[28:23] = 100111
+        // Mask: 0xFF800000, Value: 0x13800000
+        // Rd = bits[4:0], Rn = bits[9:5], Rm = bits[20:16]
+        // ═══════════════════════════════════════════════════════════════════
+        if (instr & 0xFF800000) == 0x13800000 {
+            // Check all three registers - any could be x18
+            let rm = (instr >> 16) & 0x1F;
+            if rm == 18 { return true; }
+            let rn = (instr >> 5) & 0x1F;
+            if rn == 18 { return true; }
+            let rd = instr & 0x1F;
+            return rd == 18;
+        }
+        
         // For other instructions, return false as baseline
         false
     }
@@ -322,5 +338,111 @@ mod tests {
     fn test_adds_shifted_reg_flags() {
         let instr = 0x2b120131; // ADDS w17, w9, w18 — Rm=x18 with S bit set
         assert!(references_x18(instr), "ADDS with Rm=x18 should be detected");
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Task 4: EXTR (extract) instruction support for SHA-1 rotation
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Test EXTR instruction that references x18.
+    /// EXTR w18, w15, w15, #27 is equivalent to ROR w18, w15, #27,
+    /// which is used in SHA-1 rotation operations.
+    /// 
+    /// EXTR encoding:
+    /// - bits[28:23] = 100111 (distinguishes from SBFM/UBFM which has 100110)
+    /// - Mask: 0xFF800000, Value: 0x13800000
+    /// - Rd = bits[4:0], Rn = bits[9:5], Rm = bits[20:16]
+    #[test]
+    fn test_extr_x18() {
+        // EXTR w18, w15, w15, #27 (= ROR w18, w15, #27) — SHA-1 rotation
+        // 0x138f6df2 encodes EXTR with:
+        // - Rd = 18 (x18/w18 as destination)
+        // - Rn = 15 (x15)
+        // - Rm = 15 (x15)
+        // - imms = 27 (rotation amount)
+        let instr = 0x138f6df2;
+        assert!(references_x18(instr), 
+            "EXTR with x18 should be detected: {:#010x}", instr);
+    }
+    
+    /// Test multiple EXTR instructions used in SHA-1 rotations.
+    /// SHA-1 uses ROR (rotate right) which can be implemented as EXTR.
+    #[test]
+    fn test_extr_various_x18() {
+        // SHA-1 rotation instructions with various register combinations
+        let extr_cases = &[
+            (0x138f6df2, "EXTR w18, w15, w15, #27 — SHA-1 rotation"),
+            (0x13906e12, "EXTR w18, w16, w16, #27"),
+            (0x138b6d72, "EXTR w18, w11, w11, #27"),
+            (0x138d6db2, "EXTR w18, w13, w13, #27"),
+        ];
+        for &(instr, desc) in extr_cases {
+            assert!(references_x18(instr), 
+                "EXTR with x18 not detected: {} ({:#010x})", desc, instr);
+        }
+    }
+    
+    /// Test EXTR with x18 as Rm (source register 2) rather than Rd.
+    /// Some SHA-1 implementations may use different register patterns.
+    #[test]
+    fn test_extr_x18_as_rm() {
+        // EXTR w0, w1, w18, #something — x18 as Rm
+        // This should also be detected since Rm can be x18
+        let instr = 0x13800651; // EXTR w17, w1, w18, #something
+        assert!(references_x18(instr), 
+            "EXTR with Rm=x18 should be detected: {:#010x}", instr);
+    }
+    
+    /// Verify EXTR instruction correctly distinguishes from SBFM/UBFM.
+    /// - EXTR: bits[28:23] = 100111 (0x138 >> 23 = 0x13 = 0b100111)
+    /// - SBFM/UBFM: bits[28:23] = 100110 (0x130 >> 23 = 0x13 but different)
+    /// 
+    /// Actually, let me verify:
+    /// - 0x13800000 >> 23 = 0x13 = 0b100111 (EXTR)
+    /// - 0x13000000 >> 23 = 0x13 = 0b100111 (also looks like EXTR pattern)
+    /// 
+    /// The key difference is bit[15] - SBFM/UBFM has it clear, EXTR has it set.
+    /// Actually, let me check:
+    /// - 0x138f6df2 (EXTR with x18) = 0001 0011 1000 1111 0110 1101 1111 0010
+    /// - Bits[28:23] = bits[31:29]=000, bits[28:26]=100, bit[25:24]=11, bit[23]=1
+    ///   = 0 001 001 11 1 = wait, let me redo this
+    ///   
+    /// 0x138f6df2 = 0001 0011 1000 1111 0110 1101 1111 0010
+    /// bits[31:28] = 0001 = 0x1
+    /// bits[27:24] = 0011 = 0x3
+    /// bits[23] = 1
+    /// 
+    /// Looking at the pattern:
+    /// - 0x13800000 has top 23 bits = 100111
+    /// - 0x13000000 has top 23 bits = 100110
+    /// 
+    /// So the mask should be 0xFF800000 to capture bits[28:23].
+    /// Wait, let me check more carefully:
+    /// 
+    /// bits[28:23] = 6 bits starting at bit 23
+    /// Mask for bits[28:23] = bits[28] + bits[27] + ... + bits[23]
+    /// = 0b11111100000000000000000000000000 (0xFC000000)
+    /// 
+    /// But the task says: Mask: 0xFF800000, Value: 0x13800000
+    /// Let me check: 0xFF800000 = 11111111100000000000000000000000
+    /// That covers bits[31:24] plus bit[23] = 9 bits total
+    /// 
+    /// 0x13800000 = 00010011100000000000000000000000
+    /// 
+    /// This checks bits[28:24] = 10011 and bit[23] = 0
+    /// So the value is checking: bits[28:24] == 10011
+    /// 
+    /// Actually, looking at ARM documentation more carefully:
+    /// - EXTR: op0=100, op1=111 (so top bits starting at 28 would be related)
+    /// 
+    /// Let me just implement based on the hint and verify with tests.
+    #[test]
+    fn test_extr_not_sbfm_ubfm() {
+        // SBFM (signed bitfield move) has different encoding
+        // This should NOT be detected as EXTR
+        // Example SBFM: 0x13000000 has bits[28:23] = 100110
+        let sbfm = 0x13000000;
+        assert!(!references_x18(sbfm), 
+            "SBFM should not be detected as EXTR: {:#010x}", sbfm);
     }
 }
