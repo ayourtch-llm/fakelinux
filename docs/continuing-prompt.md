@@ -21,6 +21,7 @@ The ARM A64 decoder refactoring is in progress. The goal is to unify x18 registe
    - LogicalShiftedReg, AddSubExtReg, DataProc2Src
    - Bitfield, LdrLiteral, LdrStrUnscaled, LdrStrRegOffset
    - LDP/STP (0xA8/0xAA), CBZ/CBNZ (0xB4/0xB5), FMOV (0xF2/0xF3/0xFA)
+   - ADR (0x10), ADD/ADDP (0x78), DataProc (0x98)
 
 ## Current Test Status
 
@@ -28,62 +29,58 @@ The ARM A64 decoder refactoring is in progress. The goal is to unify x18 registe
 cargo test trap::tests::references_x18_detects_all_libpython_instructions
 ```
 
-**Result**: 43 of 238 x18 instructions still not detected (down from 90+)
+**Result**: 4 of 238 x18 instructions still not detected (down from 90+)
 
 ## Remaining Missed Instructions
 
-The following instruction patterns are still not detected:
+### 1. `0x1a9203f1` - ADD/ADDP with Rm=x18
+- Top byte: 0x1A
+- Rn=31, Rd=17, Rm=18
+- Need to add table entry for 0x1A instructions (ADD/ADDP with extended register)
 
-### SIMD Load/Store with Rm=x18 (top bytes 0x38, 0x78, 0xB8)
-- `0x38xxxxxx`, `0x78xxxxxx`, `0xB8xxxxxx` - These have Rm at bits[20:16] that can be x18
-- The current SIMD fallback only checks Rn (base), not Rm (index)
+### 2. `0x9b125421` - Data processing with Rm=x18
+- Top byte: 0x9B
+- Rn=1, Rd=1, Rm=18
+- Need to fix the 0x98 entry to also match 0x9B (mask should be 0xF8000000, not 0xFC000000)
 
-### LDR/STR with Rm=x18 (top bytes 0x90, 0xB0, 0xF0, 0xF8)
-- `0x90xxxxxx`, `0xB0xxxxxx`, `0xF0xxxxxx`, `0xF8xxxxxx` - These have Rm at bits[20:16]
-- The current LDR/STR fallback only checks Rn and Rd, not Rm
-
-### LDP/STP with Rd=x18 or Rm=x18 (top byte 0xA9)
-- `0xA9xxxxxx` - Some LDP/STP variants have Rd=x18 or Rm=x18
-- Current entry only checks Rt and Rn, not all register positions
-
-### FMOV with Rn=x18 (top byte 0xF2)
-- `0xF240065f`, `0xF2400a5f` - FMOV from GPR, Rn=x18
-- Current FMOV entry only checks Rt and Rm, not Rn
-
-### ADD/ADDP with Rm=x18 (top bytes 0x7A, 0x9B)
-- `0x7Axxxxxx`, `0x9Bxxxxxx` - These have Rm at bits[20:16] that can be x18
-
-### LDP with Rt2=x18 (top byte 0xA9)
-- `0xA9004be3`, `0xA9404be3` - These have Rt2 at bits[20:16] that should be x18
-- But analysis shows Rm=0, so these might be false positives in the test data
+### 3. `0xa9004be3` and `0xa9404be3` - LDP with imm7, NOT Rm
+- Top byte: 0xA9
+- Rn=31, Rd=3, Rm=0 (NOT 18!)
+- These are LDP instructions where bits[20:14] are imm7, not Rm
+- **These are likely false positives in the test data** - they don't actually reference x18
 
 ## What Needs to Be Done
 
-### 1. Fix SIMD Load/Store Detection
-The SIMD fallback currently returns early after checking Rn. It should:
-- Check both Rn (base) and Rm (index) for x18
-- Only return false if neither is x18
+### 1. Fix 0x9B Entry
+The current entry uses mask 0xFC000000 with value 0x98000000, which doesn't match 0x9B.
+Change to mask 0xF8000000 with value 0x98000000 to match both 0x98 and 0x9B.
 
-### 2. Fix LDR/STR Detection  
-The LDR/STR scaled fallback should check Rm as well as Rn and Rd.
+### 2. Add 0x1A Entry
+Add a table entry for 0x1A instructions (ADD/ADDP with extended register):
+```rust
+InstrEncoding {
+    class: InstrClass::Unimplemented,
+    mask: 0xF8000000,
+    value: 0x18000000,  // Match 0x18-0x1F
+    reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+},
+```
 
-### 3. Add Missing Instruction Classes
-Add table entries for:
-- **0x7A**: ADD/ADDP with extended register (Rd, Rn, Rm at bits[4:0], [9:5], [20:16])
-- **0x9B**: Various data processing with Rm operand
-- **0xF2**: FMOV from GPR (Rt, Rn at bits[4:0], [9:5])
+### 3. Verify Test Data
+The 0xA9 instructions (`0xa9004be3`, `0xa9404be3`) show Rm=0, not 18.
+These might be false positives in the test data. Verify by:
+- Checking if these instructions actually appear in Python binaries with x18
+- Or if they were incorrectly added to the test data
 
-### 4. Fix LDP/STP Entry
-The LDP/STP entry at 0xA8 needs to be more specific or have a separate entry for 0xA9 variants.
-
-### 5. Verify Test Data
-Some instructions like `0xA9004be3` show Rm=0, not 18. Verify these are actually x18 instructions or false positives in the test data.
+### 4. Update continuing-prompt.md
+Update this document with final status once all issues are resolved.
 
 ## File Locations
 
 - `src/decoder.rs` - Main decoder module with INSTR_TABLE and references_x18()
 - `src/trap.rs` - Old references_x18() now delegates to decoder
 - `docs/plans/2026-04-15-arm64-decoder-tdd.md` - Original plan document
+- `docs/continuing-prompt.md` - This document
 
 ## Commands to Run
 
@@ -100,6 +97,6 @@ cargo test decoder
 
 ## Key Insight
 
-The main issue is that the fallback code in `decoder::references_x18()` is checking the wrong register fields for some instruction classes. The table-driven approach is correct, but the fallback needs to be more comprehensive, or we need to add more table entries to cover all the instruction patterns.
+The main issue is that some table entries have incorrect masks that don't match all variants of an instruction class. The fallback code is also checking the wrong register fields for some instruction classes.
 
-The cleanest solution is to add more specific table entries rather than expanding the fallback logic, as this keeps the single source of truth principle intact.
+The cleanest solution is to add more specific table entries with correct masks rather than expanding the fallback logic, as this keeps the single source of truth principle intact.

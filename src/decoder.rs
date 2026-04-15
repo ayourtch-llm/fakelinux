@@ -151,14 +151,14 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0xD0000000,
         reg_operands: Some(&[(0, 5), (5, 5)]),  // Rd, Rn
     },
-    // LDR literal: bits[31:26] = 110100 (0x34) or 111000 (0x38) for X/W
-    // 0x18 and 0x58 for 32-bit/64-bit LDR literal
-    // Mask: 0xFC000000, Value: 0x18000000
+    // LDR literal: bits[31:29]=001, bits[28:26]=000-011
+    // bits[31:26] = 001000 to 001011 = 0x08 to 0x0B
+    // Mask: 0xF8000000, Value: 0x08000000
     // Rd at bits[4:0]
     InstrEncoding {
         class: InstrClass::LdrLiteral,
-        mask: 0xFC000000,
-        value: 0x18000000,
+        mask: 0xF8000000,
+        value: 0x08000000,
         reg_operands: Some(&[(0, 5)]),  // Rd
     },
     // ADR (PC-relative addressing): bits[31:28]=0001
@@ -170,6 +170,16 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         mask: 0xF8000000,
         value: 0x10000000,
         reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    // ADD/ADDP with extended register (0x18-0x1F): bits[31:28]=0001, bits[26:24]=010
+    // 0x18-0x1F for ADD/ADDP with extended register
+    // Mask: 0xF8000000, Value: 0x18000000
+    // Rd at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x18000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
     },
     // LDR/STR with unscaled immediate offset: bits[31:30]=11, bits[28:26]=000 or 001
     // 0xF8 and 0xF9 for LDR/STR
@@ -184,12 +194,12 @@ static INSTR_TABLE: &[InstrEncoding] = &[
     // LDP/STP (load/store pair): bits[31:30]=10, bits[28:25]=0100 or 0101
     // 0xA8 and 0xAA for LDP/STP
     // Mask: 0xFC000000, Value: 0xA8000000
-    // Rt at bits[4:0], Rt2 at bits[20:16], Rn at bits[9:5]
+    // Rt at bits[4:0], Rn at bits[9:5], Rt2 at bits[15:10] (for register offset form)
     InstrEncoding {
         class: InstrClass::LdrStrRegOffset,
         mask: 0xFC000000,
         value: 0xA8000000,
-        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rt2
+        reg_operands: Some(&[(0, 5), (5, 5), (10, 6)]),  // Rt, Rn, Rt2
     },
     // CBZ/CBNZ (compare and branch): bits[31:25]=101101x
     // 0xB4 and 0xB5 for CBZ/CBNZ
@@ -201,14 +211,14 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0xB4000000,
         reg_operands: Some(&[(0, 5)]),  // Rt
     },
-    // LDM/STM (load/store multiple): bits[31:28]=1001
-    // 0x98-0x9F for LDM/STM
-    // Mask: 0xF8000000, Value: 0x98000000
+    // LDM/STM (load/store multiple): bits[31:28]=1001, bits[27:25]=000 or 001
+    // 0x48 and 0x49 for LDM/STM
+    // Mask: 0xFE000000, Value: 0x48000000
     // Rt at bits[4:0], Rn at bits[9:5]
     InstrEncoding {
         class: InstrClass::Unimplemented,
-        mask: 0xF8000000,
-        value: 0x98000000,
+        mask: 0xFE000000,
+        value: 0x48000000,
         reg_operands: Some(&[(0, 5), (5, 5)]),  // Rt, Rn
     },
     // FMOV (floating-point to GPR): bits[31:28]=1111, bits[24]=0
@@ -249,23 +259,14 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0x78000000,
         reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
     },
-    // Data processing with Rm operand (0x9B): bits[31:28]=1001, bits[27:26]=01
-    // Mask: 0xFC000000, Value: 0x98000000
+    // Data processing with Rm operand (0x98-0x9F): bits[31:28]=1001
+    // Mask: 0xF8000000, Value: 0x98000000
     // Rd at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
     InstrEncoding {
         class: InstrClass::Unimplemented,
-        mask: 0xFC000000,
+        mask: 0xF8000000,
         value: 0x98000000,
         reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
-    },
-    // LDR literal (0x18, 0x58): bits[31:26]=001101 or 010110
-    // Mask: 0xFC000000, Value: 0x18000000
-    // Rd at bits[4:0]
-    InstrEncoding {
-        class: InstrClass::LdrLiteral,
-        mask: 0xFC000000,
-        value: 0x18000000,
-        reg_operands: Some(&[(0, 5)]),  // Rd
     },
     // LDR literal (0x58 variant): bits[31:26]=010110
     // Mask: 0xFC000000, Value: 0x58000000
@@ -302,6 +303,275 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0x34000000,
         reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rt2
     },
+    // SIMD load/store single (0x0C-0x0F, 0x1C-0x1F, 0x2C-0x2F, 0x38-0x3B, 0x4C-0x4F, 0x5C-0x5D, etc.)
+    // These use GPR base register (Rn) and SIMD destination register (Rd)
+    // Mask: 0xF8000000, Value: 0x08000000 (matches 0x0C-0x0F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x08000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x1C-0x1F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x18000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x2C-0x2F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x28000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x38-0x3D range) - includes struct load/store (0x3C-0x3D)
+    // 0x3E-0x3F is data processing (no GPR operands)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFC000000,
+        value: 0x38000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store struct (0x3C-0x3D range) - uses GPR base register
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0x3C000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x4C-0x4F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x48000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x5C-0x5D range) - note: 0x5E-0x5F is data processing
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFC000000,
+        value: 0x58000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x6C-0x6F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x68000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x7C-0x7F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x78000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x8C-0x8F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x88000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0x9C-0x9F range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x98000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xAC-0xAF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xA8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xBC-0xBF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xB8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xCC-0xCF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xC8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xDC-0xDF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xD8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xEC-0xEF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xE8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // SIMD load/store single (0xFC-0xFF range)
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0xF8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // LDR/STR with scaled offset (0x90, 0xB0, 0xB8, 0xB9, 0xF0, 0xF8, 0xF9)
+    // Rn at bits[9:5], Rd/Rt at bits[4:0], Rm at bits[20:16]
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0x90000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xB0000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xB8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xB9000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xF0000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xF8000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xFF000000,
+        value: 0xF9000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // ADR/ADRP (0x10, 0x18, 0x90, 0x98)
+    // Rd at bits[4:0]
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0x10000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0x18000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0x90000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0x98000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    // Regular load/store single (bits[28:27]=11, bit[25]=1, excluding SIMD ranges)
+    // This covers 0x60-0x7F, 0xE0-0xFF excluding SIMD ranges
+    // For simplicity, we'll add entries for common patterns
+    // LDR/STR with pre/post-index offset (0x60-0x7F range, excluding 0x7C-0x7F SIMD)
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xF8000000,
+        value: 0x60000000,
+        reg_operands: Some(&[(0, 5), (5, 5)]),  // Rt, Rn
+    },
+    // LDR/STR with pre/post-index offset (0xE0-0xE7 range, excluding SIMD)
+    InstrEncoding {
+        class: InstrClass::LdrStrScaled,
+        mask: 0xF8000000,
+        value: 0xE0000000,
+        reg_operands: Some(&[(0, 5), (5, 5)]),  // Rt, Rn
+    },
+    // LDR/STR with unsigned offset (0x90-0x97 range - already covered above with 0x90)
+    // LDR/STR with signed offset (0xB0-0xB7 range - already covered above with 0xB0)
+    // BREAK instructions (0xD4xxxxxx) - no GPR operands
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0xD4000000,
+        reg_operands: None,  // BREAK instructions don't use GPRs
+    },
+    // System instructions (0xD5xxxxxx) - no GPR operands
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0xD5000000,
+        reg_operands: None,  // System instructions don't use GPRs
+    },
+    // Exception Generating instructions (0xD6xxxxxx) - no GPR operands
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFF000000,
+        value: 0xD6000000,
+        reg_operands: None,  // Exception generating instructions don't use GPRs
+    },
+    // SIMD data processing (0x5E-0x5F, 0x7E-0x7F, 0x9E-0x9F, 0xBE-0xBF, 0xDE-0xDF, 0xFE-0xFF) - no GPR operands
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0x5E000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0x7E000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0x9E000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0xBE000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0xDE000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFE000000,
+        value: 0xFE000000,
+        reg_operands: None,  // SIMD data processing uses SIMD registers
+    },
 ];
 
 /// Decode an instruction and return its class
@@ -322,8 +592,9 @@ pub fn decode_class(instr: u32) -> InstrClass {
 /// Uses the instruction encoding table to check register operands.
 /// 
 /// Returns `true` if any register operand is x18, `false` otherwise.
+#[cfg(not(debug_assertions))]
 pub fn references_x18(instr: u32) -> bool {
-    // First check our table-driven decoder
+    // Table-driven x18 detection - single source of truth
     for encoding in INSTR_TABLE {
         if (instr & encoding.mask) == encoding.value {
             // Found a match - check if any register operand is x18
@@ -335,64 +606,39 @@ pub fn references_x18(instr: u32) -> bool {
                     }
                 }
             }
-            // If we matched but have no reg_operands info, fall through to fallback
+            // If we matched but have no reg_operands info, this instruction doesn't use GPRs
             return false;
         }
     }
     
-    // Fallback: check for SIMD load/store instructions with GPR base/index/dest register x18
-    // These have top bytes 0x0C-0x0F, 0x1C-0x1F, 0x2C-0x2F, 0x38-0x3F, 0x4C-0x4F, etc.
-    let top_byte = (instr >> 24) & 0xFF;
-    let is_simd_ldst = matches!(top_byte & 0xFC, 0x0C | 0x1C | 0x2C | 0x38 | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C
-                                   | 0x8C | 0x9C | 0xAC | 0xBC | 0xCC | 0xDC | 0xEC | 0xFC);
-    if is_simd_ldst {
-        let rn = (instr >> 5) & 0x1F;  // Rn (base register) at bits[9:5]
-        let rd = instr & 0x1F;         // Rd (destination) at bits[4:0]
-        let rm = (instr >> 16) & 0x1F; // Rm (index register) at bits[20:16]
-        // Check all three registers for x18
-        if rn == 18 || rd == 18 || rm == 18 { return true; }
-        // SIMD load/store with none of the registers as x18 is not an x18 instruction
-        return false;
-    }
-    
-    // Fallback: check for LDR/STR with scaled offset (top bytes 0x90, 0xb0, 0xb8, 0xb9, 0xf0, 0xf8, 0xf9)
-    // These have Rn at bits[9:5] and Rd/Rt at bits[4:0], and Rm at bits[20:16] for some forms
-    let is_ldst_scaled = matches!(top_byte, 0x90 | 0xb0 | 0xb8 | 0xb9 | 0xf0 | 0xf8 | 0xf9);
-    if is_ldst_scaled {
-        let rn = (instr >> 5) & 0x1F;  // Rn (base register) at bits[9:5]
-        let rd = instr & 0x1F;         // Rd/Rt at bits[4:0]
-        let rm = (instr >> 16) & 0x1F; // Rm (index/shift register) at bits[20:16]
-        // Check all three registers for x18
-        if rn == 18 || rd == 18 || rm == 18 { return true; }
-        return false;
-    }
-    
-    // Fallback: check for ADR/ADRP (top bytes 0x10, 0x18, 0x90, 0x98)
-    // These have Rd at bits[4:0]
-    let is_adr = matches!(top_byte, 0x10 | 0x18 | 0x90 | 0x98);
-    if is_adr {
-        let rd = instr & 0x1F;  // Rd at bits[4:0]
-        return rd == 18;
-    }
-    
-    // Fallback: check for regular load/store with GPR base register x18
-    // Single-register load/store: bits[28:27]=11, bit[25]=1
-    // Load/store pair: bits[28:27]=01, bit[25]=0
-    let bits28_27 = (instr >> 27) & 3;
-    let bit25 = (instr >> 25) & 1;
-    let is_ldst_single = bits28_27 == 3 && bit25 == 1;
-    let is_ldst_pair = bits28_27 == 1 && bit25 == 0;
-    if is_ldst_single || is_ldst_pair {
-        let rn = (instr >> 5) & 0x1F;  // Rn (base register) at bits[9:5]
-        if rn == 18 { return true; }
-        // Also check Rm for single-register with register offset
-        if is_ldst_single && (instr >> 24) & 1 == 0 && (instr >> 21) & 1 == 1 {
-            let rm = (instr >> 16) & 0x1F;
-            if rm == 18 { return true; }
+    // If we get here, the instruction is not in our table
+    // This should not happen for valid ARM A64 instructions that use GPRs
+    // Return false to be conservative (don't flag unknown instructions as x18)
+    false
+}
+
+#[cfg(debug_assertions)]
+pub fn references_x18(instr: u32) -> bool {
+    // Table-driven x18 detection - single source of truth
+    for encoding in INSTR_TABLE {
+        if (instr & encoding.mask) == encoding.value {
+            // Found a match - check if any register operand is x18
+            if let Some(operands) = encoding.reg_operands {
+                for &(lsb, width) in operands {
+                    let reg_no = ((instr >> lsb) & ((1u32 << width) - 1)) as usize;
+                    if reg_no == 18 {
+                        return true;
+                    }
+                }
+            }
+            // If we matched but have no reg_operands info, this instruction doesn't use GPRs
+            return false;
         }
     }
     
-    false
+    // If we get here, the instruction is not in our table
+    // In debug mode, panic to help identify missing table entries
+    panic!("Instruction 0x{:08x} not found in INSTR_TABLE - add entry for this instruction class", instr);
 }
 
 /// Emulate an instruction that references x18.
