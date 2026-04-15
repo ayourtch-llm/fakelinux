@@ -161,15 +161,25 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0x18000000,
         reg_operands: Some(&[(0, 5)]),  // Rd
     },
+    // ADR (PC-relative addressing): bits[31:28]=0001
+    // 0x10 and 0x14 for 32-bit/64-bit ADR
+    // Mask: 0xF8000000, Value: 0x10000000
+    // Rd at bits[4:0]
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x10000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
     // LDR/STR with unscaled immediate offset: bits[31:30]=11, bits[28:26]=000 or 001
     // 0xF8 and 0xF9 for LDR/STR
     // Mask: 0xFC000000, Value: 0xF8000000
-    // Rd/Rt at bits[4:0], Rn at bits[9:5]
+    // Rd/Rt at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
     InstrEncoding {
         class: InstrClass::LdrStrUnscaled,
         mask: 0xFC000000,
         value: 0xF8000000,
-        reg_operands: Some(&[(0, 5), (5, 5)]),  // Rd/Rt, Rn
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd/Rt, Rn, Rm
     },
     // LDP/STP (load/store pair): bits[31:30]=10, bits[28:25]=0100 or 0101
     // 0xA8 and 0xAA for LDP/STP
@@ -203,23 +213,22 @@ static INSTR_TABLE: &[InstrEncoding] = &[
     },
     // FMOV (floating-point to GPR): bits[31:28]=1111, bits[24]=0
     // 0xF2 and 0xF3 for FMOV
-    // Mask: 0xF8000000, Value: 0xF2000000
+    // Mask: 0xF8000000, Value: 0xF0000000
     // Rt at bits[4:0], Rn at bits[9:5]
     InstrEncoding {
         class: InstrClass::Unimplemented,
         mask: 0xF8000000,
-        value: 0xF2000000,
+        value: 0xF0000000,
         reg_operands: Some(&[(0, 5), (5, 5)]),  // Rt, Rn
     },
-    // FMOV (GPR to floating-point): bits[31:28]=1111, bits[24]=1
-    // 0xFA for FMOV
-    // Mask: 0xF8000000, Value: 0xFA000000
-    // Rt at bits[4:0], Rm at bits[20:16]
+    // FMOV (GPR to floating-point): bits[31:28]=1111, bits[27:24]=1010 (0xFA)
+    // Mask: 0xFF000000, Value: 0xFA000000
+    // Rt at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
     InstrEncoding {
         class: InstrClass::Unimplemented,
-        mask: 0xF8000000,
+        mask: 0xFF000000,
         value: 0xFA000000,
-        reg_operands: Some(&[(0, 5), (16, 5)]),  // Rt, Rm
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rm
     },
     // Data processing 1 source with extended immediate (0x92): bits[31:28]=1001
     // 0x92 for various 1-source data processing
@@ -230,6 +239,68 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         mask: 0xF8000000,
         value: 0x90000000,
         reg_operands: Some(&[(0, 5), (5, 5)]),  // Rd, Rn
+    },
+    // ADD/ADDP with extended register (0x7A, 0x9B): bits[31:28]=0111 or 1001
+    // Mask: 0xF8000000, Value: 0x78000000
+    // Rd at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xF8000000,
+        value: 0x78000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // Data processing with Rm operand (0x9B): bits[31:28]=1001, bits[27:26]=01
+    // Mask: 0xFC000000, Value: 0x98000000
+    // Rd at bits[4:0], Rn at bits[9:5], Rm at bits[20:16]
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFC000000,
+        value: 0x98000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rd, Rn, Rm
+    },
+    // LDR literal (0x18, 0x58): bits[31:26]=001101 or 010110
+    // Mask: 0xFC000000, Value: 0x18000000
+    // Rd at bits[4:0]
+    InstrEncoding {
+        class: InstrClass::LdrLiteral,
+        mask: 0xFC000000,
+        value: 0x18000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    // LDR literal (0x58 variant): bits[31:26]=010110
+    // Mask: 0xFC000000, Value: 0x58000000
+    // Rd at bits[4:0]
+    InstrEncoding {
+        class: InstrClass::LdrLiteral,
+        mask: 0xFC000000,
+        value: 0x58000000,
+        reg_operands: Some(&[(0, 5)]),  // Rd
+    },
+    // B.cond (conditional branch): bits[31:26]=010101
+    // 0x54 for B.cond - no register operands
+    InstrEncoding {
+        class: InstrClass::Unimplemented,
+        mask: 0xFC000000,
+        value: 0x54000000,
+        reg_operands: None,  // No GPR operands
+    },
+    // Data processing 1 source (0x53): bits[31:28]=0101
+    // Mask: 0xF8000000, Value: 0x50000000
+    // Rd at bits[4:0], Rn at bits[9:5]
+    InstrEncoding {
+        class: InstrClass::DataProc1Src,
+        mask: 0xF8000000,
+        value: 0x50000000,
+        reg_operands: Some(&[(0, 5), (5, 5)]),  // Rd, Rn
+    },
+    // LDP/STP with literal offset (0x34, 0x35): bits[31:26]=001101 or 001101
+    // Mask: 0xFC000000, Value: 0x34000000
+    // Rt at bits[4:0], Rt2 at bits[20:16], Rn at bits[9:5]
+    InstrEncoding {
+        class: InstrClass::LdrStrRegOffset,
+        mask: 0xFC000000,
+        value: 0x34000000,
+        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rt2
     },
 ];
 
@@ -269,17 +340,18 @@ pub fn references_x18(instr: u32) -> bool {
         }
     }
     
-    // Fallback: check for SIMD load/store instructions with GPR base/index register x18
-    // These have top bytes 0x0C-0x0F, 0x1C-0x1F, 0x2C-0x2F, 0x3C-0x3F, etc.
+    // Fallback: check for SIMD load/store instructions with GPR base/index/dest register x18
+    // These have top bytes 0x0C-0x0F, 0x1C-0x1F, 0x2C-0x2F, 0x38-0x3F, 0x4C-0x4F, etc.
     let top_byte = (instr >> 24) & 0xFF;
-    let is_simd_ldst = matches!(top_byte & 0xFC, 0x0C | 0x1C | 0x2C | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C
+    let is_simd_ldst = matches!(top_byte & 0xFC, 0x0C | 0x1C | 0x2C | 0x38 | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C
                                    | 0x8C | 0x9C | 0xAC | 0xBC | 0xCC | 0xDC | 0xEC | 0xFC);
     if is_simd_ldst {
         let rn = (instr >> 5) & 0x1F;  // Rn (base register) at bits[9:5]
+        let rd = instr & 0x1F;         // Rd (destination) at bits[4:0]
         let rm = (instr >> 16) & 0x1F; // Rm (index register) at bits[20:16]
-        // Check both base and index registers for x18
-        if rn == 18 || rm == 18 { return true; }
-        // SIMD load/store with neither base nor index as x18 is not an x18 instruction
+        // Check all three registers for x18
+        if rn == 18 || rd == 18 || rm == 18 { return true; }
+        // SIMD load/store with none of the registers as x18 is not an x18 instruction
         return false;
     }
     
