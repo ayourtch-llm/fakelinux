@@ -11,6 +11,283 @@
 
 use disarm64_defn::defn::InsnOpcode;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED DECODE + EMULATE INFRASTRUCTURE (Task 6)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Instruction classes for emulation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrClass {
+    /// EXTR - Extract register (used for ROR in SHA-1)
+    Extr,
+    /// Add/Subtract shifted register
+    AddSubShiftedReg,
+    /// Data Processing (1 source): REV, RBIT, CLZ, etc.
+    DataProc1Src,
+    /// ADD/SUB immediate
+    AddSubImmediate,
+    /// Logical immediate
+    LogicalImmediate,
+    /// Move wide (MOVZ/MOVK/MOVN)
+    MoveWide,
+    /// Unimplemented instruction class
+    Unimplemented,
+}
+
+/// Instruction encoding entry for table-driven decoding
+pub struct InstrEncoding {
+    /// Instruction class for emulation
+    pub class: InstrClass,
+    /// Mask for matching instruction bits
+    pub mask: u32,
+    /// Expected value after masking
+    pub value: u32,
+}
+
+/// Lookup table for instruction encodings
+/// 
+/// The table is ordered by specificity (most specific masks first).
+static INSTR_TABLE: &[InstrEncoding] = &[
+    // EXTR: bits[30:24] = 100111x (0x4C for 32-bit, 0x4E for other)
+    // Mask: 0xFC000000 (bits[31:26]), Value: 0x4C000000
+    // This matches both 0x4C (0b1001100) and 0x4E (0b1001110)
+    InstrEncoding {
+        class: InstrClass::Extr,
+        mask: 0xFC000000,
+        value: 0x4C000000,
+    },
+    // Data Processing 1 source: bits[31:21] = 10110101100
+    // Mask: 0x7FFF0000, Value: 0x5AC00000
+    InstrEncoding {
+        class: InstrClass::DataProc1Src,
+        mask: 0x7FFF0000,
+        value: 0x5AC00000,
+    },
+    // ADD/SUB shifted register: bits[28:25] = 01011, bit[24] = 0
+    // Mask: 0x1F200000, Value: 0x0B000000
+    InstrEncoding {
+        class: InstrClass::AddSubShiftedReg,
+        mask: 0x1F200000,
+        value: 0x0B000000,
+    },
+    // ADD/SUB immediate: bits[28:25] = 10001
+    // Mask: 0x1F000000, Value: 0x11000000
+    InstrEncoding {
+        class: InstrClass::AddSubImmediate,
+        mask: 0x1F000000,
+        value: 0x11000000,
+    },
+    // Move wide: bits[28:23] = 100101
+    // Mask: 0xFF800000, Value: 0x12800000
+    InstrEncoding {
+        class: InstrClass::MoveWide,
+        mask: 0xFF800000,
+        value: 0x12800000,
+    },
+];
+
+/// Decode an instruction and return its class
+/// 
+/// Returns the instruction class if recognized, or Unimplemented if not found.
+pub fn decode_class(instr: u32) -> InstrClass {
+    for encoding in INSTR_TABLE {
+        if (instr & encoding.mask) == encoding.value {
+            return encoding.class;
+        }
+    }
+    InstrClass::Unimplemented
+}
+
+/// Emulate an instruction that references x18.
+/// 
+/// This function provides a unified interface for emulating ARM A64 instructions.
+/// It uses table-driven decoding to determine the instruction class, then
+/// calls the appropriate emulation routine.
+/// 
+/// Returns `true` if emulation was successful, `false` if the instruction
+/// is not recognized or cannot be emulated.
+/// 
+/// # Arguments
+/// 
+/// * `instr` - The raw 32-bit instruction to emulate
+/// * `regs` - Mutable reference to register state (X1-X30, X0 is index 0)
+#[allow(dead_code)]
+pub fn emulate(instr: u32, regs: &mut TestRegs) -> bool {
+    let class = decode_class(instr);
+    
+    match class {
+        InstrClass::Extr => emulate_extr(instr, regs),
+        InstrClass::DataProc1Src => emulate_dp1_src(instr, regs),
+        _ => false, // Not yet implemented
+    }
+}
+
+/// Emulate EXTR (extract) instruction
+/// 
+/// EXTR extracts a field from a concatenated pair of registers.
+/// For 32-bit: concat(Rn, Rm) >> LSB, taking lower 32 bits as result.
+/// This is equivalent to ROR when Rn == Rm.
+/// 
+/// # Arguments
+/// 
+/// * `instr` - EXTR instruction encoding
+/// * `regs` - Register state
+/// 
+/// # Returns
+/// 
+/// Always returns `true` for valid EXTR instructions
+fn emulate_extr(instr: u32, regs: &mut TestRegs) -> bool {
+    let lsb = ((instr >> 10) & 0x3F) as u32;
+    let rn = ((instr >> 5) & 0x1F) as usize;
+    let rm = ((instr >> 16) & 0x1F) as usize;
+    let rd = (instr & 0x1F) as usize;
+    
+    // EXTR is only valid in 32-bit mode (sf=0)
+    // For 64-bit mode, the instruction would have different encoding
+    let hi = regs.get(rn);
+    let lo = regs.get(rm);
+    
+    // Concatenate hi:lo into a 64-bit value
+    let concat = ((hi as u64 & 0xFFFFFFFF) << 32) | (lo as u64 & 0xFFFFFFFF);
+    
+    // Extract the field starting at LSB, take lower 32 bits
+    let result = ((concat >> lsb) & 0xFFFFFFFF) as u64;
+    
+    regs.set(rd, result);
+    true
+}
+
+/// Emulate Data Processing 1-source instructions
+/// 
+/// These include: RBIT, REV16, REV, REV32, REV64, CLZ, CLS
+/// 
+/// # Arguments
+/// 
+/// * `instr` - DP1-source instruction encoding
+/// * `regs` - Register state
+/// 
+/// # Returns
+/// 
+/// `true` if emulation was successful, `false` if opcode not recognized
+fn emulate_dp1_src(instr: u32, regs: &mut TestRegs) -> bool {
+    let opcode = ((instr >> 10) & 0x3F) as u32;
+    let rn = ((instr >> 5) & 0x1F) as usize;
+    let rd = (instr & 0x1F) as usize;
+    let sf = (instr >> 31) & 1; // 0=32-bit, 1=64-bit
+    
+    let n = if sf == 0 { regs.get(rn) & 0xFFFFFFFF } else { regs.get(rn) };
+    
+    let result = match opcode {
+        // RBIT - Reverse bits
+        0x00 => reverse_bits(n, sf == 1),
+        // REV16 - Reverse bytes in each 16-bit half
+        0x02 => reverse_bytes_half(n, sf == 1),
+        // REV / REV32 - Reverse bytes in each 32-bit word
+        0x04 => reverse_bytes_word(n),
+        // CLZ - Count leading zeros
+        0x10 => count_leading_zeros(n, sf == 1),
+        // CLS - Count leading sign bits
+        0x12 => count_leading_sign_bits(n, sf == 1),
+        _ => return false,
+    };
+    
+    regs.set(rd, result);
+    true
+}
+
+/// Reverse all bits in a value
+fn reverse_bits(val: u64, is_64bit: bool) -> u64 {
+    if is_64bit {
+        val.reverse_bits()
+    } else {
+        (val as u32).reverse_bits() as u64
+    }
+}
+
+/// Reverse bytes within each 16-bit halfword
+fn reverse_bytes_half(val: u64, is_64bit: bool) -> u64 {
+    if is_64bit {
+        ((val & 0xFFFF) << 48) |
+        ((val & 0xFFFF_0000) >> 8) |
+        ((val & 0xFF00_0000) << 8) |
+        ((val & 0xFF00_0000_0000) >> 8) |
+        ((val & 0x00FF_0000_0000) << 8) |
+        ((val & 0x0000_FFFF_0000) << 8) |
+        ((val & 0x0000_0000_FFFF) << 48) |
+        ((val & 0x0000_0000_FFFF) >> 48)
+    } else {
+        ((val as u32).swap_bytes() & 0xFFFF_FFFF) as u64
+    }
+}
+
+/// Reverse bytes within each 32-bit word
+fn reverse_bytes_word(val: u64) -> u64 {
+    ((val as u32).swap_bytes() as u64) & 0xFFFF_FFFF
+}
+
+/// Count leading zeros
+fn count_leading_zeros(val: u64, is_64bit: bool) -> u64 {
+    if is_64bit {
+        val.leading_zeros() as u64
+    } else {
+        (val as u32).leading_zeros() as u64
+    }
+}
+
+/// Count leading sign bits
+fn count_leading_sign_bits(val: u64, is_64bit: bool) -> u64 {
+    if is_64bit {
+        let sign_bit = (val >> 63) & 1;
+        if sign_bit == 0 {
+            (!val).leading_zeros() as u64
+        } else {
+            val.leading_zeros() as u64
+        }
+    } else {
+        let val32 = val as u32;
+        let sign_bit = (val32 >> 31) & 1;
+        if sign_bit == 0 {
+            (!val32).leading_zeros() as u64
+        } else {
+            val32.leading_zeros() as u64
+        }
+    }
+}
+
+/// Test register set for emulation testing
+/// 
+/// Registers are accessed as X1-X30 (index 0-29), matching ARM numbering.
+/// X31 (SP) is not accessible through these methods.
+#[cfg(test)]
+struct TestRegs {
+    x: [u64; 31],
+}
+
+#[cfg(test)]
+impl TestRegs {
+    /// Create a new register set initialized to zero
+    fn new() -> Self {
+        Self { x: [0; 31] }
+    }
+    
+    /// Get the value of register Xn (n is 1-31)
+    fn get(&self, n: usize) -> u64 {
+        self.x[n.saturating_sub(1)]
+    }
+    
+    /// Set the value of register Xn (n is 1-31)
+    fn set(&mut self, n: usize, val: u64) {
+        if n < 31 { self.x[n - 1] = val; }
+    }
+}
+
+#[cfg(test)]
+impl Default for TestRegs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Main encoding groups (M*I*op0 from ARM manual)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainGroup {
@@ -546,5 +823,106 @@ mod tests {
         let rev_rd = 0x5ac00812; // REV w18, w0
         assert!(references_x18(rev_rd), 
             "DP1-source with Rd=x18 should be detected: {:#010x}", rev_rd);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Task 6: Unified decode + emulate function tests
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    #[test]
+    fn test_emulate_extr_basic() {
+        // EXTR w18, w15, w15, #27 — should rotate w15 right by 27
+        // Correct encoding: 0x4e0f6df2
+        // sf=0, N=0, opc=0, main_op=0x4E, Rm=15, imms=27, Rn=15, Rd=18
+        let instr = 0x4e0f6df2;
+        let mut regs = TestRegs::new();
+        regs.set(15, 0xDEADBEEF_u64);  // w15 = 0xDEADBEEF
+        
+        // This will call emulate() which we need to implement
+        let result = emulate(instr, &mut regs);
+        
+        assert!(result, "EXTR should be emulated successfully");
+        
+        // ROR by 27 on 32-bit value, stored as u64
+        let input: u32 = 0xDEADBEEF;
+        let expected = (input.rotate_right(27) as u64) & 0xFFFFFFFF;
+        assert_eq!(regs.get(18), expected, "EXTR should rotate correctly");
+    }
+    
+    #[test]
+    fn test_emulate_extr_sha1_rotation() {
+        // SHA-1 uses ROR which can be implemented as EXTR
+        // EXTR w18, w15, w15, #27 is equivalent to ROR w18, w15, #27
+        let instr = 0x4e0f6df2;
+        let mut regs = TestRegs::new();
+        
+        // SHA-1 test vector
+        let w15_val: u32 = 0x12345678;
+        regs.set(15, w15_val as u64);
+        
+        emulate(instr, &mut regs);
+        
+        // EXTR w18, w15, w15, #27 = ROR(w15, 27)
+        let expected = (w15_val.rotate_right(27) as u64) & 0xFFFFFFFF;
+        assert_eq!(regs.get(18), expected, "SHA-1 rotation should match");
+    }
+    
+    #[test]
+    fn test_emulate_extr_different_registers() {
+        // EXTR w18, w15, w16, #20 — using different source registers
+        // Correct encoding: 0x4e1051f2
+        // sf=0, N=0, opc=0, main_op=0x4E, Rm=16, imms=20, Rn=15, Rd=18
+        let instr = 0x4e1051f2;
+        
+        let mut regs = TestRegs::new();
+        regs.set(15, 0x12345678u64);
+        regs.set(16, 0x9ABCDEF0u64);
+        
+        let result = emulate(instr, &mut regs);
+        assert!(result, "Valid EXTR instruction should be emulated");
+        
+        // Concatenate hi:lo = 0x12345678_9ABCDEF0
+        // Shift right by 20, take lower 32 bits
+        let concat = (0x12345678u64 << 32) | 0x9ABCDEF0u64;
+        let expected = ((concat >> 20) & 0xFFFFFFFF) as u64;
+        
+        assert_eq!(regs.get(18), expected, "EXTR with different registers");
+    }
+    
+    #[test]
+    fn test_decode_class_extr() {
+        // Correct EXTR encoding: 0x4e0f6df2
+        let instr = 0x4e0f6df2;
+        assert_eq!(decode_class(instr), InstrClass::Extr, "EXTR should decode correctly");
+    }
+    
+    #[test]
+    fn test_decode_class_unimplemented() {
+        // NOP - should be unimplemented
+        let nop = 0xD503201F;
+        assert_eq!(decode_class(nop), InstrClass::Unimplemented, "NOP should be unimplemented");
+    }
+    
+    #[test]
+    fn test_emulate_returns_false_for_unimplemented() {
+        let nop = 0xD503201F;
+        let mut regs = TestRegs::new();
+        
+        let result = emulate(nop, &mut regs);
+        
+        assert!(!result, "Unimplemented instructions should return false");
+    }
+    
+    #[test]
+    fn test_testregs_basics() {
+        let mut regs = TestRegs::new();
+        assert_eq!(regs.get(1), 0, "New registers should be zero");
+        
+        regs.set(1, 42);
+        assert_eq!(regs.get(1), 42, "Register should hold set value");
+        
+        // Test that x31 (SP) is not accessible
+        regs.set(31, 999);
+        assert_eq!(regs.get(31), 0, "x31 should not be settable");
     }
 }
