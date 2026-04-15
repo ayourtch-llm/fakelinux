@@ -139,14 +139,46 @@ mod tests {
     
     /// Check if an instruction references x18 (platform register)
     /// 
-    /// This is a skeleton that returns false for non-x18 instructions.
-    /// Full implementation will use table-driven decoding.
+    /// This function checks for x18 (platform register) references in ARM A64 instructions.
+    /// For SIMD load/store instructions, it checks the GPR base register (Rn at bits[9:5]),
+    /// NOT the SIMD register (Vt at bits[4:0]).
     pub fn references_x18(instr: u32) -> bool {
         // Don't check our own UDF marker or SVC
         if instr == 0x0000_F000 || instr == 0xD4000001 { return false; }
         
-        // TODO: Implement full x18 detection using table-driven approach
-        // For skeleton, return false as baseline
+        let top_byte = (instr >> 24) & 0xFF;
+        
+        // Check for SIMD load/store instructions
+        // These use top bytes with [11:10] = 11 for load/store:
+        // - 0x0C/0x4C: AdvSIMD multi-structure load/store (post-index/pre-index)
+        // - 0x0D/0x4D: AdvSIMD single-structure load
+        // - 0x2C/0x6C/0x2D/0x6D: AdvSIMD load/store with post-index
+        // - 0x1C/0x5C/0x9C/0xDC: LDR (SIMD literal)
+        // - 0x3C/0x7C/0xBC/0xFC: LDR/STR (SIMD unsigned offset)
+        let is_simd_ldst = match top_byte {
+            0x0C | 0x4C |   // AdvSIMD multi-structure load (post-index / pre-index)
+            0x0D | 0x4D |   // AdvSIMD single-structure load (post-index / pre-index)
+            0x2C | 0x6C |   // AdvSIMD load with post-index
+            0x2D | 0x6D |   // AdvSIMD single structure post-index
+            0x1C | 0x5C |   // LDR (SIMD literal, unscaled offset)
+            0x9C | 0xDC |   // LDR (SIMD literal, immediate pre/post-index)
+            0x3C | 0x7C |   // LDR/STR (SIMD, unsigned offset)
+            0xBC | 0xFC     // LDR/STR (SIMD, register offset)
+                => true,
+            _ => false,
+        };
+        
+        if is_simd_ldst {
+            // For SIMD load/store:
+            // - Rt (bits[4:0]) is SIMD register V0-V31 — NOT what we check
+            // - Rn (bits[9:5]) is GPR base register — THIS is what we check for x18
+            let rn = (instr >> 5) & 0x1F;
+            return rn == 18;
+        }
+        
+        // For other instructions, check standard GPR register fields
+        // This will be expanded in later tasks with table-driven approach
+        // For now, return false as baseline
         false
     }
     
@@ -171,5 +203,67 @@ mod tests {
         let result = references_x18(0xD503201F);
         // Just verify the function can be called and returns a boolean
         assert!(matches!(result, true | false));
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test for Task 2: SIMD load/store with GPR base register x18 detection
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// Verify that SIMD Vt=18 (register v18) is NOT confused with GPR x18.
+    /// In SIMD load instructions, Vt is the SIMD register (V0-V31), while
+    /// the base register Rn (bits[9:5]) is a GPR (X0-X30). Only the GPR
+    /// base register should be checked for x18 references.
+    #[test]
+    fn test_simd_load_with_gpr_base_x18() {
+        // LD1 {v18.16b}, [x1] — Vt=18 is SIMD, should NOT be detected as x18
+        // because x18 detection should only check GPR base register
+        let instr = 0x0c402032; // LD1 {v18.16b}, [x1]
+        assert!(!references_x18(instr), 
+            "SIMD Vt=18 should not be detected as x18 (Vt is SIMD register, not GPR)");
+        
+        // LD1 {v18.16b}, [x18] — Rn=x18 IS GPR x18, should be detected
+        // Top byte 0x0c = AdvSIMD multi-structure load
+        // bits[9:5] = 18 = base register x18
+        let instr2 = 0x0c402252; // LD1 {v18.16b}, [x18]
+        assert!(references_x18(instr2), 
+            "GPR base x18 should be detected even when SIMD Vt=18");
+    }
+    
+    /// Verify that SIMD register 18 (Vt=18) does NOT trigger x18 detection.
+    /// This is a common edge case where the SIMD register number happens
+    /// to match the GPR number we care about, but they are distinct register sets.
+    #[test]
+    fn test_simd_load_simd_register_18_not_gpr() {
+        // Vt=18 in SIMD instructions should NOT trigger x18 detection
+        // because SIMD registers (V0-V31) are different from GPRs (X0-X30)
+        let simd_cases = &[
+            0x0c402032, // LD1 {v18.16b}, [x1]
+            0x4cdfa032, // LD1 {v18.16b}, [x1], #16
+            0x4d40c032, // LD1R {v18.4s}, [x1]
+        ];
+        for &instr in simd_cases {
+            assert!(!references_x18(instr), 
+                "SIMD Vt=18 should not be detected as x18: {:#010x}", instr);
+        }
+    }
+    
+    /// Test that SIMD load instructions correctly detect x18 in base register.
+    /// Different SIMD load/store instruction formats:
+    /// - 0x0C/0x4C: AdvSIMD multi-structure load/store
+    /// - 0x0D/0x4D: AdvSIMD single-structure load
+    /// - 0x2C/0x6C/0x2D/0x6D: Post-indexed forms
+    #[test]
+    fn test_simd_load_store_various_formats_with_x18_base() {
+        // Test various SIMD load formats with x18 as base register
+        let test_cases = &[
+            (0x0c402252, "LD1 multi-struct [x18]"),      // Top=0x0c
+            (0x4c402252, "LD1 multi-struct post-idx"),   // Top=0x4c
+            (0x0d402252, "LD1R single-struct [x18]"),    // Top=0x0d
+            (0x4d402252, "LD1R single-struct post-idx"), // Top=0x4d
+        ];
+        for (instr, desc) in test_cases {
+            assert!(references_x18(*instr), 
+                "{} ({:#010x}) should detect x18 base register", desc, instr);
+        }
     }
 }
