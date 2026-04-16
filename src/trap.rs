@@ -335,7 +335,13 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         EmulClass::CondCompareImm => emul_ccmp_imm(orig_instr, mctx),
         EmulClass::FloatGprConvert => emul_fmov(orig_instr, mctx),
         EmulClass::Extract => emul_extract(orig_instr, mctx),
-        _ => false,
+        other => {
+            let pc = mctx.ss.pc;
+            panic!(
+                "fakelinux: UNHANDLED EmulClass::{:?} for instr={:#010x} at pc={:#x}",
+                other, orig_instr, pc
+            );
+        }
     }
 }
 
@@ -419,13 +425,16 @@ fn emul_logical_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
             };
             let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
             if opc == 3 {
-                // ANDS — update NZ, clear CV
+                // ANDS — update NZ, clear CV; Rd=31 is XZR
                 let bits = if sf == 1 { 64 } else { 32 };
                 let n = (result >> (bits - 1)) & 1;
                 let z = if result == 0 { 1 } else { 0 };
                 regs.cpsr = (regs.cpsr & 0x0FFF_FFFF) | ((n as u32) << 31) | ((z as u32) << 30);
+                if rd != 31 { write_gpr(regs, rd, result); }
+            } else {
+                // AND/ORR/EOR — Rd=31 is SP
+                write_gpr_sp(regs, rd, result);
             }
-            if rd != 31 { write_gpr(regs, rd, result); }
             return true;
         }
         return false; // bad bitmask encoding
@@ -542,7 +551,24 @@ fn emul_addsub_carry(orig_instr: u32, mctx: &mut MContext64) -> bool {
         };
         let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
         if s == 1 {
-            update_nzcv(regs, a, b, result, op == 1, sf == 1);
+            // ADC/SBC needs its own carry/overflow computation (3-operand)
+            let bits = if sf == 1 { 64u32 } else { 32 };
+            let mask = if bits == 64 { u64::MAX } else { 0xFFFF_FFFF };
+            let a_m = a & mask;
+            let b_eff = if op == 0 { b & mask } else { (!b) & mask };
+            // Carry: use 128-bit to detect overflow
+            let wide = (a_m as u128) + (b_eff as u128) + (carry as u128);
+            let c_out = (wide >> bits) & 1;
+            // N, Z from result
+            let n = (result >> (bits - 1)) & 1;
+            let z = if (result & mask) == 0 { 1u32 } else { 0 };
+            // Overflow: sign of a_m and b_eff agree, but differ from result
+            let sa = (a_m >> (bits - 1)) & 1;
+            let sb = (b_eff >> (bits - 1)) & 1;
+            let sr = (result >> (bits - 1)) & 1;
+            let v = if sa == sb && sa != sr { 1u32 } else { 0 };
+            regs.cpsr = (regs.cpsr & 0x0FFF_FFFF)
+                | ((n as u32) << 31) | (z << 30) | ((c_out as u32) << 29) | (v << 28);
         }
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
@@ -640,120 +666,184 @@ fn emul_dp3_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
 }
 
 fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
-    {
-        let size = (orig_instr >> 30) & 0x3;
-        let v_bit = (orig_instr >> 26) & 1;
-        let is_load = (orig_instr >> 22) & 1;
-        let imm12 = ((orig_instr >> 10) & 0xFFF) as u64;
-        let rn = ((orig_instr >> 5) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        let scale = if v_bit == 1 {
-            let opc1 = (orig_instr >> 23) & 1;
-            if size == 0 && opc1 == 1 { 4u32 } else { size }
-        } else { size };
-        let offset = imm12 << scale;
-        let base = read_gpr_sp(&mctx.ss, rn);
-        let addr = base.wrapping_add(offset);
-        if v_bit == 1 {
-            let ns = &mut mctx.ns;
-            if is_load == 1 {
-                let val: u128 = match scale {
-                    0 => unsafe { *(addr as *const u8) as u128 },
-                    1 => unsafe { *(addr as *const u16) as u128 },
-                    2 => unsafe { *(addr as *const u32) as u128 },
-                    3 => unsafe { *(addr as *const u64) as u128 },
-                    4 => unsafe { *(addr as *const u128) },
-                    _ => 0,
-                };
-                ns.v[rt] = val;
-            } else {
-                let val = ns.v[rt];
-                match scale {
-                    0 => unsafe { *(addr as *mut u8) = val as u8 },
-                    1 => unsafe { *(addr as *mut u16) = val as u16 },
-                    2 => unsafe { *(addr as *mut u32) = val as u32 },
-                    3 => unsafe { *(addr as *mut u64) = val as u64 },
-                    4 => unsafe { *(addr as *mut u128) = val },
-                    _ => {}
-                }
-            }
+    let size = (orig_instr >> 30) & 0x3;
+    let v_bit = (orig_instr >> 26) & 1;
+    let opc = (orig_instr >> 22) & 0x3; // full 2-bit opc: 0=STR, 1=LDR, 2=signed64, 3=signed32/PRFM
+    let imm12 = ((orig_instr >> 10) & 0xFFF) as u64;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rt = (orig_instr & 0x1F) as usize;
+
+    // PRFM: size=3, V=0, opc=2 — prefetch hint, no-op
+    if v_bit == 0 && size == 3 && opc == 2 {
+        return true;
+    }
+
+    let scale = if v_bit == 1 {
+        let opc1 = (orig_instr >> 23) & 1;
+        if size == 0 && opc1 == 1 { 4u32 } else { size }
+    } else { size };
+    let offset = imm12 << scale;
+    let base = read_gpr_sp(&mctx.ss, rn);
+    let addr = base.wrapping_add(offset);
+
+    if v_bit == 1 {
+        // SIMD/FP register access
+        let is_load = opc & 1;
+        let ns = &mut mctx.ns;
+        if is_load == 1 {
+            let val: u128 = match scale {
+                0 => unsafe { *(addr as *const u8) as u128 },
+                1 => unsafe { *(addr as *const u16) as u128 },
+                2 => unsafe { *(addr as *const u32) as u128 },
+                3 => unsafe { *(addr as *const u64) as u128 },
+                4 => unsafe { *(addr as *const u128) },
+                _ => 0,
+            };
+            ns.v[rt] = val;
         } else {
-            let regs = &mut mctx.ss;
-            if is_load == 1 {
-                let val = unsafe { load_mem(addr, size) };
-                if rt != 31 { write_gpr(regs, rt, val); }
-            } else {
+            let val = ns.v[rt];
+            match scale {
+                0 => unsafe { *(addr as *mut u8) = val as u8 },
+                1 => unsafe { *(addr as *mut u16) = val as u16 },
+                2 => unsafe { *(addr as *mut u32) = val as u32 },
+                3 => unsafe { *(addr as *mut u64) = val as u64 },
+                4 => unsafe { *(addr as *mut u128) = val },
+                _ => {}
+            }
+        }
+    } else {
+        // GPR access: opc=0 store, opc=1 load (zero-ext), opc=2 signed load to X, opc=3 signed load to W
+        let regs = &mut mctx.ss;
+        match opc {
+            0 => {
+                // STR
                 let val = read_gpr(regs, rt);
                 unsafe { store_mem(addr, size, val); }
             }
+            1 => {
+                // LDR (zero-extend)
+                let val = unsafe { load_mem(addr, size) };
+                if rt != 31 { write_gpr(regs, rt, val); }
+            }
+            2 => {
+                // Signed load, extend to 64-bit (LDRSW/LDRSH/LDRSB to X)
+                let raw = unsafe { load_mem(addr, size) };
+                let val = match size {
+                    0 => raw as u8 as i8 as i64 as u64,   // LDRSB → X
+                    1 => raw as u16 as i16 as i64 as u64, // LDRSH → X
+                    2 => raw as u32 as i32 as i64 as u64, // LDRSW → X
+                    _ => raw,
+                };
+                if rt != 31 { write_gpr(regs, rt, val); }
+            }
+            3 => {
+                // Signed load, extend to 32-bit (LDRSB/LDRSH to W)
+                let raw = unsafe { load_mem(addr, size) };
+                let val = match size {
+                    0 => (raw as u8 as i8 as i32 as u32) as u64,  // LDRSB → W
+                    1 => (raw as u16 as i16 as i32 as u32) as u64, // LDRSH → W
+                    _ => raw & 0xFFFF_FFFF,
+                };
+                if rt != 31 { write_gpr(regs, rt, val); }
+            }
+            _ => unreachable!(),
         }
-        return true;
     }
-    false
+    true
 }
 
 fn emul_ldr_str_unscaled(orig_instr: u32, mctx: &mut MContext64) -> bool {
     let regs = &mut mctx.ss;
-    {
-        let size = (orig_instr >> 30) & 0x3;
-        let is_load = (orig_instr >> 22) & 1;
-        let imm9 = ((orig_instr >> 12) & 0x1FF) as u64;
-        let imm9 = sign_extend(imm9, 9);
-        let rn = ((orig_instr >> 5) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        let base = read_gpr_sp(regs, rn);
-        let addr = base.wrapping_add(imm9);
-        if is_load == 1 {
-            let val = unsafe { load_mem(addr, size) };
+    let size = (orig_instr >> 30) & 0x3;
+    let opc = (orig_instr >> 22) & 0x3;
+    let imm9 = sign_extend(((orig_instr >> 12) & 0x1FF) as u64, 9);
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rt = (orig_instr & 0x1F) as usize;
+    let base = read_gpr_sp(regs, rn);
+    let addr = base.wrapping_add(imm9);
+    // PRFUM: size=3, opc=2 — prefetch unscaled, no-op
+    if size == 3 && opc == 2 { return true; }
+    match opc {
+        0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+        1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
+        2 => {
+            let raw = unsafe { load_mem(addr, size) };
+            let val = match size {
+                0 => raw as u8 as i8 as i64 as u64,
+                1 => raw as u16 as i16 as i64 as u64,
+                2 => raw as u32 as i32 as i64 as u64,
+                _ => raw,
+            };
             if rt != 31 { write_gpr(regs, rt, val); }
-        } else {
-            let val = read_gpr(regs, rt);
-            unsafe { store_mem(addr, size, val); }
         }
-        return true;
+        3 => {
+            let raw = unsafe { load_mem(addr, size) };
+            let val = match size {
+                0 => (raw as u8 as i8 as i32 as u32) as u64,
+                1 => (raw as u16 as i16 as i32 as u32) as u64,
+                _ => raw & 0xFFFF_FFFF,
+            };
+            if rt != 31 { write_gpr(regs, rt, val); }
+        }
+        _ => unreachable!(),
     }
-    false
+    true
 }
 
 fn emul_ldr_str_prepost(orig_instr: u32, mctx: &mut MContext64) -> bool {
     let regs = &mut mctx.ss;
-    {
-        let size = (orig_instr >> 30) & 0x3;
-        let is_load = (orig_instr >> 22) & 1;
-        let imm9 = ((orig_instr >> 12) & 0x1FF) as u64;
-        let imm9 = sign_extend(imm9, 9);
-        let wb = (orig_instr >> 10) & 0x3;
-        let rn = ((orig_instr >> 5) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        let base = read_gpr_sp(regs, rn);
-        let addr = if wb == 0b11 { base.wrapping_add(imm9) } else { base }; // pre vs post
-        if is_load == 1 {
-            let val = unsafe { load_mem(addr, size) };
+    let size = (orig_instr >> 30) & 0x3;
+    let opc = (orig_instr >> 22) & 0x3;
+    let imm9 = sign_extend(((orig_instr >> 12) & 0x1FF) as u64, 9);
+    let wb = (orig_instr >> 10) & 0x3;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rt = (orig_instr & 0x1F) as usize;
+    let base = read_gpr_sp(regs, rn);
+    let addr = if wb == 0b11 { base.wrapping_add(imm9) } else { base }; // pre vs post
+    match opc {
+        0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+        1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
+        2 => {
+            let raw = unsafe { load_mem(addr, size) };
+            let val = match size {
+                0 => raw as u8 as i8 as i64 as u64,
+                1 => raw as u16 as i16 as i64 as u64,
+                2 => raw as u32 as i32 as i64 as u64,
+                _ => raw,
+            };
             if rt != 31 { write_gpr(regs, rt, val); }
-        } else {
-            let val = read_gpr(regs, rt);
-            unsafe { store_mem(addr, size, val); }
         }
-        let new_base = if wb == 0b11 { base.wrapping_add(imm9) } else { base.wrapping_add(imm9) };
-        write_gpr_sp(regs, rn, new_base);
-        return true;
+        3 => {
+            let raw = unsafe { load_mem(addr, size) };
+            let val = match size {
+                0 => (raw as u8 as i8 as i32 as u32) as u64,
+                1 => (raw as u16 as i16 as i32 as u32) as u64,
+                _ => raw & 0xFFFF_FFFF,
+            };
+            if rt != 31 { write_gpr(regs, rt, val); }
+        }
+        _ => unreachable!(),
     }
-    false
+    // Bug #9 fix: writeback (both pre and post write base + offset)
+    let new_base = base.wrapping_add(imm9);
+    write_gpr_sp(regs, rn, new_base);
+    true
 }
 
 fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
     {
         let size = (orig_instr >> 30) & 0x3;
         let v_bit = (orig_instr >> 26) & 1;
-        let is_load = (orig_instr >> 22) & 1;
+        let opc = (orig_instr >> 22) & 0x3;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
         let option = (orig_instr >> 13) & 0x7;
         let s_bit = (orig_instr >> 12) & 1;
         let rn = ((orig_instr >> 5) & 0x1F) as usize;
         let rt = (orig_instr & 0x1F) as usize;
+        // PRFM register offset: size=3, V=0, opc=2
+        if v_bit == 0 && size == 3 && opc == 2 { return true; }
         let offset_val = read_gpr(&mctx.ss, rm);
         let scale = if v_bit == 1 {
-            // SIMD/FP: size+opc[1] determines scale (0=8,1=16,2=32,3=64,0+opc1=128)
             let opc1 = (orig_instr >> 23) & 1;
             if size == 0 && opc1 == 1 { 4u32 } else { size }
         } else { size };
@@ -761,7 +851,7 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
         let base = read_gpr_sp(&mctx.ss, rn);
         let addr = base.wrapping_add(offset_val);
         if v_bit == 1 {
-            // SIMD/FP: access mctx.ns.v[rt] directly
+            let is_load = opc & 1;
             let ns = &mut mctx.ns;
             if is_load == 1 {
                 let val: u128 = match scale {
@@ -786,12 +876,29 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
             }
         } else {
             let regs = &mut mctx.ss;
-            if is_load == 1 {
-                let val = unsafe { load_mem(addr, size) };
-                if rt != 31 { write_gpr(regs, rt, val); }
-            } else {
-                let val = read_gpr(regs, rt);
-                unsafe { store_mem(addr, size, val); }
+            match opc {
+                0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+                1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
+                2 => {
+                    let raw = unsafe { load_mem(addr, size) };
+                    let val = match size {
+                        0 => raw as u8 as i8 as i64 as u64,
+                        1 => raw as u16 as i16 as i64 as u64,
+                        2 => raw as u32 as i32 as i64 as u64,
+                        _ => raw,
+                    };
+                    if rt != 31 { write_gpr(regs, rt, val); }
+                }
+                3 => {
+                    let raw = unsafe { load_mem(addr, size) };
+                    let val = match size {
+                        0 => (raw as u8 as i8 as i32 as u32) as u64,
+                        1 => (raw as u16 as i16 as i32 as u32) as u64,
+                        _ => raw & 0xFFFF_FFFF,
+                    };
+                    if rt != 31 { write_gpr(regs, rt, val); }
+                }
+                _ => unreachable!(),
             }
         }
         return true;
@@ -814,10 +921,10 @@ fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
         let is_signed = opc == 1; // LDPSW: load 32-bit, sign-extend to 64-bit
         let offset = sign_extend(imm7, 7) << scale;
         let base = read_gpr_sp(regs, rn);
-        let addr = if wb_type == 0b11 || wb_type == 0b10 {
-            base.wrapping_add(offset)
+        let addr = if wb_type == 0b01 {
+            base // post-index: use base first, writeback later
         } else {
-            base // post-index: use base first
+            base.wrapping_add(offset) // offset (10), pre-index (11), no-allocate (00)
         };
         let elem_size = 1u64 << scale;
         if is_load == 1 {
@@ -846,19 +953,6 @@ fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
-    // LDRSW (immediate, unsigned offset): 10_111_00_110_imm12_Rn_Rt
-    if orig_instr & 0xFFC0_0000 == 0xB980_0000 {
-        let imm12 = ((orig_instr >> 10) & 0xFFF) as u64;
-        let rn = ((orig_instr >> 5) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        let offset = imm12 << 2;
-        let base = read_gpr_sp(regs, rn);
-        let addr = base.wrapping_add(offset);
-        let val = unsafe { *(addr as *const i32) as i64 as u64 };
-        if rt != 31 { write_gpr(regs, rt, val); }
-        return true;
-    }
-
     false
 }
 
@@ -1084,7 +1178,7 @@ fn emul_extract(orig_instr: u32, mctx: &mut MContext64) -> bool {
         let concat = ((hi & 0xFFFF_FFFF) << 32) | (lo & 0xFFFF_FFFF);
         ((concat >> imms) & 0xFFFF_FFFF) as u64
     } else {
-        if imms == 0 { hi }
+        if imms == 0 { lo }
         else { (hi << (64 - imms)) | (lo >> imms) }
     };
     if rd != 31 { write_gpr(regs, rd, result); }
@@ -1942,5 +2036,202 @@ mod tests {
         for &instr in non_x18 {
             assert!(!references_x18(instr), "false positive for {:#010x}", instr);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Emulation handler tests (TDD for audit-found bugs)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Create a zeroed MContext64 for testing.
+    fn make_mctx() -> MContext64 {
+        // Ensure x18 thread-local storage is initialized
+        if !X18_KEY_INIT.load(std::sync::atomic::Ordering::SeqCst) {
+            init_x18_key();
+        }
+        unsafe { std::mem::zeroed() }
+    }
+
+    // ─── Bug #1: Signed loads executed as stores ─────────────────────
+
+    #[test]
+    fn test_ldrsw_emulates_as_load_not_store() {
+        // LDRSW x2, [x18] — opc=10 (signed load), Rn=x18 (base), Rt=x2 (dest)
+        // Encoding: 10_111_00_110_000000000000_10010_00010 = 0xB9800242
+        // This MUST load from memory, NOT store.
+        let mut mctx = make_mctx();
+        let test_val: i32 = -42;
+        let test_addr = &test_val as *const i32 as u64;
+        set_thread_x18(test_addr); // x18 = base address
+        mctx.ss.x[2] = 0xDEAD; // sentinel in destination
+
+        let instr: u32 = 0xB9800242; // LDRSW x2, [x18, #0]
+        let result = emul_ldr_str_unsigned_imm(instr, &mut mctx);
+        assert!(result, "LDRSW should be handled");
+
+        // x2 should contain sign-extended -42
+        assert_eq!(mctx.ss.x[2], (-42i64) as u64,
+            "LDRSW should sign-extend to 64-bit, got {:#x}", mctx.ss.x[2]);
+        assert_eq!(test_val, -42, "memory should NOT be modified by a load");
+    }
+
+    #[test]
+    fn test_ldrsh_emulates_as_load_not_store() {
+        // LDRSH x2, [x18] — size=01, opc=10, Rn=x18, Rt=x2
+        // Encoding: 01_111_00_110_000000000000_10010_00010 = 0x79800242
+        let mut mctx = make_mctx();
+        let test_val: i16 = -1000;
+        let test_addr = &test_val as *const i16 as u64;
+        set_thread_x18(test_addr);
+        mctx.ss.x[2] = 0xDEAD;
+
+        let instr: u32 = 0x79800242; // LDRSH x2, [x18]
+        let result = emul_ldr_str_unsigned_imm(instr, &mut mctx);
+        assert!(result, "LDRSH should be handled");
+
+        assert_eq!(mctx.ss.x[2], (-1000i64) as u64,
+            "LDRSH should sign-extend to 64-bit, got {:#x}", mctx.ss.x[2]);
+        assert_eq!(test_val, -1000, "memory should NOT be modified by a load");
+    }
+
+    // ─── Bug #2: PRFM executed as store ──────────────────────────────
+
+    #[test]
+    fn test_prfm_is_noop() {
+        // PRFM #0, [x0] with x0 pointing at a canary — size=3, V=0, opc=2
+        // Encoding: 11_111_00_110_000000000000_00000_00000 = 0xF9800000
+        let mut mctx = make_mctx();
+        let mut canary: u64 = 0xCAFE_BABE_1234_5678;
+        let addr = &mut canary as *mut u64 as u64;
+        mctx.ss.x[0] = addr;
+
+        let instr: u32 = 0xF9800000; // PRFM #0, [x0]
+        let result = emul_ldr_str_unsigned_imm(instr, &mut mctx);
+        assert!(result, "PRFM should be handled (as no-op)");
+        assert_eq!(canary, 0xCAFE_BABE_1234_5678,
+            "PRFM should NOT modify memory");
+    }
+
+    // ─── Bug #3: ADC/SBC wrong C flag ───────────────────────────────
+
+    #[test]
+    fn test_adcs_carry_flag_with_carry_in() {
+        // ADCS x18, x0, x1 — sf=1, op=0, S=1
+        // a=MAX, b=MAX, carry_in=1 → result wraps, C should be 1
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = u64::MAX;
+        mctx.ss.x[1] = u64::MAX;
+        mctx.ss.cpsr = 1 << 29; // C flag set (carry-in = 1)
+        set_thread_x18(0);
+
+        // ADCS x18, x0, x1: sf=1, op=0, S=1, Rm=1, Rn=0, Rd=18
+        // 10_1_11010000_00001_000000_00000_10010 = 0xBA010012
+        let instr: u32 = 0xBA010012;
+        emul_addsub_carry(instr, &mut mctx);
+
+        // C flag should be set (overflow from 64-bit addition)
+        let c_flag = (mctx.ss.cpsr >> 29) & 1;
+        assert_eq!(c_flag, 1, "ADCS with MAX+MAX+1 should set C flag");
+    }
+
+    #[test]
+    fn test_sbcs_carry_flag_equal_with_no_carry() {
+        // SBCS x18, x0, x1 — a=5, b=5, carry_in=0
+        // SBC = a + ~b + C = 5 + ~5 + 0 = 5 + 0xFFFF...FFFA + 0 = 0xFFFF...FFFF
+        // No carry-out → C should be 0
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 5;
+        mctx.ss.x[1] = 5;
+        mctx.ss.cpsr = 0; // C flag clear (carry-in = 0)
+        set_thread_x18(0);
+
+        // SBCS x18, x0, x1: sf=1, op=1, S=1, Rm=1, Rn=0, Rd=18
+        // 11_1_11010000_00001_000000_00000_10010 = 0xFA010012
+        let instr: u32 = 0xFA010012;
+        emul_addsub_carry(instr, &mut mctx);
+
+        let c_flag = (mctx.ss.cpsr >> 29) & 1;
+        assert_eq!(c_flag, 0, "SBCS 5-5 with C=0 should clear C flag");
+    }
+
+    // ─── Bug #4: LDNP/STNP offset not applied ───────────────────────
+
+    #[test]
+    fn test_ldnp_applies_offset() {
+        // LDNP x2, x3, [x0, #16] — no-allocate pair load with offset
+        // opc=10, wb=00, L=1, imm7=2, Rt2=3, Rn=0, Rt=2
+        // 10_101_000_01_0000010_00011_00000_00010 = 0xA8410C02
+        let mut mctx = make_mctx();
+        let data: [u64; 4] = [111, 222, 333, 444];
+        let base_addr = data.as_ptr() as u64;
+        mctx.ss.x[0] = base_addr;
+
+        let instr: u32 = 0xA8410C02;
+        let result = emul_ldp_stp(instr, &mut mctx);
+        assert!(result, "LDNP should be handled");
+
+        // With offset #16 (imm7=2, scale=8): should load from base+16 and base+24
+        assert_eq!(mctx.ss.x[2], 333, "LDNP Rt should load from base+16, got {}", mctx.ss.x[2]);
+        assert_eq!(mctx.ss.x[3], 444, "LDNP Rt2 should load from base+24");
+    }
+
+    // ─── Bug #7: EXTR 64-bit lsb=0 returns wrong register ──────────
+
+    #[test]
+    fn test_extr_64bit_lsb0_returns_xm() {
+        // EXTR x2, x0, x1, #0 — should return Xm (x1), not Xn (x0)
+        // ARM spec: result = (Xn:Xm)<63:0> = Xm when lsb=0
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0xAAAA_BBBB_CCCC_DDDD; // Xn (high)
+        mctx.ss.x[1] = 0x1111_2222_3333_4444; // Xm (low)
+
+        // EXTR x2, x0, x1, #0: sf=1, N=1, o0=0, Rm=1, imms=0, Rn=0, Rd=2
+        // 1_00_100111_1_0_00001_000000_00000_00010 = 0x93C10002
+        let instr: u32 = 0x93C10002;
+        let result = emul_extract(instr, &mut mctx);
+        assert!(result, "EXTR should be handled");
+
+        assert_eq!(mctx.ss.x[2], 0x1111_2222_3333_4444,
+            "EXTR x2, x0, x1, #0 should return Xm (x1), got {:#x}", mctx.ss.x[2]);
+    }
+
+    // ─── Bug #8: Logical imm Rd=31 should write SP ──────────────────
+
+    #[test]
+    fn test_and_imm_rd31_writes_sp() {
+        // ORR SP, x18, #0x1 — opc=01, Rd=31 should write to SP (not discard)
+        // For ORR (not ANDS), Rd=31 means SP
+        let mut mctx = make_mctx();
+        set_thread_x18(0x1234_5678_9ABC_0000);
+        mctx.ss.sp = 0;
+
+        // ORR xSP, x18, #0x1: sf=1, opc=01, N=1, immr=0, imms=0, Rn=18, Rd=31
+        // 1_01_100100_1_000000_000000_10010_11111 = 0xB240025F
+        let instr: u32 = 0xB240025F;
+        let result = emul_logical_imm(instr, &mut mctx);
+        assert!(result, "ORR imm with Rd=SP should be handled");
+
+        // SP should have the ORR result (0x...0000 | 0x1 = 0x...0001)
+        assert_eq!(mctx.ss.sp, 0x1234_5678_9ABC_0001,
+            "ORR SP, x18, #1 should write to SP, got {:#x}", mctx.ss.sp);
+    }
+
+    // ─── Bug #9: Dead conditional in prepost writeback ───────────────
+
+    #[test]
+    fn test_ldr_prepost_writeback_correct() {
+        // LDR x2, [x0, #8]! — pre-index, should writeback x0 = x0 + 8
+        let mut mctx = make_mctx();
+        let data: [u64; 2] = [0xDEAD, 0xBEEF];
+        let base_addr = data.as_ptr() as u64;
+        mctx.ss.x[0] = base_addr;
+
+        // LDR x2, [x0, #8]!: size=11, V=0, opc=01, imm9=8, wb=11 (pre)
+        // 11_111_00_01_0_000001000_11_00000_00010 = 0xF8408C02
+        let instr: u32 = 0xF8408C02;
+        let result = emul_ldr_str_prepost(instr, &mut mctx);
+        assert!(result, "LDR pre-index should be handled");
+
+        assert_eq!(mctx.ss.x[2], 0xBEEF, "should load from base+8");
+        assert_eq!(mctx.ss.x[0], base_addr + 8, "x0 should be updated to base+8");
     }
 }
