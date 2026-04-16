@@ -1451,13 +1451,27 @@ unsafe extern "C" fn trap_handler(
                 let pid = libc::getpid();
                 let sp = mctx.ss.sp;
                 let lr = mctx.ss.lr;
-                let mut buf = [0u8; 300];
-                let n = raw_fmt(&mut buf, format_args!(
-                    "fakelinux: [{}] LR_WATCH_HIT! pc={:#x} sp={:#x} lr={:#x} expected={:#x} got={:#x}\n",
-                    pid, pc, sp, lr, lw_exp, lw_cur
-                ));
-                libc::write(2, buf.as_ptr() as *const _, n);
-                // Update expected so we only report the FIRST corruption
+                // Dump 16 qwords AROUND the watched address to see context
+                let mut ctx_buf = [0u8; 800];
+                let mut cn = {
+                    use std::io::Write;
+                    let mut c = std::io::Cursor::new(&mut ctx_buf[..]);
+                    let _ = c.write_fmt(format_args!(
+                        "fakelinux: [{}] LR_WATCH_HIT! pc={:#x} sp={:#x} lr={:#x} expected={:#x} got={:#x} watch_addr={:#x}\n",
+                        pid, pc, sp, lr, lw_exp, lw_cur, lw_addr));
+                    // Stack dump around watch address (8 qwords below, 8 above)
+                    let _ = c.write_fmt(format_args!("  STACK around watch_addr {:#x}:\n", lw_addr));
+                    for off in -64i64..=64i64 {
+                        if off % 8 != 0 { continue; }
+                        let a = (lw_addr as i64 + off) as u64;
+                        let v = (a as *const u64).read();
+                        let mark = if a == lw_addr { " <-- WATCHED" } else { "" };
+                        let _ = c.write_fmt(format_args!("    [{:#x}] = {:#018x}{}\n", a, v, mark));
+                    }
+                    c.position() as usize
+                };
+                libc::write(2, ctx_buf.as_ptr() as *const _, cn);
+                let _ = cn;
                 FORK_LR_WATCH_EXPECTED.store(lw_cur, Ordering::Relaxed);
             }
         }

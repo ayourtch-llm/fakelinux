@@ -705,9 +705,11 @@ extern "C" fn fork_trampoline_entry() -> ! {
         crate::trap::FORK_CANARY_ADDR.store(canary_addr, std::sync::atomic::Ordering::Relaxed);
         crate::trap::FORK_CANARY_SAVED.store(saved_canary, std::sync::atomic::Ordering::Relaxed);
 
-        // Watch __libc_fork's saved LR on the stack to detect corruption.
-        // __libc_fork_sp = guest_sp + 0x10. stp x29,x30,[sp,#224] puts x30 at sp+232=sp+0xE8.
-        let lr_watch_addr = guest_sp + 0x10 + 0xE8;
+        // Watch _Fork's saved LR on the stack to detect corruption.
+        // glibc 2.39+ uses _Fork (not __libc_fork). Its prologue is just:
+        //   stp x29, x30, [sp, #-16]!
+        // So saved x30 is at sp+8 of _Fork's frame, where sp = guest_sp at clone SVC.
+        let lr_watch_addr = guest_sp + 8;
         // Read the LR BEFORE fork — this is the correct parent value
         let lr_before_fork = unsafe { (lr_watch_addr as *const u64).read() };
         // Read LR again AFTER fork — if macOS fork corrupted it, this will differ
