@@ -1922,7 +1922,11 @@ pub fn install_trap_handler() {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = trap_handler as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa.sa_mask);
+        // Block other signals during the SIGILL handler to prevent signal_forwarder
+        // from racing with trap_handler on the shared mctx and FORK trampoline state.
+        // Without this, a SIGCHLD arriving mid-handler can corrupt sigframe writes
+        // and miss sigreturn restoration. See docs/theory.md.
+        libc::sigfillset(&mut sa.sa_mask);
         if libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut()) != 0 {
             let msg = "fakelinux: sigaction(SIGILL) failed\n";
             libc::write(2, msg.as_ptr() as *const _, msg.len());
