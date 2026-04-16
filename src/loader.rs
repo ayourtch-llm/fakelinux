@@ -383,54 +383,75 @@ fn addr_in_code_ranges(addr: u64, code_ranges: &[(u64, u64)]) -> bool {
     false
 }
 
-/// Detect embedded literal pools by scanning for ADR/ADRP instructions whose
-/// targets fall within the scanned code range. Such targets are typically
-/// embedded data tables (e.g. SHA-256 round constants in libcrypto), which
-/// must NOT be patched as if they were instructions.
+/// Detect embedded literal pools by scanning for `adr xN, target` instructions
+/// followed (within a few instructions) by `ldr ?, [xN], #...` (post-increment
+/// load via the same register). This is the canonical ARM idiom for reading
+/// from an embedded data table (e.g. SHA-256 K constants in libcrypto's
+/// SHA256_Transform).
 ///
-/// Returns a sorted Vec of `(start_addr, end_addr)` ranges to exclude from
-/// x18 patching. Each range is conservatively sized to MAX_LITERAL_POOL_SIZE
-/// bytes, terminated early if a clear function-prologue pattern is encountered.
+/// Returns a sorted Vec of `(start_addr, end_addr)` ranges. Each pool ends at
+/// the next function prologue (`paciasp` / `stp x29, x30, [sp, #-N]!`) or at
+/// MAX_LITERAL_POOL_SIZE, whichever comes first.
+///
+/// The detection is intentionally conservative: it requires BOTH the ADR and
+/// the post-increment load to match before excluding a region. A bare ADR
+/// (e.g. for code addresses, switch table bases) is NOT excluded.
 fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
-    // Conservative max literal pool size. SHA-256 K table is 256 bytes.
-    // Rare to have larger inline tables in code segments.
-    const MAX_LITERAL_POOL_SIZE: u64 = 1024;
+    // Hard cap on pool size. SHA-256 K table is 256 bytes; rare to see larger.
+    const MAX_LITERAL_POOL_SIZE: u64 = 512;
+    // How many instructions after the ADR to look for the post-inc load.
+    const LOOKAHEAD_INSTRS: usize = 8;
 
     let count = len / 4;
     let base = start as *const u32;
     let mut pool_starts: Vec<u64> = Vec::new();
 
-    // First pass: find ADR/ADRP targets that fall within the scanned range
-    // and AFTER the ADR instruction itself (forward references).
     for i in 0..count as usize {
         let pc = start + (i as u64) * 4;
         let instr = unsafe { base.add(i).read() };
 
-        // ADR:  bits[31:24] = 0_xx_10000  (top byte 0x10/0x30/0x50/0x70)
-        // ADRP: bits[31:24] = 1_xx_10000  (top byte 0x90/0xB0/0xD0/0xF0)
-        let is_adr = (instr & 0x9F000000) == 0x10000000;
-        let is_adrp = (instr & 0x9F000000) == 0x90000000;
-        if !is_adr && !is_adrp { continue; }
+        // Match ADR (not ADRP — ADRP usually points to .rodata in another seg)
+        // ADR encoding: bit[31]=0, bits[28:24]=10000
+        if (instr & 0x9F000000) != 0x10000000 { continue; }
 
-        // Decode 21-bit signed immediate
+        // Decode 21-bit signed immediate (immhi:immlo)
         let immlo = ((instr >> 29) & 0x3) as u64;
         let immhi = ((instr >> 5) & 0x7FFFF) as u64;
         let imm21 = (immhi << 2) | immlo;
-        // Sign extend 21 bits
         let imm = if imm21 & (1 << 20) != 0 {
             (imm21 | !((1u64 << 21) - 1)) as i64
         } else {
             imm21 as i64
         };
+        let target = pc.wrapping_add(imm as u64);
+        let rd = (instr & 0x1F) as u32;
 
-        let target = if is_adrp {
-            (pc & !0xFFF).wrapping_add((imm as u64) << 12)
-        } else {
-            pc.wrapping_add(imm as u64)
-        };
+        // Target must be a forward reference within the scan range
+        if target <= pc || target >= start + len { continue; }
 
-        // Only count forward references within our scan range
-        if is_adr && target > pc && target < start + len {
+        // Look ahead for post-increment load via the same register.
+        // LDR (immediate, post-index) encoding:
+        //   size_111_00_0_x_0_imm9_01_Rn_Rt
+        //   (bits[29:27]=111, bit[26]=0, bit[24]=0, bits[21]=0, bits[11:10]=01)
+        // For our purposes, accept any load with [Rn], #imm post-index where Rn==rd
+        let mut found_load = false;
+        let max_j = (i + LOOKAHEAD_INSTRS).min(count as usize);
+        for j in (i + 1)..max_j {
+            let next = unsafe { base.add(j).read() };
+            // Match LDR (immediate, post-index): xx_111_00_0_x_0_imm9_01_Rn_Rt
+            // Mask: 0x3FE00C00, value: 0x38400400 covers LDR/LDRSW post-index loads
+            // Also check pair forms: LDP post-index is xx_101_00_01_imm7_Rt2_Rn_Rt
+            let is_ldr_postinc = (next & 0x3FE00C00) == 0x38400400;
+            let is_ldp_postinc = (next & 0x7E800000) == 0x28800000;
+            if is_ldr_postinc || is_ldp_postinc {
+                let rn = (next >> 5) & 0x1F;
+                if rn == rd {
+                    found_load = true;
+                    break;
+                }
+            }
+        }
+        if found_load {
             pool_starts.push(target);
         }
     }
@@ -439,10 +460,7 @@ fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
     pool_starts.sort_unstable();
     pool_starts.dedup();
 
-    // Build pool ranges. Stop each pool at:
-    // - 1024 bytes (conservative max)
-    // - end of scan range
-    // - the next pool start
+    // Build pool ranges, terminating at function prologues.
     let mut pools: Vec<(u64, u64)> = Vec::with_capacity(pool_starts.len());
     for (idx, &pool_start) in pool_starts.iter().enumerate() {
         let mut pool_end = pool_start + MAX_LITERAL_POOL_SIZE;
@@ -450,7 +468,32 @@ fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
         if let Some(&next_start) = pool_starts.get(idx + 1) {
             if next_start < pool_end { pool_end = next_start; }
         }
-        pools.push((pool_start, pool_end));
+
+        // Walk forward from pool_start looking for clear function prologue.
+        // PACIASP: 0xd503233f
+        // STP x29, x30, [sp, #-N]!: bits match 0xa9bX7BFD or 0xa9aX7BFD
+        let mut scan = pool_start;
+        while scan < pool_end {
+            if scan + 4 > start + len { break; }
+            let off = scan - start;
+            let word = unsafe { base.add((off / 4) as usize).read() };
+            // PACIASP marker
+            if word == 0xd503233fu32 {
+                pool_end = scan;
+                break;
+            }
+            // STP x29, x30, [sp, #-N]!  pre-index with Rt=29, Rt2=30, Rn=31
+            // Mask 0x7FC07FFF, value 0xA9807BFD covers the pre-index variant.
+            if (word & 0x7FC07FFF) == 0xA9807BFDu32 {
+                pool_end = scan;
+                break;
+            }
+            scan += 4;
+        }
+
+        if pool_end > pool_start {
+            pools.push((pool_start, pool_end));
+        }
     }
     pools
 }
