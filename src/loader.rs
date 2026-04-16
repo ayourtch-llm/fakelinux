@@ -406,6 +406,22 @@ fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
     let base = start as *const u32;
     let mut pool_starts: Vec<u64> = Vec::new();
 
+    // Detect SHA-256 K table by fingerprint: K[0..3] = 0x428a2f98, 0x71374491,
+    // 0xb5c0fbcf, 0xe9b5dba5. Some libraries (libgcrypt) load the K table via
+    // an indirect GOT lookup, so we can't trace ADR/ADRP statically. Direct
+    // fingerprint matching catches all cases.
+    for i in 0..(count as usize).saturating_sub(4) {
+        let w0 = unsafe { base.add(i).read() };
+        if w0 != 0x428a2f98 { continue; }
+        let w1 = unsafe { base.add(i + 1).read() };
+        let w2 = unsafe { base.add(i + 2).read() };
+        let w3 = unsafe { base.add(i + 3).read() };
+        if w1 == 0x71374491 && w2 == 0xb5c0fbcf && w3 == 0xe9b5dba5 {
+            // SHA-256 K table found — 64 entries × 4 bytes = 256 bytes
+            pool_starts.push(start + (i as u64) * 4);
+        }
+    }
+
     for i in 0..count as usize {
         let pc = start + (i as u64) * 4;
         let instr = unsafe { base.add(i).read() };
