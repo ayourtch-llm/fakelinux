@@ -675,3 +675,179 @@ Create `/etc/resolv.conf` in the rootfs:
 ```bash
 echo "nameserver 8.8.8.8" > ubuntu-rootfs/etc/resolv.conf
 ```
+
+## 2026-04-17 Session — env propagation fix, zstd/libc6 deep-dive
+
+Continued from the 2026-04-15/16 handoff, which had hypothesised a
+`struct flock` layout bug behind the libc6 preinst failing with
+`debconf: DbDriver "config": config.dat is locked by another process`.
+
+### The flock theory was wrong
+
+First thing this session: `grep`'d the guest, debconf uses Perl
+`flock($fh, LOCK_EX | LOCK_NB)` — the BSD `flock(2)` syscall, not
+`fcntl(F_SETLK)`. So any layout issue in `linux_flock_to_mac` couldn't
+have caused the symptom. Saved some time for the next person:
+**always re-check what the failing caller is actually invoking** rather
+than trusting a handoff hypothesis at face value.
+
+### Real root cause — env was not crossing execve
+
+Tracing with `FAKELINUX_TRACE=1` showed two back-to-back debconf
+frontends being launched: an outer one (PID A) that cleanly locked
+`config.dat`, then a child (PID B) that re-exec'd `/usr/share/debconf/frontend`
+and raced A for the same lock. Debconf is supposed to detect the outer
+frontend via `$ENV{DEBIAN_HAS_FRONTEND}=1` and connect via inherited fds,
+but the variable wasn't propagating.
+
+The reason sat in two places:
+
+1. **`src/syscall.rs::do_execve`** was passing the *host* libc `environ`
+   into `libc::execve(self_exe, argv, environ)`, throwing away the
+   guest's envp. Any guest-set env var (perl's `$ENV{DEBIAN_HAS_FRONTEND}`,
+   bash's `export`, etc.) was lost across the re-exec boundary.
+2. **`src/loader.rs::setup_stack`** was hardcoding the fresh guest's
+   initial envp to exactly `[PATH, HOME, TERM]`, so even after fixing (1)
+   the newly-loaded binary only saw three vars.
+
+Both fixes went in TDD-first (per user's explicit preference this
+session):
+
+- `merge_envp(guest_env, overrides) -> Vec<CString>` in `syscall.rs`,
+  with 6 unit tests covering DEBIAN_HAS_FRONTEND pass-through, FAKELINUX_*
+  overrides replacing/adding/removing, and first-wins dedup.
+- `build_guest_env(host_env) -> Vec<CString>` in `loader.rs`, with 5
+  tests for DEBIAN_HAS_FRONTEND propagation, FAKELINUX_* stripping, and
+  PATH/HOME/TERM defaults when the host didn't set them.
+
+All 161 unit tests pass afterwards (148 → 161, +13 new). Committed as
+`2065aea fix(exec): propagate guest env through execve and into
+freshly-loaded guest`.
+
+Regression check: `apt-get install file` still reaches
+`Status: install ok unpacked` for libmagic-mgc, libmagic1t64, and file.
+libc6's preinst now gets past the debconf step, surfaces the expected
+pre-existing `dpkg-divert` clash on `/var/lib/dpkg/diversions` (state
+issue, not a fakelinux bug), and `apt --fix-broken install` exposes the
+NEXT blocker described below.
+
+### New blocker — libzstd "Data corruption detected" on libc6 unpack
+
+`apt --fix-broken install` and `dpkg-deb --contents libc6....deb` both
+die deterministically at the exact same file (`./usr/lib/.../gconv/libCNS.so`)
+with:
+
+```
+dpkg-deb (subprocess): decompressing archive 'libc6_...deb' member 'data.tar':
+    zstd error: Data corruption detected
+/usr/bin/tar: Unexpected EOF in archive
+```
+
+Architecture of dpkg-deb's extraction (confirmed from trace):
+
+- PID A (`dpkg-deb` main) opens the `.deb`, lseek's past the ar headers,
+  forks twice.
+- PID B (pump, forked from A) reads raw `data.tar.zst` bytes from fd=3
+  and writes them unmodified to pipe fd=5.
+- PID C (decompressor, forked from A) reads compressed bytes from
+  pipe fd=4 (the other end of B's pipe), calls
+  `ZSTD_decompressStream` in-process, writes decompressed tar to pipe
+  fd=6.
+- PID D = `/usr/bin/tar -tvf -`, reads decompressed tar from stdin.
+
+Added two debug knobs to the syscall layer —
+`FAKELINUX_DUMP_WRITE_FD=<fd>` and `FAKELINUX_DUMP_READ_FD=<fd>` — that
+append every successful byte of a matching read/write to
+`/tmp/pipe_dump_*_pid<pid>_fd<fd>.bin`. Used them to build a clean
+evidence chain:
+
+- The pump's writes on fd=5 (1,277,952 bytes before EPIPE) have
+  `sha256` identical to the corresponding byte range of
+  `data.tar.zst` in the `.deb`. Pump is reading and forwarding
+  correctly.
+- The decompressor's reads on fd=4 (1,179,675 bytes before giving up)
+  are a perfect prefix of the pump's writes (`cmp` reports EOF on the
+  shorter file, not a mismatch). Pipe is carrying correct data.
+- Host `zstd -d` fed the exact 1,179,675-byte prefix decompresses to
+  19.1 MB and then exits with `/*stdin*\ : Read error (39) : premature
+  end`. That's the expected end-of-stream error for an incomplete
+  zstd frame — NOT `Data corruption detected`.
+- Guest libzstd fed the same bytes produces 18.9 MB of decompressed
+  output (a valid prefix of host zstd's 19.1 MB), then reports
+  `Data corruption detected` instead of `premature end`.
+
+Same bytes in, different error path out. That's the smoking gun but
+not a fix. Ruled out as the cause:
+
+- x18 patching — rerunning with `FAKELINUX_NO_X18=1` reproduces the
+  symptom identically.
+- Signal interference — no SIGCHLD / signal-forwarder activity between
+  the last successful read and the corruption report.
+- Generic pipe integrity — `cat file | cat | cat | sha256sum` on a
+  5 MB random file produces a matching hash inside the guest.
+
+What still seems plausible but wasn't proved in-session:
+
+1. Memory corruption inside libzstd's `DCtx` / Huffman tables via a
+   mis-emulated x18-relative store. The `emul_ldr_str_reg_offset`
+   path handles `STR Xt, [X18, Xm, LSL #N]` — if any dispatch goes
+   through a buggy variant, we'd scribble on libzstd's heap without
+   touching input bytes. Open question: are x18-relative stores ever
+   targeting addresses inside libzstd's allocated context struct?
+   Next session should add a trap that records every x18-relative
+   STORE destination in PID C and cross-reference against libzstd's
+   malloc ranges.
+2. Short-read interleaving. The reads just before failure follow
+   libzstd's well-known `+3`-byte lookahead-padding pattern:
+   `65539 requested → 32744 returned`, then `32795 requested → 32768`,
+   then `27 requested → 27`. The sequence is legal and the bytes are
+   valid, but there's a chance an older libzstd (1.5.5 ships in noble)
+   has a state-machine edge-case that Linux's kernel pipe semantics
+   avoid but macOS's don't. Would need a real-Linux cross-check with
+   the same captured prefix.
+3. Fork semantics around libzstd state. dpkg-deb forks AFTER zstd
+   helpers are initialised in the parent; our fork hooks might not
+   preserve something libzstd relies on. No concrete suspect, but
+   worth instrumenting.
+
+While at it, broadened `fakelinux_env_overrides()` to forward every
+`FAKELINUX_*` host variable through the execve chain rather than a
+hardcoded allowlist, so the new `FAKELINUX_DUMP_*` knobs (and any
+future debug envs) keep working across re-execs without needing code
+changes. `build_guest_env` already strips `FAKELINUX_*` before handing
+to the guest, so no supervisor-internal state leaks.
+
+Commits from this session:
+
+```
+f00d98c  debug(syscall): FAKELINUX_DUMP_{READ,WRITE}_FD pipe-byte dumpers; broaden FAKELINUX_* forwarding
+2065aea  fix(exec): propagate guest env through execve and into freshly-loaded guest
+```
+
+### Handoff — start here next session
+
+**Goal**: unblock `dpkg-deb --contents libc6....deb` inside fakelinux.
+Everything upstream (env propagation, debconf, file unpack) now works.
+
+**First experiment**: add a store-destination tracer to
+`emul_ldr_str_reg_offset` (and friends in `src/trap.rs`) that, when
+`FAKELINUX_TRACE_X18_STORES=1` is set, logs every `(pc, base_reg,
+addr, value)` on emulated stores. Run it for the dpkg-deb failure and
+check for stores landing inside the heap range libzstd uses for its
+DCtx (you can dump the heap layout from `/proc/self/maps` in the guest).
+
+**Cheap cross-checks**:
+- Rebuild the test on a real Linux ARM64 box using the captured
+  1,179,675-byte prefix (`/tmp/pipe_dump_read_pid*_fd4.bin`) — does
+  native libzstd 1.5.5 also say "Data corruption" or "premature end"?
+  If "premature end" there too, the bug is 100% fakelinux-specific.
+- Try `dpkg-deb --fsys-tarfile libc6....deb > /tmp/out.tar` inside
+  the guest — different code path through dpkg-deb, same libzstd.
+  If it fails at the same offset, libzstd is definitely seeing
+  corrupt state regardless of the output pipe.
+
+**State for memory**: the full narrative is in
+`project_libc6_zstd_corruption.md` (and `MEMORY.md` indexes it).
+Reproducer, dump-file layout, and what's already been ruled out are
+there — read them before instrumenting, so you don't repeat the same
+experiments.
