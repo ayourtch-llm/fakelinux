@@ -383,6 +383,87 @@ fn addr_in_code_ranges(addr: u64, code_ranges: &[(u64, u64)]) -> bool {
     false
 }
 
+/// Detect embedded literal pools by scanning for ADR/ADRP instructions whose
+/// targets fall within the scanned code range. Such targets are typically
+/// embedded data tables (e.g. SHA-256 round constants in libcrypto), which
+/// must NOT be patched as if they were instructions.
+///
+/// Returns a sorted Vec of `(start_addr, end_addr)` ranges to exclude from
+/// x18 patching. Each range is conservatively sized to MAX_LITERAL_POOL_SIZE
+/// bytes, terminated early if a clear function-prologue pattern is encountered.
+fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
+    // Conservative max literal pool size. SHA-256 K table is 256 bytes.
+    // Rare to have larger inline tables in code segments.
+    const MAX_LITERAL_POOL_SIZE: u64 = 1024;
+
+    let count = len / 4;
+    let base = start as *const u32;
+    let mut pool_starts: Vec<u64> = Vec::new();
+
+    // First pass: find ADR/ADRP targets that fall within the scanned range
+    // and AFTER the ADR instruction itself (forward references).
+    for i in 0..count as usize {
+        let pc = start + (i as u64) * 4;
+        let instr = unsafe { base.add(i).read() };
+
+        // ADR:  bits[31:24] = 0_xx_10000  (top byte 0x10/0x30/0x50/0x70)
+        // ADRP: bits[31:24] = 1_xx_10000  (top byte 0x90/0xB0/0xD0/0xF0)
+        let is_adr = (instr & 0x9F000000) == 0x10000000;
+        let is_adrp = (instr & 0x9F000000) == 0x90000000;
+        if !is_adr && !is_adrp { continue; }
+
+        // Decode 21-bit signed immediate
+        let immlo = ((instr >> 29) & 0x3) as u64;
+        let immhi = ((instr >> 5) & 0x7FFFF) as u64;
+        let imm21 = (immhi << 2) | immlo;
+        // Sign extend 21 bits
+        let imm = if imm21 & (1 << 20) != 0 {
+            (imm21 | !((1u64 << 21) - 1)) as i64
+        } else {
+            imm21 as i64
+        };
+
+        let target = if is_adrp {
+            (pc & !0xFFF).wrapping_add((imm as u64) << 12)
+        } else {
+            pc.wrapping_add(imm as u64)
+        };
+
+        // Only count forward references within our scan range
+        if is_adr && target > pc && target < start + len {
+            pool_starts.push(target);
+        }
+    }
+
+    if pool_starts.is_empty() { return Vec::new(); }
+    pool_starts.sort_unstable();
+    pool_starts.dedup();
+
+    // Build pool ranges. Stop each pool at:
+    // - 1024 bytes (conservative max)
+    // - end of scan range
+    // - the next pool start
+    let mut pools: Vec<(u64, u64)> = Vec::with_capacity(pool_starts.len());
+    for (idx, &pool_start) in pool_starts.iter().enumerate() {
+        let mut pool_end = pool_start + MAX_LITERAL_POOL_SIZE;
+        if pool_end > start + len { pool_end = start + len; }
+        if let Some(&next_start) = pool_starts.get(idx + 1) {
+            if next_start < pool_end { pool_end = next_start; }
+        }
+        pools.push((pool_start, pool_end));
+    }
+    pools
+}
+
+/// Check if an address falls within a literal pool range.
+fn addr_in_pools(addr: u64, pools: &[(u64, u64)]) -> bool {
+    // Pools are sorted; binary search would be faster for large lists.
+    for &(s, e) in pools {
+        if addr >= s && addr < e { return true; }
+    }
+    false
+}
+
 /// Scan executable memory and replace SVC #0 and MSR/MRS tpidr_el0 with UDF #0xF000.
 /// `code_ranges` restricts x18 patching to actual code sections (to avoid corrupting
 /// data like string tables that may share the same PT_LOAD segment).
@@ -399,6 +480,9 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     let x18_max_offset: u64 = std::env::var("FAKELINUX_X18_MAX_OFFSET")
         .ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(u64::MAX);
+    // Find embedded literal pools (e.g. SHA-256 K table) to exclude from x18 patching.
+    // These are data tables embedded in .text, reached via ADR + load (not execution).
+    let literal_pools = find_literal_pools(start, size);
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -419,7 +503,9 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
                 let offset = (i as u64) * 4;
                 // Only patch x18 in actual code sections — data in the same segment
                 // (e.g. .dynstr, .rodata) could match x18 patterns and must not be corrupted.
+                // Also skip literal pools (data embedded in .text via ADR+load).
                 if (!have_code_ranges || addr_in_code_ranges(pc_addr, code_ranges))
+                    && !addr_in_pools(pc_addr, &literal_pools)
                     && offset < x18_max_offset {
                     add_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
@@ -459,6 +545,8 @@ pub fn patch_new_code(start: u64, len: u64) {
     let mut x18_skipped = 0u64;
     let have_code_ranges = !code_ranges.is_empty();
     let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok();
+    // Find embedded literal pools to exclude from x18 patching.
+    let literal_pools = find_literal_pools(start, len);
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
@@ -474,9 +562,10 @@ pub fn patch_new_code(start: u64, len: u64) {
             } else if !skip_x18 && trap::references_x18(instr) {
                 let pc_addr = base.add(i) as u64;
                 // x18 patterns have high false-positive rates on data (string tables,
-                // symbol tables, etc.). Only patch if we have confirmed code ranges.
-                // SVC/TPIDR patterns are specific enough to scan everything safely.
-                if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges) {
+                // symbol tables, etc.). Only patch if we have confirmed code ranges
+                // AND we're not in a literal pool (data embedded in .text).
+                if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges)
+                    && !addr_in_pools(pc_addr, &literal_pools) {
                     add_runtime_tpidr_patch(pc_addr, instr);
                     base.add(i).write(trap::UDF_MARKER);
                     x18_patched += 1;
