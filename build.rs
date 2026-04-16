@@ -23,6 +23,62 @@ struct ParsedEncoding {
     mask: u32,
     value: u32,
     gpr_fields: Vec<GprField>,
+    emul_class: u8,
+}
+
+/// Map a psname decode path (group.subgroup) to an EmulClass discriminant.
+/// Must match the EmulClass enum in decoder.rs.
+fn psname_to_emul_class(psname: &str) -> u8 {
+    // Extract group.subgroup from "A64.group.subgroup.encoding"
+    let parts: Vec<&str> = psname.split('.').collect();
+    if parts.len() < 3 {
+        return 255; // Other
+    }
+    let key = format!("{}.{}", parts[1], parts[2]);
+    match key.as_str() {
+        // Data Processing — Immediate
+        "dpimm.addsub_imm" => 0,      // AddSubImm
+        "dpimm.log_imm" => 1,         // LogicalImm
+        "dpimm.movewide" => 2,        // MoveWide
+        "dpimm.bitfield" => 3,        // Bitfield
+        "dpimm.extract" => 4,         // Extract
+        "dpimm.pcreladdr" => 5,       // PcRelAddr
+        // Data Processing — Register
+        "dpreg.log_shift" => 6,       // LogicalShiftedReg
+        "dpreg.addsub_shift" => 7,    // AddSubShiftedReg
+        "dpreg.addsub_ext" => 8,      // AddSubExtReg
+        "dpreg.addsub_carry" => 9,    // AddSubCarry
+        "dpreg.condsel" => 10,        // CondSelect
+        "dpreg.dp_2src" => 11,        // DataProc2Src
+        "dpreg.dp_3src" => 12,        // DataProc3Src
+        "dpreg.condcmp_reg" => 13,    // CondCompareReg
+        "dpreg.condcmp_imm" => 14,    // CondCompareImm
+        "dpreg.dp_1src" => 15,        // DataProc1Src
+        // Load/Store
+        "ldst.ldst_pos" => 16,        // LdrStrUnsignedImm
+        "ldst.ldst_immpost" => 17,    // LdrStrPrePost
+        "ldst.ldst_immpre" => 17,     // LdrStrPrePost (same handler)
+        "ldst.ldst_unscaled" => 18,   // LdrStrUnscaled
+        "ldst.ldst_regoff" => 19,     // LdrStrRegOffset
+        "ldst.ldstpair_off" => 20,    // LdpStp
+        "ldst.ldstpair_post" => 20,   // LdpStp (same handler)
+        "ldst.ldstpair_pre" => 20,    // LdpStp (same handler)
+        "ldst.loadlit" => 21,         // LoadLiteral
+        "ldst.ldstnapair_offs" => 20, // LdpStp (no-allocate pair, same shape)
+        // Branches
+        "control.compbranch" => 22,   // CompareBranch (CBZ/CBNZ)
+        "control.testbranch" => 23,   // TestBranch (TBZ/TBNZ)
+        // FP ↔ GPR conversion
+        "simd_dp.float2int" => 24,    // FloatGprConvert (FMOV etc.)
+        // Load/store exclusive and atomics
+        "ldst.ldstexclr" => 25,       // LoadStoreExclusive
+        "ldst.ldstexclp" => 25,       // LoadStoreExclusive
+        "ldst.memop" => 26,           // AtomicMemOp
+        "ldst.ldstord" => 27,         // LoadStoreOrdered (LDAR/STLR)
+        "ldst.ldapstl_unscaled" => 27, // LoadStoreOrdered
+        // Catch-all
+        _ => 255,                     // Other
+    }
 }
 
 /// Standard GPR register field names in ARM A64.
@@ -145,6 +201,10 @@ fn main() {
                 // Parse base mask/value and field positions from regdiagram
                 let (base_mask, base_value, fields) = parse_regdiagram(&regdiagram);
 
+                // Extract emulation class from psname decode path
+                let psname = regdiagram.attribute("psname").unwrap_or("");
+                let emul_class = psname_to_emul_class(psname);
+
                 // Determine GPR fields
                 let gpr_fields: Vec<GprField> = if iclass_class == "general" {
                     // For general class, all standard register fields are GPR
@@ -179,6 +239,7 @@ fn main() {
                             mask: base_mask,
                             value: base_value,
                             gpr_fields: gpr_fields.clone(),
+                            emul_class,
                         });
                     }
                 } else {
@@ -203,6 +264,7 @@ fn main() {
                             mask: enc_mask,
                             value: enc_value,
                             gpr_fields: gpr_fields.clone(),
+                            emul_class,
                         });
                     }
 
@@ -222,6 +284,7 @@ fn main() {
                             mask: base_mask,
                             value: base_value,
                             gpr_fields,
+                            emul_class,
                         });
                     } else {
                         // Use per-encoding entries
@@ -513,6 +576,8 @@ fn write_generated_table(encodings: &[ParsedEncoding]) {
     )
     .unwrap();
     writeln!(f, "    pub gpr_lsbs: [u8; 5],").unwrap();
+    writeln!(f, "    /// Emulation class discriminant (see EmulClass enum in decoder.rs).").unwrap();
+    writeln!(f, "    pub emul_class: u8,").unwrap();
     writeln!(f, "    pub name: &'static str,").unwrap();
     writeln!(f, "}}").unwrap();
     writeln!(f).unwrap();
@@ -531,7 +596,7 @@ fn write_generated_table(encodings: &[ParsedEncoding]) {
 
         writeln!(
             f,
-            "    GenEntry {{ mask: {:#010x}, value: {:#010x}, gpr_lsbs: [{}, {}, {}, {}, {}], name: {:?} }},",
+            "    GenEntry {{ mask: {:#010x}, value: {:#010x}, gpr_lsbs: [{}, {}, {}, {}, {}], emul_class: {}, name: {:?} }},",
             enc.mask,
             enc.value,
             lsbs[0],
@@ -539,6 +604,7 @@ fn write_generated_table(encodings: &[ParsedEncoding]) {
             lsbs[2],
             lsbs[3],
             lsbs[4],
+            enc.emul_class,
             enc.name
         )
         .unwrap();
@@ -663,7 +729,7 @@ fn write_empty_table() {
     let mut f = fs::File::create(&dest_path).expect("cannot create generated file");
     writeln!(f, "// Empty table — data/encoding/ not found").unwrap();
     writeln!(f, "#[derive(Debug, Clone, Copy)]").unwrap();
-    writeln!(f, "pub struct GenEntry {{ pub mask: u32, pub value: u32, pub gpr_lsbs: [u8; 5], pub name: &'static str }}").unwrap();
+    writeln!(f, "pub struct GenEntry {{ pub mask: u32, pub value: u32, pub gpr_lsbs: [u8; 5], pub emul_class: u8, pub name: &'static str }}").unwrap();
     writeln!(f, "pub static GEN_TABLE: &[GenEntry] = &[];").unwrap();
 
     let test_path = Path::new(&out_dir).join("generated_x18_tests.rs");

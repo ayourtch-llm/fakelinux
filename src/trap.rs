@@ -304,11 +304,47 @@ pub fn references_x18(instr: u32) -> bool {
 
 /// Emulate an instruction that references x18, substituting per-thread x18 storage.
 /// Returns true if emulation succeeded.
+///
+/// Uses the XML-generated decode table (via `decode_emul_class()`) to classify
+/// the instruction, then dispatches to the appropriate handler.
 fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
-    let instr_pc = mctx.ss.pc; // save before borrowing mctx.ss
-    let regs = &mut mctx.ss;
+    use crate::decoder::EmulClass;
+    let instr_pc = mctx.ss.pc;
 
-    // ─── Data processing (immediate) ─────────────────────────────────
+    match crate::decoder::decode_emul_class(orig_instr) {
+        EmulClass::AddSubImm => emul_addsub_imm(orig_instr, mctx),
+        EmulClass::MoveWide => emul_move_wide(orig_instr, mctx),
+        EmulClass::LogicalImm => emul_logical_imm(orig_instr, mctx),
+        EmulClass::LogicalShiftedReg => emul_logical_shifted_reg(orig_instr, mctx),
+        EmulClass::AddSubShiftedReg => emul_addsub_shifted_reg(orig_instr, mctx),
+        EmulClass::AddSubExtReg => emul_addsub_ext_reg(orig_instr, mctx),
+        EmulClass::AddSubCarry => emul_addsub_carry(orig_instr, mctx),
+        EmulClass::CondSelect => emul_cond_select(orig_instr, mctx),
+        EmulClass::DataProc2Src => emul_dp2_src(orig_instr, mctx),
+        EmulClass::DataProc3Src => emul_dp3_src(orig_instr, mctx),
+        EmulClass::LdrStrUnsignedImm => emul_ldr_str_unsigned_imm(orig_instr, mctx),
+        EmulClass::LdrStrUnscaled => emul_ldr_str_unscaled(orig_instr, mctx),
+        EmulClass::LdrStrPrePost => emul_ldr_str_prepost(orig_instr, mctx),
+        EmulClass::LdrStrRegOffset => emul_ldr_str_reg_offset(orig_instr, mctx),
+        EmulClass::LdpStp => emul_ldp_stp(orig_instr, mctx),
+        EmulClass::Bitfield => emul_bitfield(orig_instr, mctx),
+        EmulClass::PcRelAddr => emul_adr_adrp(orig_instr, instr_pc, mctx),
+        EmulClass::CompareBranch => emul_cbz_cbnz(orig_instr, instr_pc, mctx),
+        EmulClass::TestBranch => emul_tbz_tbnz(orig_instr, instr_pc, mctx),
+        EmulClass::CondCompareReg => emul_ccmp_reg(orig_instr, mctx),
+        EmulClass::CondCompareImm => emul_ccmp_imm(orig_instr, mctx),
+        EmulClass::FloatGprConvert => emul_fmov(orig_instr, mctx),
+        EmulClass::Extract => emul_extract(orig_instr, mctx),
+        _ => false,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Emulation handler functions (one per EmulClass)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn emul_addsub_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
     // ADD/SUB immediate: sf_op_S_100010_sh_imm12_Rn_Rd
     if orig_instr & 0x1F00_0000 == 0x1100_0000 {
         let sf = (orig_instr >> 31) & 1;
@@ -332,20 +368,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // MOV wide (MOVZ/MOVK/MOVN): sf_opc_100101_hw_imm16_Rd
-    if orig_instr & 0x1F80_0000 == 0x1280_0000 ||  // MOVN
-       orig_instr & 0x1F80_0000 == 0x1480_0000 ||  // reserved (skip)
-       orig_instr & 0x1F80_0000 == 0x1500_0000 ||  // reserved
-       orig_instr & 0x1F80_0000 == 0x1280_0000 {   // (duplicate, simplify below)
-        // fall through to generic check
-    }
-    // MOVZ: x_10_100101_hw_imm16_Rd
-    if orig_instr & 0x7F80_0000 == 0x5280_0000 || orig_instr & 0x7F80_0000 == 0x5200_0000 {
-        // This is getting complex, let me handle move-wide generically
-    }
-    // Generic move-wide: bits[28:23] = 100101
-    if (orig_instr >> 23) & 0x3F == 0b100101 {
+fn emul_move_wide(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let opc = (orig_instr >> 29) & 0x3;
         let hw = ((orig_instr >> 21) & 0x3) as u32;
@@ -370,9 +398,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, val); }
         return true;
     }
+    false
+}
 
-    // Logical immediate: sf_opc_100100_N_immr_imms_Rn_Rd
-    if (orig_instr >> 23) & 0x3F == 0b100100 {
+fn emul_logical_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let opc = (orig_instr >> 29) & 0x3;
         let rn = ((orig_instr >> 5) & 0x1F) as usize;
@@ -399,10 +430,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return false; // bad bitmask encoding
     }
+    false
+}
 
-    // ─── Data processing (register) ──────────────────────────────────
-    // Logical shifted register: sf_opc_01010_shift_0_Rm_imm6_Rn_Rd
-    if orig_instr & 0x1F00_0000 == 0x0A00_0000 {
+fn emul_logical_shifted_reg(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let opc = (orig_instr >> 29) & 0x3;
         let n_bit = (orig_instr >> 21) & 1; // NOT flag
@@ -433,9 +466,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // Add/sub shifted register: sf_op_S_01011_shift_0_Rm_imm6_Rn_Rd
-    if orig_instr & 0x1F20_0000 == 0x0B00_0000 {
+fn emul_addsub_shifted_reg(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1;
         let s = (orig_instr >> 29) & 1;
@@ -455,9 +491,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // Add/sub extended register: sf_op_S_01011_00_1_Rm_option_imm3_Rn_Rd
-    if orig_instr & 0x1FE0_0000 == 0x0B20_0000 {
+fn emul_addsub_ext_reg(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1;
         let s = (orig_instr >> 29) & 1;
@@ -479,10 +518,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // Add/subtract with carry: sf_op_S_11010000_Rm_000000_Rn_Rd
-    // ADC (op=0,S=0), ADCS (op=0,S=1), SBC (op=1,S=0), SBCS (op=1,S=1)
-    if orig_instr & 0x1FE0_FC00 == 0x1A00_0000 {
+fn emul_addsub_carry(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1;
         let s = (orig_instr >> 29) & 1;
@@ -506,9 +547,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // Conditional select: sf_op_S_11010100_Rm_cond_op2_Rn_Rd
-    if orig_instr & 0x1FE0_0000 == 0x1A80_0000 {
+fn emul_cond_select(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
@@ -533,10 +577,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // Data processing (2 source): sf_0_S_11010110_Rm_opcode_Rn_Rd
-    // Common: UDIV, SDIV, LSLV, LSRV, ASRV, RORV
-    if orig_instr & 0x5FE0_0000 == 0x1AC0_0000 {
+fn emul_dp2_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
         let opcode = (orig_instr >> 10) & 0x3F;
@@ -569,10 +615,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // Data processing (3 source): sf_op54_11011_op31_Rm_o0_Ra_Rn_Rd
-    // MADD, MSUB
-    if (orig_instr >> 24) & 0x1F == 0b11011 {
+fn emul_dp3_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
         let o0 = (orig_instr >> 15) & 1;
@@ -588,11 +636,11 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // ─── Load/Store ──────────────────────────────────────────────────
-
-    // LDR/STR (immediate, unsigned offset): size_11_V_01_01_imm12_Rn_Rt
-    if orig_instr & 0x3B00_0000 == 0x3900_0000 {
+fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    {
         let size = (orig_instr >> 30) & 0x3;
         let v_bit = (orig_instr >> 26) & 1;
         let is_load = (orig_instr >> 22) & 1;
@@ -604,7 +652,7 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
             if size == 0 && opc1 == 1 { 4u32 } else { size }
         } else { size };
         let offset = imm12 << scale;
-        let base = read_gpr_sp(regs, rn);
+        let base = read_gpr_sp(&mctx.ss, rn);
         let addr = base.wrapping_add(offset);
         if v_bit == 1 {
             let ns = &mut mctx.ns;
@@ -630,6 +678,7 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
                 }
             }
         } else {
+            let regs = &mut mctx.ss;
             if is_load == 1 {
                 let val = unsafe { load_mem(addr, size) };
                 if rt != 31 { write_gpr(regs, rt, val); }
@@ -640,10 +689,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // LDUR/STUR (unscaled immediate): size_11_1_00_0x_0_imm9_00_Rn_Rt
-    // This is the same as pre/post-index but bits[11:10]=00 means unscaled, no writeback.
-    if orig_instr & 0x3B20_0C00 == 0x3800_0000 {
+fn emul_ldr_str_unscaled(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let size = (orig_instr >> 30) & 0x3;
         let is_load = (orig_instr >> 22) & 1;
         let imm9 = ((orig_instr >> 12) & 0x1FF) as u64;
@@ -661,10 +712,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // LDR/STR (pre/post-index): size_11_1_00_0x_0_imm9_wb_Rn_Rt
-    // wb: 01=post-index, 11=pre-index
-    if orig_instr & 0x3B20_0400 == 0x3800_0400 {
+fn emul_ldr_str_prepost(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let size = (orig_instr >> 30) & 0x3;
         let is_load = (orig_instr >> 22) & 1;
         let imm9 = ((orig_instr >> 12) & 0x1FF) as u64;
@@ -685,25 +738,27 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         write_gpr_sp(regs, rn, new_base);
         return true;
     }
+    false
+}
 
-    // LDR/STR (register offset): size_11_V_00_0x_1_Rm_option_S_10_Rn_Rt
-    if orig_instr & 0x3B20_0C00 == 0x3820_0800 {
+fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    {
         let size = (orig_instr >> 30) & 0x3;
-        let v_bit = (orig_instr >> 26) & 1; // V=1 means SIMD/FP Rt
+        let v_bit = (orig_instr >> 26) & 1;
         let is_load = (orig_instr >> 22) & 1;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
         let option = (orig_instr >> 13) & 0x7;
         let s_bit = (orig_instr >> 12) & 1;
         let rn = ((orig_instr >> 5) & 0x1F) as usize;
         let rt = (orig_instr & 0x1F) as usize;
-        let offset_val = read_gpr(regs, rm);
+        let offset_val = read_gpr(&mctx.ss, rm);
         let scale = if v_bit == 1 {
             // SIMD/FP: size+opc[1] determines scale (0=8,1=16,2=32,3=64,0+opc1=128)
             let opc1 = (orig_instr >> 23) & 1;
             if size == 0 && opc1 == 1 { 4u32 } else { size }
         } else { size };
         let offset_val = extend_reg(offset_val, option, if s_bit == 1 { scale } else { 0 });
-        let base = read_gpr_sp(regs, rn);
+        let base = read_gpr_sp(&mctx.ss, rn);
         let addr = base.wrapping_add(offset_val);
         if v_bit == 1 {
             // SIMD/FP: access mctx.ns.v[rt] directly
@@ -730,6 +785,7 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
                 }
             }
         } else {
+            let regs = &mut mctx.ss;
             if is_load == 1 {
                 let val = unsafe { load_mem(addr, size) };
                 if rt != 31 { write_gpr(regs, rt, val); }
@@ -740,10 +796,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // LDP/STP (signed offset, pre/post-index):
-    // opc_10_1_x_0xx_imm7_Rt2_Rn_Rt
-    if orig_instr & 0x3A00_0000 == 0x2800_0000 {
+fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let opc = (orig_instr >> 30) & 0x3;
         let is_load = (orig_instr >> 22) & 1;
         let wb_type = (orig_instr >> 23) & 0x3; // 01=post, 10=offset, 11=pre
@@ -788,47 +846,6 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
-
-    // LDP/STP literal (PC-relative):
-    // opc_10010_x_11_imm19_Rt2_Rt
-    // bits[31:26] = 100100 (LDP) or 100101 (STP)
-    // bits[25] = 0 for LDP, 1 for STP
-    // bits[24] = 0 for 64-bit, 1 for 32-bit
-    // bits[23:22] = 11 (literal)
-    // bits[21:5] = imm19 (PC-relative offset, signed)
-    // bits[14:10] = Rt2
-    // bits[4:0] = Rt
-    if orig_instr & 0xFC00_0000 == 0x9400_0000 {
-        let opc = (orig_instr >> 30) & 0x3;
-        let is_load = ((orig_instr >> 25) & 1) == 0; // 0=LDP, 1=STP
-        let imm19_raw = ((orig_instr >> 5) & 0x7FFFF) as i64;
-        // Sign-extend imm19 from 19 bits
-        let imm19 = if imm19_raw & 0x40000 != 0 {
-            imm19_raw - 0x80000
-        } else {
-            imm19_raw
-        };
-        let rt2 = ((orig_instr >> 10) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        // opc=00: LDP/STP W (32-bit), opc=10: LDP/STP X (64-bit)
-        let scale = if opc <= 1 { 2u64 } else { 3 };
-        let pc = instr_pc as i64; // PC at time of instruction fetch
-        let addr = (pc + (imm19 << scale)) as u64;
-        let elem_size = 1u64 << scale;
-        if is_load {
-            let mut v1 = unsafe { load_mem(addr, scale as u32) };
-            let mut v2 = unsafe { load_mem(addr.wrapping_add(elem_size), scale as u32) };
-            if rt != 31 { write_gpr(regs, rt, v1); }
-            if rt2 != 31 { write_gpr(regs, rt2, v2); }
-        } else {
-            let v1 = read_gpr(regs, rt);
-            let v2 = read_gpr(regs, rt2);
-            unsafe { store_mem(addr, scale as u32, v1); }
-            unsafe { store_mem(addr.wrapping_add(elem_size), scale as u32, v2); }
-        }
-        return true;
-    }
-
     // LDRSW (immediate, unsigned offset): 10_111_00_110_imm12_Rn_Rt
     if orig_instr & 0xFFC0_0000 == 0xB980_0000 {
         let imm12 = ((orig_instr >> 10) & 0xFFF) as u64;
@@ -842,14 +859,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         return true;
     }
 
-    // LDRB/LDRH/LDRSB/LDRSH unsigned offset are covered by the generic LDR handler above
-    // (size field distinguishes byte/half/word/doubleword)
+    false
+}
 
-    // ─── Bitfield (SBFM/UBFM/BFM — includes LSL, LSR, ASR, SXTW, etc.) ──
-    // ARM encoding: sf opc(2) 100110 N immr(6) imms(6) Rn(5) Rd(5)
-    // Fixed bits [28:24] = 10011, bit 23 = 0 for 32-bit (sf=0), 1 for 64-bit (sf=1)
-    // We check bits [28:24] = 10011
-    if (orig_instr >> 24) & 0x1F == 0b10011 {
+fn emul_bitfield(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let opc = (orig_instr >> 29) & 0x3;
         let n = (orig_instr >> 22) & 1;
@@ -914,11 +929,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // ─── ADR/ADRP ───────────────────────────────────────────────────
-    // ADR:  0_immlo_10000_immhi_Rd
-    // ADRP: 1_immlo_10000_immhi_Rd
-    if orig_instr & 0x1F00_0000 == 0x1000_0000 {
+fn emul_adr_adrp(orig_instr: u32, instr_pc: u64, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let rd = (orig_instr & 0x1F) as usize;
         let immhi = ((orig_instr >> 5) & 0x7FFFF) as u64;
         let immlo = ((orig_instr >> 29) & 0x3) as u64;
@@ -932,10 +948,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
     }
+    false
+}
 
-    // ─── CBZ/CBNZ ────────────────────────────────────────────────────
-    // sf_011010_op_imm19_Rt  (op: 0=CBZ, 1=CBNZ)
-    if orig_instr & 0x7E00_0000 == 0x3400_0000 {
+fn emul_cbz_cbnz(orig_instr: u32, instr_pc: u64, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 24) & 1; // 0=CBZ, 1=CBNZ
         let imm19 = ((orig_instr >> 5) & 0x7FFFF) as u64;
@@ -952,11 +970,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // ─── CCMP/CCMN (register) ───────────────────────────────────���───
-    // ─── TBZ/TBNZ ────────────────────────────────────────────────────
-    // b5_011011_op_b40_imm14_Rt  (op: 0=TBZ, 1=TBNZ)
-    if orig_instr & 0x7E00_0000 == 0x3600_0000 {
+fn emul_tbz_tbnz(orig_instr: u32, instr_pc: u64, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let b5 = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 24) & 1; // 0=TBZ, 1=TBNZ
         let b40 = ((orig_instr >> 19) & 0x1F) as u32;
@@ -974,10 +993,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // ─── CCMP/CCMN (register) ───────────────────────────────────────
-    // sf_op_S_11010010_Rm_cond_0_o2_Rn_o3_nzcv  (S=1, bit11=0=reg, o2=0, o3=0)
-    if orig_instr & 0x3FE0_0C10 == 0x3A40_0000 {
+fn emul_ccmp_reg(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1; // 0=CCMN, 1=CCMP
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
@@ -997,10 +1018,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // ─── CCMP/CCMN (immediate) ──────────────────────────────────────
-    // sf_op_S_11010010_imm5_cond_1_o2_Rn_o3_nzcv  (S=1, bit11=1=imm)
-    if orig_instr & 0x3FE0_0C10 == 0x3A40_0800 {
+fn emul_ccmp_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    {
         let sf = (orig_instr >> 31) & 1;
         let op = (orig_instr >> 30) & 1;
         let imm5 = ((orig_instr >> 16) & 0x1F) as u64;
@@ -1020,13 +1043,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
+    false
+}
 
-    // ─── FMOV (GPR ↔ FP) ───────────────────────────────────────────
-    // FMOV Xd, Dn: 1_00_11110_01_1_00_110_000000_Rn_Rd (0x9E660000)
-    // FMOV Dn, Xn: 1_00_11110_01_1_00_111_000000_Rn_Rd (0x9E670000)
-    // FMOV Wd, Sn: 0_00_11110_00_1_00_110_000000_Rn_Rd (0x1E260000)
-    // FMOV Sn, Wn: 0_00_11110_00_1_00_111_000000_Rn_Rd (0x1E270000)
-    if orig_instr & 0x7FBF_FC00 == 0x1E26_0000 || orig_instr & 0x7FBF_FC00 == 0x1E27_0000 {
+fn emul_fmov(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    // FMOV GPR ↔ FP
+    {
         let sf = (orig_instr >> 31) & 1;
         let direction = (orig_instr >> 16) & 1; // 0(110)=FP→GPR, 1(111)=GPR→FP
         let rn = ((orig_instr >> 5) & 0x1F) as usize;
@@ -1043,9 +1065,30 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         }
         return true;
     }
-
-    // ─── Unhandled ───────────────────────────────────────────────────
     false
+}
+
+fn emul_extract(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    // EXTR is classified as Extract by the XML table.
+    // Encoding: sf_00_100111_N_o0_Rm_imms_Rn_Rd
+    let regs = &mut mctx.ss;
+    let sf = (orig_instr >> 31) & 1;
+    let rm = ((orig_instr >> 16) & 0x1F) as usize;
+    let imms = ((orig_instr >> 10) & 0x3F) as u32;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rd = (orig_instr & 0x1F) as usize;
+    let bits = if sf == 1 { 64u32 } else { 32 };
+    let hi = read_gpr(regs, rn);
+    let lo = read_gpr(regs, rm);
+    let result = if sf == 0 {
+        let concat = ((hi & 0xFFFF_FFFF) << 32) | (lo & 0xFFFF_FFFF);
+        ((concat >> imms) & 0xFFFF_FFFF) as u64
+    } else {
+        if imms == 0 { hi }
+        else { (hi << (64 - imms)) | (lo >> imms) }
+    };
+    if rd != 31 { write_gpr(regs, rd, result); }
+    true
 }
 
 // ─── Emulation helpers ───────────────────────────────────────────────────────
