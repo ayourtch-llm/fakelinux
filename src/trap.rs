@@ -908,30 +908,41 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
 }
 
 fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let opc = (orig_instr >> 30) & 0x3;
+    let v_flag = (orig_instr >> 26) & 1;     // 0 = GPR, 1 = SIMD&FP
+    let wb_type = (orig_instr >> 23) & 0x3;  // 01=post, 10=offset, 11=pre, 00=no-alloc
+    let is_load = (orig_instr >> 22) & 1;
+    let imm7 = ((orig_instr >> 15) & 0x7F) as u64;
+    let rt2 = ((orig_instr >> 10) & 0x1F) as usize;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rt = (orig_instr & 0x1F) as usize;
+
+    // Element size depends on V and opc.
+    //   GPR  : opc=00 → 32-bit, opc=01 → LDPSW (32-bit signed), opc=10 → 64-bit
+    //   SIMD : opc=00 → 32-bit (S), opc=01 → 64-bit (D), opc=10 → 128-bit (Q)
+    let scale: u64 = if v_flag == 0 {
+        if opc <= 1 { 2 } else { 3 }
+    } else {
+        match opc { 0 => 2, 1 => 3, 2 => 4, _ => return false }
+    };
+    let is_signed_gpr = v_flag == 0 && opc == 1; // LDPSW
+    let elem_size: u64 = 1u64 << scale;
+    let offset = sign_extend(imm7, 7) << scale;
+
     let regs = &mut mctx.ss;
-    {
-        let opc = (orig_instr >> 30) & 0x3;
-        let is_load = (orig_instr >> 22) & 1;
-        let wb_type = (orig_instr >> 23) & 0x3; // 01=post, 10=offset, 11=pre
-        let imm7 = ((orig_instr >> 15) & 0x7F) as u64;
-        let rt2 = ((orig_instr >> 10) & 0x1F) as usize;
-        let rn = ((orig_instr >> 5) & 0x1F) as usize;
-        let rt = (orig_instr & 0x1F) as usize;
-        // opc=00: STP/LDP W (32-bit), opc=01: LDPSW (32-bit, sign-extend), opc=10: STP/LDP X (64-bit)
-        let scale = if opc <= 1 { 2u64 } else { 3 };
-        let is_signed = opc == 1; // LDPSW: load 32-bit, sign-extend to 64-bit
-        let offset = sign_extend(imm7, 7) << scale;
-        let base = read_gpr_sp(regs, rn);
-        let addr = if wb_type == 0b01 {
-            base // post-index: use base first, writeback later
-        } else {
-            base.wrapping_add(offset) // offset (10), pre-index (11), no-allocate (00)
-        };
-        let elem_size = 1u64 << scale;
+    let base = read_gpr_sp(regs, rn);
+    let addr = if wb_type == 0b01 {
+        base // post-index: use base first, writeback later
+    } else {
+        base.wrapping_add(offset) // offset (10), pre-index (11), no-allocate (00)
+    };
+
+    if v_flag == 0 {
+        // Integer LDP/STP (32-bit or 64-bit GPRs).
         if is_load == 1 {
             let mut v1 = unsafe { load_mem(addr, scale as u32) };
             let mut v2 = unsafe { load_mem(addr.wrapping_add(elem_size), scale as u32) };
-            if is_signed {
+            if is_signed_gpr {
                 v1 = v1 as i32 as i64 as u64;
                 v2 = v2 as i32 as i64 as u64;
             }
@@ -943,18 +954,49 @@ fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
             unsafe { store_mem(addr, scale as u32, v1); }
             unsafe { store_mem(addr.wrapping_add(elem_size), scale as u32, v2); }
         }
-        // Writeback
-        if wb_type == 0b01 || wb_type == 0b11 {
-            let new_base = if wb_type == 0b01 {
-                base.wrapping_add(offset) // post-index
-            } else {
-                base.wrapping_add(offset) // pre-index (same addr)
-            };
-            write_gpr_sp(regs, rn, new_base);
+    } else {
+        // SIMD&FP LDP/STP — reads/writes V/Q register file, not GPRs.
+        // Rt/Rt2 here index ns.v[] (q0..q31). Sub-Q sizes occupy the low bits.
+        let ns = &mut mctx.ns;
+        if is_load == 1 {
+            let v1 = unsafe { load_simd(addr, elem_size) };
+            let v2 = unsafe { load_simd(addr.wrapping_add(elem_size), elem_size) };
+            ns.v[rt] = v1;
+            ns.v[rt2] = v2;
+        } else {
+            let v1 = ns.v[rt];
+            let v2 = ns.v[rt2];
+            unsafe { store_simd(addr, elem_size, v1); }
+            unsafe { store_simd(addr.wrapping_add(elem_size), elem_size, v2); }
         }
-        return true;
     }
-    false
+
+    // Writeback (post/pre-index): always writes to Rn (GPR), regardless of V.
+    if wb_type == 0b01 || wb_type == 0b11 {
+        let new_base = base.wrapping_add(offset);
+        write_gpr_sp(regs, rn, new_base);
+    }
+    true
+}
+
+/// Load `bytes` of memory (1, 2, 4, 8 or 16) into the low bits of a u128.
+unsafe fn load_simd(addr: u64, bytes: u64) -> u128 {
+    match bytes {
+        4  => (addr as *const u32).read_unaligned() as u128,
+        8  => (addr as *const u64).read_unaligned() as u128,
+        16 => (addr as *const u128).read_unaligned(),
+        _  => 0,
+    }
+}
+
+/// Store the low `bytes` of `val` to memory.
+unsafe fn store_simd(addr: u64, bytes: u64, val: u128) {
+    match bytes {
+        4  => (addr as *mut u32).write_unaligned(val as u32),
+        8  => (addr as *mut u64).write_unaligned(val as u64),
+        16 => (addr as *mut u128).write_unaligned(val),
+        _  => {},
+    }
 }
 
 fn emul_bitfield(orig_instr: u32, mctx: &mut MContext64) -> bool {
@@ -1440,38 +1482,21 @@ unsafe extern "C" fn trap_handler(
         }
     }
 
-    // Global LR watch: check [FORK_LR_WATCH_ADDR] at every single trap to detect
-    // the exact instruction that corrupts __libc_fork's saved LR.
-    {
+    // LR watch (debug-only). Disabled by default — was for fork LR corruption
+    // investigation, but proved misleading (was watching wrong slot for glibc 2.39's
+    // _Fork). Enable with FAKELINUX_TRACE_LR=1 if needed.
+    if std::env::var("FAKELINUX_TRACE_LR").is_ok() {
         let lw_addr = FORK_LR_WATCH_ADDR.load(Ordering::Relaxed);
         let lw_exp = FORK_LR_WATCH_EXPECTED.load(Ordering::Relaxed);
         if lw_addr != 0 && lw_exp != 0 {
             let lw_cur = (lw_addr as *const u64).read();
             if lw_cur != lw_exp {
                 let pid = libc::getpid();
-                let sp = mctx.ss.sp;
-                let lr = mctx.ss.lr;
-                // Dump 16 qwords AROUND the watched address to see context
-                let mut ctx_buf = [0u8; 800];
-                let mut cn = {
-                    use std::io::Write;
-                    let mut c = std::io::Cursor::new(&mut ctx_buf[..]);
-                    let _ = c.write_fmt(format_args!(
-                        "fakelinux: [{}] LR_WATCH_HIT! pc={:#x} sp={:#x} lr={:#x} expected={:#x} got={:#x} watch_addr={:#x}\n",
-                        pid, pc, sp, lr, lw_exp, lw_cur, lw_addr));
-                    // Stack dump around watch address (8 qwords below, 8 above)
-                    let _ = c.write_fmt(format_args!("  STACK around watch_addr {:#x}:\n", lw_addr));
-                    for off in -64i64..=64i64 {
-                        if off % 8 != 0 { continue; }
-                        let a = (lw_addr as i64 + off) as u64;
-                        let v = (a as *const u64).read();
-                        let mark = if a == lw_addr { " <-- WATCHED" } else { "" };
-                        let _ = c.write_fmt(format_args!("    [{:#x}] = {:#018x}{}\n", a, v, mark));
-                    }
-                    c.position() as usize
-                };
-                libc::write(2, ctx_buf.as_ptr() as *const _, cn);
-                let _ = cn;
+                let mut buf = [0u8; 200];
+                let n = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] LR_WATCH_HIT! pc={:#x} expected={:#x} got={:#x} watch_addr={:#x}\n",
+                    pid, pc, lw_exp, lw_cur, lw_addr));
+                libc::write(2, buf.as_ptr() as *const _, n);
                 FORK_LR_WATCH_EXPECTED.store(lw_cur, Ordering::Relaxed);
             }
         }
@@ -2399,5 +2424,68 @@ mod tests {
         mctx.ss.x[0] = 0; // all zeros → 31 leading sign bits
         assert!(emul_dp1_src(0x5AC01402, &mut mctx));
         assert_eq!(mctx.ss.x[2], 31, "CLS 32-bit zero");
+    }
+
+    // ─── SIMD&FP LDP/STP via x18 (apt-get install file repro) ──────────
+    //
+    // LDP q0, q1, [x18]  — encoding 0xAD400640.
+    // Bit 26 (V) = 1, opc=10 → 128-bit Q-register pair; previously the
+    // emulator wrote into GPR x0/x1, corrupting tar's stack frames inside
+    // dpkg-deb. This caused "tar: This does not look like a tar archive".
+    #[test]
+    fn test_ldp_q_via_x18_writes_simd_regs() {
+        let mut mctx = make_mctx();
+        // 32 bytes (two q regs) of source data, 16-byte aligned by allocator.
+        let data: [u8; 32] = [
+            0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+            0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x01,
+            0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,
+            0xB0,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xB7,
+        ];
+        let base = data.as_ptr() as u64;
+        set_thread_x18(base);
+        // Sentinels to verify we DO NOT touch GPRs.
+        mctx.ss.x[0] = 0xDEAD_BEEF;
+        mctx.ss.x[1] = 0xCAFE_F00D;
+        mctx.ns.v[0] = 0;
+        mctx.ns.v[1] = 0;
+
+        // LDP q0, q1, [x18]: 0xAD400640
+        let instr: u32 = 0xAD400640;
+        let result = emul_ldp_stp(instr, &mut mctx);
+        assert!(result, "LDP q0, q1, [x18] should be handled");
+
+        // GPRs must be untouched.
+        assert_eq!(mctx.ss.x[0], 0xDEAD_BEEF, "x0 must not be clobbered by LDP q0");
+        assert_eq!(mctx.ss.x[1], 0xCAFE_F00D, "x1 must not be clobbered by LDP q1");
+
+        // q0 = bytes 0..16 (little-endian 128-bit).
+        let mut expect_q0: u128 = 0;
+        for i in (0..16).rev() { expect_q0 = (expect_q0 << 8) | data[i] as u128; }
+        let mut expect_q1: u128 = 0;
+        for i in (0..16).rev() { expect_q1 = (expect_q1 << 8) | data[16 + i] as u128; }
+        assert_eq!(mctx.ns.v[0], expect_q0, "q0 should hold first 16 bytes");
+        assert_eq!(mctx.ns.v[1], expect_q1, "q1 should hold next 16 bytes");
+    }
+
+    // STP d0, d1, [x18]  — encoding 0x6D000640.
+    // V=1, opc=01 → 64-bit D-register pair store.
+    #[test]
+    fn test_stp_d_via_x18_reads_simd_regs() {
+        let mut mctx = make_mctx();
+        let mut buf: [u64; 2] = [0; 2];
+        let base = buf.as_mut_ptr() as u64;
+        set_thread_x18(base);
+        mctx.ns.v[0] = 0x1122_3344_5566_7788_u128;
+        mctx.ns.v[1] = 0xAABB_CCDD_EEFF_0011_u128;
+
+        // STP d0, d1, [x18]: opc=01,V=1,LType=10(offset),L=0,imm7=0,Rt2=1,Rn=18,Rt=0
+        // 01 101 1 0 10 0 0000000 00001 10010 00000 = 0x6D000640
+        let instr: u32 = 0x6D000640;
+        let result = emul_ldp_stp(instr, &mut mctx);
+        assert!(result, "STP d0, d1, [x18] should be handled");
+
+        assert_eq!(buf[0], 0x1122_3344_5566_7788);
+        assert_eq!(buf[1], 0xAABB_CCDD_EEFF_0011);
     }
 }
