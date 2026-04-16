@@ -937,7 +937,7 @@ fn setup_stack(
 
     // 2) Environment strings
     let env_strs: Vec<&[u8]> = vec![
-        b"PATH=/usr/bin:/bin\0",
+        b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0",
         b"HOME=/root\0",
         b"TERM=xterm\0",
     ];
