@@ -281,6 +281,7 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     // Verify trampoline signature (sanity check)
     let t0 = (p.add(0) as *const u32).read_unaligned();
     let t1 = (p.add(4) as *const u32).read_unaligned();
+
     if t0 != 0xD280_1168 || t1 != 0xD43E_0000 {
         // Not a valid sigframe -- could be a bug. Log and return false.
         let msg = "fakelinux: rt_sigreturn: invalid sigframe trampoline\n";

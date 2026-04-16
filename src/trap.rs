@@ -1854,11 +1854,11 @@ unsafe extern "C" fn trap_handler(
         libc::_exit(128 + libc::SIGILL);
     }
 
-    IN_TRAP.store(false, Ordering::SeqCst);
-
-    // Deliver any signals that were deferred while we were in the trap handler.
-    // We build the sigframe directly here since we have the guest registers in mcontext.
+    // Keep IN_TRAP=true while delivering pending signals: build_sigframe_and_redirect
+    // mutates `mctx`, and another macOS signal arriving here would also try to
+    // mutate it via signal_forwarder, racing with our writes.
     crate::signal::deliver_pending_to_guest(mctx);
+    IN_TRAP.store(false, Ordering::SeqCst);
 }
 
 /// Full signal environment re-init for child after fork().
