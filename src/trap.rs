@@ -789,6 +789,46 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         return true;
     }
 
+    // LDP/STP literal (PC-relative):
+    // opc_10010_x_11_imm19_Rt2_Rt
+    // bits[31:26] = 100100 (LDP) or 100101 (STP)
+    // bits[25] = 0 for LDP, 1 for STP
+    // bits[24] = 0 for 64-bit, 1 for 32-bit
+    // bits[23:22] = 11 (literal)
+    // bits[21:5] = imm19 (PC-relative offset, signed)
+    // bits[14:10] = Rt2
+    // bits[4:0] = Rt
+    if orig_instr & 0xFC00_0000 == 0x9400_0000 {
+        let opc = (orig_instr >> 30) & 0x3;
+        let is_load = ((orig_instr >> 25) & 1) == 0; // 0=LDP, 1=STP
+        let imm19_raw = ((orig_instr >> 5) & 0x7FFFF) as i64;
+        // Sign-extend imm19 from 19 bits
+        let imm19 = if imm19_raw & 0x40000 != 0 {
+            imm19_raw - 0x80000
+        } else {
+            imm19_raw
+        };
+        let rt2 = ((orig_instr >> 10) & 0x1F) as usize;
+        let rt = (orig_instr & 0x1F) as usize;
+        // opc=00: LDP/STP W (32-bit), opc=10: LDP/STP X (64-bit)
+        let scale = if opc <= 1 { 2u64 } else { 3 };
+        let pc = instr_pc as i64; // PC at time of instruction fetch
+        let addr = (pc + (imm19 << scale)) as u64;
+        let elem_size = 1u64 << scale;
+        if is_load {
+            let mut v1 = unsafe { load_mem(addr, scale as u32) };
+            let mut v2 = unsafe { load_mem(addr.wrapping_add(elem_size), scale as u32) };
+            if rt != 31 { write_gpr(regs, rt, v1); }
+            if rt2 != 31 { write_gpr(regs, rt2, v2); }
+        } else {
+            let v1 = read_gpr(regs, rt);
+            let v2 = read_gpr(regs, rt2);
+            unsafe { store_mem(addr, scale as u32, v1); }
+            unsafe { store_mem(addr.wrapping_add(elem_size), scale as u32, v2); }
+        }
+        return true;
+    }
+
     // LDRSW (immediate, unsigned offset): 10_111_00_110_imm12_Rn_Rt
     if orig_instr & 0xFFC0_0000 == 0xB980_0000 {
         let imm12 = ((orig_instr >> 10) & 0xFFF) as u64;

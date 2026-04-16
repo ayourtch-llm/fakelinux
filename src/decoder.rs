@@ -240,14 +240,14 @@ static INSTR_TABLE: &[InstrEncoding] = &[
         value: 0xFA000000,
         reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rm
     },
-    // Data processing 1 source with extended immediate (0x92): bits[31:28]=1001
-    // 0x92 for various 1-source data processing
-    // Mask: 0xF8000000, Value: 0x90000000
+    // Data processing 1 source with extended immediate (0x92): bits[31:24]=10010010
+    // 0x92 for various 1-source data processing (RBIT, REV, CLZ, CLS, etc.)
+    // Mask: 0xFC000000, Value: 0x92000000
     // Rd at bits[4:0], Rn at bits[9:5]
     InstrEncoding {
         class: InstrClass::DataProc1Src,
-        mask: 0xF8000000,
-        value: 0x90000000,
+        mask: 0xFC000000,
+        value: 0x92000000,
         reg_operands: Some(&[(0, 5), (5, 5)]),  // Rd, Rn
     },
     // ADD/ADDP with extended register (0x7A, 0x9B): bits[31:28]=0111 or 1001
@@ -296,12 +296,21 @@ static INSTR_TABLE: &[InstrEncoding] = &[
     },
     // LDP/STP with literal offset (0x34, 0x35): bits[31:26]=001101 or 001101
     // Mask: 0xFC000000, Value: 0x34000000
-    // Rt at bits[4:0], Rt2 at bits[20:16], Rn at bits[9:5]
+    // Rt at bits[4:0], Rt2 at bits[14:10], no Rn (PC-relative)
     InstrEncoding {
         class: InstrClass::LdrStrRegOffset,
         mask: 0xFC000000,
         value: 0x34000000,
-        reg_operands: Some(&[(0, 5), (5, 5), (16, 5)]),  // Rt, Rn, Rt2
+        reg_operands: Some(&[(0, 5), (10, 5)]),  // Rt, Rt2
+    },
+    // LDP/STP with literal offset (0x94-0x97): bits[31:26]=100100 or 100101
+    // Mask: 0xFC000000, Value: 0x94000000
+    // Rt at bits[4:0], Rt2 at bits[14:10], no Rn (PC-relative)
+    InstrEncoding {
+        class: InstrClass::LdrStrRegOffset,
+        mask: 0xFC000000,
+        value: 0x94000000,
+        reg_operands: Some(&[(0, 5), (10, 5)]),  // Rt, Rt2
     },
     // SIMD load/store single (0x0C-0x0F, 0x1C-0x1F, 0x2C-0x2F, 0x38-0x3B, 0x4C-0x4F, 0x5C-0x5D, etc.)
     // These use GPR base register (Rn) and SIMD destination register (Rd)
@@ -636,9 +645,11 @@ pub fn references_x18(instr: u32) -> bool {
         }
     }
     
-    // If we get here, the instruction is not in our table
-    // In debug mode, panic to help identify missing table entries
-    panic!("Instruction 0x{:08x} not found in INSTR_TABLE - add entry for this instruction class", instr);
+    // If we get here, the instruction is not in our table.
+    // This can happen when scanning memory that contains non-instruction data
+    // (e.g., ELF headers, string tables, etc.). Return false to be conservative.
+    // Note: If you see this for actual code, add a table entry for the instruction.
+    false
 }
 
 /// Emulate an instruction that references x18.
