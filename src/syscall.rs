@@ -1422,6 +1422,39 @@ fn do_getcwd(buf: u64, size: u64) -> u64 {
     len as u64
 }
 
+/// Collect a guest-supplied envp (NULL-terminated char**) into a Vec of &CStr
+/// borrowed directly from guest memory. Safe to hold across the execve call
+/// because guest memory lives in the same address space as this process.
+unsafe fn collect_guest_env<'a>(envp_ptr: u64) -> Vec<&'a std::ffi::CStr> {
+    let mut out: Vec<&std::ffi::CStr> = Vec::new();
+    if envp_ptr == 0 { return out; }
+    let mut p = envp_ptr as *const *const i8;
+    loop {
+        let entry = *p;
+        if entry.is_null() { break; }
+        out.push(std::ffi::CStr::from_ptr(entry));
+        p = p.add(1);
+    }
+    out
+}
+
+/// Build the FAKELINUX_* overrides that must propagate into every re-exec'd
+/// fakelinux supervisor. Values come from the host environment (or from the
+/// currently-computed signal state for SIGIGN/SIGMASK), so that toggles like
+/// `FAKELINUX_TRACE=1` set on the outermost invocation keep working after
+/// arbitrary fork/exec chains.
+fn fakelinux_env_overrides() -> Vec<(&'static str, Option<String>)> {
+    let mut v: Vec<(&'static str, Option<String>)> = Vec::new();
+    for key in &["FAKELINUX_TRACE", "FAKELINUX_ROOT", "FAKELINUX_SYSROOT",
+                 "FAKELINUX_LOG", "FAKELINUX_DEBUG"] {
+        match std::env::var(key) {
+            Ok(val) => v.push((*key, Some(val))),
+            Err(_) => v.push((*key, None)),
+        }
+    }
+    v
+}
+
 fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Re-exec ourselves (fakelinux) with the guest binary as argument.
     // This replaces the current process image entirely.
@@ -1544,12 +1577,21 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                         else { std::env::remove_var("FAKELINUX_SIGMASK"); }
                     }
 
-                    extern "C" { static environ: *const *const i8; }
+                    // Merge guest env (DEBIAN_HAS_FRONTEND etc.) with FAKELINUX_* host overrides.
+                    let guest_env = unsafe { collect_guest_env(envp_ptr) };
+                    let mut overrides = fakelinux_env_overrides();
+                    for key in &["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK"] {
+                        overrides.push((*key, std::env::var(key).ok()));
+                    }
+                    let merged = merge_envp(&guest_env, &overrides);
+                    let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
+                        .chain(std::iter::once(std::ptr::null()))
+                        .collect();
                     unsafe {
                         libc::execve(
                             self_exe_c.as_ptr(),
                             shebang_argv.as_ptr() as *const *const i8,
-                            environ as *const *const i8,
+                            merged_ptrs.as_ptr(),
                         );
                     }
                     return translate::linux_errno();
@@ -1628,11 +1670,19 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    // Use the HOST environment (not guest's) so env vars like FAKELINUX_TRACE propagate
-    let new_envp_marker: *const *const i8 = std::ptr::null();
-    // Actually, just use environ from libc
-    extern "C" { static environ: *const *const i8; }
-    let envp_to_use = unsafe { environ };
+    // Build the final envp by merging the guest's environment (which
+    // carries guest-set vars like DEBIAN_HAS_FRONTEND, LD_LIBRARY_PATH, ...)
+    // with the FAKELINUX_* overrides that must reach the re-exec'd supervisor.
+    // Also pull in SIGIGN/SIGMASK host-set vars that were just written above.
+    let guest_env = unsafe { collect_guest_env(envp_ptr) };
+    let mut overrides = fakelinux_env_overrides();
+    for key in &["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK"] {
+        overrides.push((*key, std::env::var(key).ok()));
+    }
+    let merged = merge_envp(&guest_env, &overrides);
+    let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
 
     // Use real execve to replace the current process. Even though we're
     // inside a SIGILL handler, execve replaces the entire process image
@@ -1644,7 +1694,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         libc::execve(
             self_exe_c.as_ptr(),
             new_argv.as_ptr() as *const *const i8,
-            envp_to_use as *const *const i8,
+            merged_ptrs.as_ptr(),
         );
     }
     // execve only returns on failure
@@ -2781,4 +2831,134 @@ fn do_copy_file_range(fd_in: i32, off_in_ptr: u64, fd_out: i32, off_out_ptr: u64
     }
 
     total as u64
+}
+
+/// Merge a guest-supplied environment (from execve's envp argument) with a
+/// set of fakelinux-internal overrides that must be visible to the re-exec'd
+/// fakelinux supervisor (e.g. `FAKELINUX_TRACE`, `FAKELINUX_ROOT`, `FAKELINUX_SIGIGN`).
+///
+/// Rules:
+/// - Any guest env var that is *not* also in `overrides` is preserved verbatim.
+/// - Any key in `overrides` replaces (or removes, if value is `None`) the
+///   corresponding guest var. If the guest did not set that var, a `Some`
+///   value is appended.
+/// - Only the first occurrence of each guest key is kept (POSIX allows
+///   duplicates but `getenv` returns the first match).
+///
+/// Each override is `(name_without_equals, Option<value>)` — `None` means
+/// "unset in final env", `Some(v)` means "set to v".
+///
+/// Returns a `Vec<CString>` — the caller converts it to a NULL-terminated
+/// `*const *const c_char` array for `execve`.
+pub fn merge_envp(
+    guest_env: &[&std::ffi::CStr],
+    overrides: &[(&str, Option<String>)],
+) -> Vec<std::ffi::CString> {
+    use std::collections::HashSet;
+    let override_keys: HashSet<&str> = overrides.iter().map(|(k, _)| *k).collect();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut out: Vec<std::ffi::CString> = Vec::new();
+
+    for entry in guest_env {
+        let bytes = entry.to_bytes();
+        // Split at first '=' to get the key
+        let eq = bytes.iter().position(|&b| b == b'=').unwrap_or(bytes.len());
+        let key = &bytes[..eq];
+        // Skip if overridden (host will decide whether to set/remove)
+        if let Ok(key_str) = std::str::from_utf8(key) {
+            if override_keys.contains(key_str) { continue; }
+        }
+        // Dedup: keep first occurrence
+        if !seen.insert(key.to_vec()) { continue; }
+        out.push(std::ffi::CString::new(bytes).unwrap());
+    }
+    for (k, v) in overrides {
+        if let Some(val) = v {
+            let entry = format!("{}={}", k, val);
+            out.push(std::ffi::CString::new(entry).unwrap());
+        }
+        // None → omit entirely from output
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    fn c(s: &[u8]) -> Box<CStr> {
+        std::ffi::CString::new(s).unwrap().into_boxed_c_str()
+    }
+
+    #[test]
+    fn merge_envp_preserves_guest_vars() {
+        let g1 = c(b"PATH=/usr/bin");
+        let g2 = c(b"HOME=/root");
+        let guest = vec![g1.as_ref(), g2.as_ref()];
+        let out = merge_envp(&guest, &[]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"PATH=/usr/bin"));
+        assert!(strs.contains(&"HOME=/root"));
+    }
+
+    #[test]
+    fn merge_envp_preserves_debian_has_frontend() {
+        // Reproduces the debconf scenario: guest sets DEBIAN_HAS_FRONTEND=1
+        // via setenv() before calling execve. Child MUST see it, or it will
+        // re-exec the debconf frontend and deadlock on config.dat flock.
+        let g1 = c(b"PATH=/usr/bin");
+        let g2 = c(b"DEBIAN_HAS_FRONTEND=1");
+        let guest = vec![g1.as_ref(), g2.as_ref()];
+        let out = merge_envp(&guest, &[]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"DEBIAN_HAS_FRONTEND=1"),
+                "child must inherit DEBIAN_HAS_FRONTEND; got {:?}", strs);
+    }
+
+    #[test]
+    fn merge_envp_host_override_replaces_guest_value() {
+        let g1 = c(b"FAKELINUX_TRACE=0");
+        let g2 = c(b"HOME=/root");
+        let guest = vec![g1.as_ref(), g2.as_ref()];
+        let out = merge_envp(&guest, &[("FAKELINUX_TRACE", Some("1".into()))]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"FAKELINUX_TRACE=1"));
+        assert!(!strs.contains(&"FAKELINUX_TRACE=0"));
+        assert!(strs.contains(&"HOME=/root"));
+    }
+
+    #[test]
+    fn merge_envp_host_override_adds_missing_var() {
+        let g1 = c(b"HOME=/root");
+        let guest = vec![g1.as_ref()];
+        let out = merge_envp(&guest, &[("FAKELINUX_ROOT", Some("/rootfs".into()))]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"FAKELINUX_ROOT=/rootfs"));
+        assert!(strs.contains(&"HOME=/root"));
+    }
+
+    #[test]
+    fn merge_envp_none_override_removes_var() {
+        let g1 = c(b"FAKELINUX_SIGIGN=0xff");
+        let g2 = c(b"HOME=/root");
+        let guest = vec![g1.as_ref(), g2.as_ref()];
+        let out = merge_envp(&guest, &[("FAKELINUX_SIGIGN", None)]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(!strs.iter().any(|s| s.starts_with("FAKELINUX_SIGIGN")));
+        assert!(strs.contains(&"HOME=/root"));
+    }
+
+    #[test]
+    fn merge_envp_dedupes_guest_duplicates() {
+        // POSIX allows duplicates; getenv() returns the first match.
+        // Our merger keeps the first occurrence.
+        let g1 = c(b"X=first");
+        let g2 = c(b"X=second");
+        let guest = vec![g1.as_ref(), g2.as_ref()];
+        let out = merge_envp(&guest, &[]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert_eq!(strs.iter().filter(|s| s.starts_with("X=")).count(), 1);
+        assert!(strs.contains(&"X=first"));
+    }
 }

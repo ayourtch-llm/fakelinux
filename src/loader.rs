@@ -935,15 +935,22 @@ fn setup_stack(
     push_bytes(&mut sp, &random_bytes);
     let at_random_addr = sp;
 
-    // 2) Environment strings
-    let env_strs: Vec<&[u8]> = vec![
-        b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0",
-        b"HOME=/root\0",
-        b"TERM=xterm\0",
-    ];
+    // 2) Environment strings — inherit from the host process environ,
+    // strip FAKELINUX_* (supervisor-internal), and add sane defaults if
+    // the host didn't set PATH/HOME/TERM. This is critical: the guest's
+    // setenv() (e.g. Perl's `$ENV{DEBIAN_HAS_FRONTEND}=1`) updates the
+    // host libc's environ, which we pass through to any re-exec'd fakelinux
+    // via do_execve — then here, the re-exec'd instance makes the guest-
+    // visible env mirror those updates.
+    let host_env = collect_host_environ();
+    let host_env_refs: Vec<&std::ffi::CStr> = host_env.iter().map(|c| c.as_ref()).collect();
+    let env_owned = build_guest_env(&host_env_refs);
     let mut env_addrs: Vec<u64> = Vec::new();
-    for e in env_strs.iter().rev() {
-        push_bytes(&mut sp, e);
+    // Reverse iterate so pushes (decreasing sp) land in the right order.
+    for e in env_owned.iter().rev() {
+        let mut bytes = e.to_bytes().to_vec();
+        bytes.push(0); // NUL terminator
+        push_bytes(&mut sp, &bytes);
         env_addrs.push(sp);
     }
     env_addrs.reverse();
@@ -1212,4 +1219,131 @@ pub unsafe fn jump_to_entry(stack_ptr: u64, entry: u64) -> ! {
         entry = in(reg) entry,
         options(noreturn)
     );
+}
+
+/// Collect the host process environment (libc's `environ`) into owned CStrings.
+/// Used to seed the guest's initial envp on the stack.
+fn collect_host_environ() -> Vec<std::ffi::CString> {
+    extern "C" { static environ: *const *const i8; }
+    let mut out: Vec<std::ffi::CString> = Vec::new();
+    unsafe {
+        let mut p = environ;
+        if p.is_null() { return out; }
+        loop {
+            let entry = *p;
+            if entry.is_null() { break; }
+            out.push(std::ffi::CStr::from_ptr(entry).to_owned());
+            p = p.add(1);
+        }
+    }
+    out
+}
+
+/// Build the initial guest environment from the host process's environment,
+/// stripping fakelinux-internal `FAKELINUX_*` variables (they are supervisor
+/// state, not guest-visible) and ensuring `PATH`, `HOME`, and `TERM` have
+/// sane defaults if the host didn't set them.
+///
+/// Preserves first-wins semantics for duplicates (POSIX allows duplicates;
+/// `getenv` returns the first match).
+pub fn build_guest_env(host_env: &[&std::ffi::CStr]) -> Vec<std::ffi::CString> {
+    use std::collections::HashSet;
+    let mut out: Vec<std::ffi::CString> = Vec::new();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for e in host_env {
+        let bytes = e.to_bytes();
+        if bytes.starts_with(b"FAKELINUX_") { continue; }
+        let eq = bytes.iter().position(|&b| b == b'=').unwrap_or(bytes.len());
+        let key = bytes[..eq].to_vec();
+        if !seen.insert(key) { continue; }
+        out.push(std::ffi::CString::new(bytes).unwrap());
+    }
+    // Add defaults for required vars if missing.
+    let defaults: &[(&[u8], &[u8])] = &[
+        (b"PATH", b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        (b"HOME", b"/root"),
+        (b"TERM", b"xterm"),
+    ];
+    for (key, val) in defaults {
+        if !out.iter().any(|c| {
+            let b = c.to_bytes();
+            b.len() > key.len() && b.starts_with(key) && b[key.len()] == b'='
+        }) {
+            let mut entry = key.to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(val);
+            out.push(std::ffi::CString::new(entry).unwrap());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn c(s: &[u8]) -> CString { CString::new(s).unwrap() }
+
+    #[test]
+    fn build_guest_env_passes_through_debian_has_frontend() {
+        // The scenario: debconf frontend re-execs fakelinux with
+        // DEBIAN_HAS_FRONTEND=1 in the host environ. The re-exec'd fakelinux
+        // must make that env var visible to the guest binary it loads, or the
+        // guest's debconf client will think there is no frontend and deadlock.
+        let vars = [
+            c(b"DEBIAN_HAS_FRONTEND=1"),
+            c(b"PATH=/usr/bin"),
+        ];
+        let refs: Vec<&std::ffi::CStr> = vars.iter().map(|c| c.as_c_str()).collect();
+        let out = build_guest_env(&refs);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"DEBIAN_HAS_FRONTEND=1"),
+                "guest env must propagate DEBIAN_HAS_FRONTEND; got {:?}", strs);
+    }
+
+    #[test]
+    fn build_guest_env_strips_fakelinux_internal_vars() {
+        let vars = [
+            c(b"FAKELINUX_TRACE=1"),
+            c(b"FAKELINUX_ROOT=/rootfs"),
+            c(b"FAKELINUX_SIGIGN=0xff"),
+            c(b"PATH=/usr/bin"),
+        ];
+        let refs: Vec<&std::ffi::CStr> = vars.iter().map(|c| c.as_c_str()).collect();
+        let out = build_guest_env(&refs);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(!strs.iter().any(|s| s.starts_with("FAKELINUX_")),
+                "FAKELINUX_* must not leak into guest; got {:?}", strs);
+    }
+
+    #[test]
+    fn build_guest_env_adds_default_path_home_term() {
+        let out = build_guest_env(&[]);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.iter().any(|s| s.starts_with("PATH=")), "{:?}", strs);
+        assert!(strs.iter().any(|s| s.starts_with("HOME=")), "{:?}", strs);
+        assert!(strs.iter().any(|s| s.starts_with("TERM=")), "{:?}", strs);
+    }
+
+    #[test]
+    fn build_guest_env_preserves_host_path_over_default() {
+        let vars = [c(b"PATH=/custom:/bin")];
+        let refs: Vec<&std::ffi::CStr> = vars.iter().map(|c| c.as_c_str()).collect();
+        let out = build_guest_env(&refs);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert!(strs.contains(&"PATH=/custom:/bin"));
+        // Only one PATH entry (no accidental duplicate from the defaults step).
+        assert_eq!(strs.iter().filter(|s| s.starts_with("PATH=")).count(), 1);
+    }
+
+    #[test]
+    fn build_guest_env_dedupes_duplicates_first_wins() {
+        let vars = [c(b"X=first"), c(b"X=second")];
+        let refs: Vec<&std::ffi::CStr> = vars.iter().map(|c| c.as_c_str()).collect();
+        let out = build_guest_env(&refs);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        assert_eq!(strs.iter().filter(|s| s.starts_with("X=")).count(), 1);
+        assert!(strs.contains(&"X=first"));
+    }
 }
