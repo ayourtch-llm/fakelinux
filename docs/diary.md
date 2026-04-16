@@ -585,6 +585,70 @@ e4c2233  feat: complete table-driven x18 detection, eliminate fallback code
 Plus several decoder-classification commits earlier in the chain
 (`feat(decoder): add unified emulate function with EXTR support`, etc.).
 
+### Handoff — start here next session
+
+**Goal**: get libc6 to install so `apt-get install` is unblocked for any
+package that depends on a newer glibc.
+
+**Symptom**: `apt-get install -y --fix-broken` reaches libc6's preinst,
+which exits 1 with this debconf error:
+
+```
+debconf: DbDriver "config": /var/cache/debconf/config.dat is locked
+        by another process: Resource temporarily unavailable
+```
+
+EAGAIN/EWOULDBLOCK on a freshly-spawned process tree means the
+`fcntl(F_SETLK)` translation is most likely returning a stale
+"already locked" answer rather than acquiring the lock.
+
+**Where to look first**:
+
+- `src/syscall.rs::do_fcntl` (the `F_GETLK / F_SETLK / F_SETLKW` arm,
+  around line 1073).
+- `src/translate.rs::linux_flock_to_mac` and `mac_flock_to_linux`. The
+  `struct flock` layouts differ between Linux and macOS:
+
+  ```c
+  // Linux (aarch64):              // macOS (aarch64):
+  short  l_type;                   off_t  l_start;
+  short  l_whence;                 off_t  l_len;
+  off_t  l_start;                  pid_t  l_pid;
+  off_t  l_len;                    short  l_type;
+  pid_t  l_pid;                    short  l_whence;
+  ```
+
+  If our translator copies field-by-field assuming the Linux order,
+  macOS will see garbage `l_type` (likely `F_WRLCK`-equivalent) on the
+  query call and return EAGAIN even when the file is unlocked.
+
+**How to verify cheaply**:
+
+```
+pkill -9 -f fakelinux
+cp /tmp/libc6_inspect/preinst ubuntu-rootfs/tmp/preinst.sh
+chmod +x ubuntu-rootfs/tmp/preinst.sh
+FAKELINUX_TRACE=1 FAKELINUX_ROOT=ubuntu-rootfs \
+    ./target/release/fakelinux --container ubuntu-rootfs/bin/bash \
+    -c '/tmp/preinst.sh install' 2>&1 | grep -E 'fcntl|flock|F_SETLK'
+```
+
+The libc6 .deb is at `ubuntu-rootfs/tmp/libc6_2.39-0ubuntu8.7_arm64.deb`
+and was extracted to `/tmp/libc6_inspect/` during the previous session.
+
+**Watch out for** (real but probably out of scope for this fix):
+- Once libc6 installs, dpkg may run more `.dpkg-new` rename storms — the
+  nofollow translation work landed on 2026-04-16 should still hold up,
+  but worth re-running the full suite afterwards.
+- The `Description` field warning when parsing `/var/lib/dpkg/status` is
+  cosmetic; ignore unless it starts blocking something.
+
+**Recent state for memory**: `project_apt_install_status.md` and
+`MEMORY.md` are both up to date. The signal-race write-up
+(`project_nested_fork_race.md`) and the LR-corruption-debunk
+(`project_fork_lr_corruption.md`) document the dead-end theories — read
+those before re-investigating "fork is broken" symptoms, you'll save time.
+
 ### What's worth carrying forward
 
 - Whenever a "race" appears on a single-threaded process, ask first
