@@ -97,13 +97,18 @@ Create `/etc/resolv.conf` in the rootfs:
 echo "nameserver 8.8.8.8" > ubuntu-rootfs/etc/resolv.conf
 ```
 
-#### apt-get Hangs
+#### apt-get Hangs *(historical — fixed 2026-04-16)*
 
-If `apt-get update` hangs after downloading package lists, check if there are zombie `gpgv` or `http` method processes:
+`apt-get update` used to hang intermittently after downloading the InRelease
+files. As of commit 4b8f921 (signal-handler `sa_mask` fix) it completes
+reliably and `apt-get install` works for at least the `file` package.
+
+If you ever see something that looks like the old hang, check for stray
+fakelinux processes from a previous run before assuming a new bug:
+
 ```bash
 ps aux | grep fakelinux
-pkill -f "fakelinux.*gpgv"
-pkill -f "fakelinux.*http"
+pkill -9 -f fakelinux
 ```
 
 ## Architecture
@@ -170,11 +175,25 @@ If you see `SIGILL at pc=... instr=...`, check:
 
 - [2026-04-14: Fork child investigation & PID simplification](session-2026-04-14.md)
   — Container PID namespace simplified (only PID 1 virtual). TLS/stack overlap
-  theory DISPROVED (canary always intact). **ROOT CAUSE FOUND**: gpgv method
-  process has corrupted saved LR on stack (heap address 0x50000bxxx instead of
-  code address) BEFORE __libc_fork is called. __libc_fork returns to garbage,
-  child runs parent code. Investigation ongoing: what corrupts the gpgv method's
-  stack before fork.
+  theory DISPROVED (canary always intact). The "corrupted saved LR" theory in
+  this session was **also later DEBUNKED** (see 2026-04-16 entry below): the LR
+  watch was monitoring the wrong stack slot for glibc 2.39's `_Fork` (which uses
+  `sp+8`, not the older `__libc_fork`'s `sp+0xE8`). The actual root cause of the
+  fork-child-runs-parent-code symptom turned out to be signal-handler concurrency,
+  fixed in commit 4b8f921.
+
+- **2026-04-15/16: XML-based decoder rewrite + apt-get unblocked**
+  Massive cleanup and forward-progress session. See "2026-04-15/16 Session" below
+  for full notes. Headlines:
+  - Hand-rolled `INSTR_TABLE` and the `disarm64` crate dependency both gone.
+    Decoder is now generated at build time from the authoritative ARM A64 XML
+    spec (~2266 XML files vendored under `data/encoding/`).
+  - 8 emulation bugs found by parallel audit agents and fixed TDD-style.
+  - SIGILL handler `sa_mask` fix — the long-running "intermittent fork hang"
+    was a single-thread signal-handler race on `mctx`, not a TPIDR/canary issue.
+  - `apt-get update` works end-to-end.
+  - `apt-get install -y --no-install-recommends file` installs 3/4 packages
+    (libmagic-mgc, libmagic1t64, file). libc6 still blocks on debconf flock.
 
 ## Recent Fixes
 
@@ -323,12 +342,27 @@ This causes apt-get update to hang after downloading InRelease files.
    be poisoned after fork if a panic occurred while holding it. Added recovery
    via `into_inner()` on poison error in `tpidr_lookup`.
 
-**ROOT CAUSE FOUND**: glibc's `_Fork` child path writes the robust list head
-to `[TPIDR - 0x668]` via `STP x0, x0, [x6, #0xd8]` where `x6 = TPIDR - 0x740`.
-On real Linux, TPIDR points to a TLS region far from the stack. Under fakelinux,
-the guest's emulated TPIDR can point to glibc's TLS block allocated ON or NEAR
-the stack. When TPIDR is exactly 0x740 bytes above `__libc_fork`'s SP, the STP
-overwrites `[SP + 0xd8]` — the **stack canary** saved at `__libc_fork`'s entry.
+> **⚠ DEBUNKED on 2026-04-16.** The "TPIDR overlaps stack canary" theory below
+> was a false lead. The LR-watch instrumentation that produced the supporting
+> evidence was monitoring the wrong stack slot — it watched `[guest_sp + 0xE8]`
+> (the older `__libc_fork` saved-LR offset) but Ubuntu noble ships glibc 2.39
+> whose `_Fork` saves LR at `[guest_sp + 8]`. Once the watch was moved to the
+> correct slot it never fired. The actual root cause of the intermittent
+> "child runs parent code" / nested-fork hang is signal-handler concurrency:
+> SIGCHLD interrupting the SIGILL handler mid-mctx-write because the SIGILL
+> handler was installed with `sigemptyset(&sa.sa_mask)`. Fixed in commit
+> 4b8f921 by switching to `sigfillset`. See `docs/theory.md` for the analysis
+> that led to the fix and the 2026-04-15/16 session below.
+>
+> Original (incorrect) theory preserved for context:
+
+**ROOT CAUSE FOUND** *(later debunked — see callout above)*: glibc's `_Fork`
+child path writes the robust list head to `[TPIDR - 0x668]` via
+`STP x0, x0, [x6, #0xd8]` where `x6 = TPIDR - 0x740`. On real Linux, TPIDR
+points to a TLS region far from the stack. Under fakelinux, the guest's
+emulated TPIDR can point to glibc's TLS block allocated ON or NEAR the stack.
+When TPIDR is exactly 0x740 bytes above `__libc_fork`'s SP, the STP overwrites
+`[SP + 0xd8]` — the **stack canary** saved at `__libc_fork`'s entry.
 
 The stack canary check at `c1d20` (`b.ne __stack_chk_fail`) fires, **skipping**
 `mov w0, w19` (which would set the fork return to 0). `__libc_fork` returns
@@ -373,11 +407,207 @@ Three signal-related bugs were fixed (may not be root cause of hang but improve 
 3. **Signal mask not inherited across execve** (main.rs): GUEST_SIGMASK reset to 0 on re-exec.
    Now propagated via `FAKELINUX_SIGMASK` env var.
 
-**Workaround**: Use `timeout` to force termination:
+**Workaround (no longer needed since 2026-04-16, but harmless)**:
 ```bash
 FAKELINUX_ROOT=./ubuntu-rootfs timeout 120 ./target/debug/fakelinux --container ./ubuntu-rootfs/usr/bin/apt-get update
 ```
 
+## 2026-04-15/16 Session — XML decoder, signal-race fix, apt-get install
+
+This was a long, multi-day push that took fakelinux from "apt-get update
+sometimes hangs" to "`apt-get install file` actually puts a working `file`
+binary on disk". A lot was rewritten or thrown out; capture the highlights
+here so they don't get lost.
+
+### Decoder rewrite from authoritative ARM XML spec
+
+**Why**: Several debug sessions in early April kept finding cases where the
+hand-rolled `INSTR_TABLE` (and the `disarm64` crate fallback) misclassified
+instructions referencing x18, leading to silent miscompiles and corrupted
+state. Writing one more ad-hoc pattern on top of the previous ones felt like
+the wrong direction.
+
+**What changed**:
+- Vendored the ARM A64 ISA XML spec (~2266 instruction XML files) into
+  `data/encoding/`.
+- New `build.rs` (~430 lines) parses every XML at build time, extracts
+  mask/value/GPR-field information from `<regdiagram>`, derives an
+  `EmulClass` from the `psname` decode path
+  (e.g. `A64.dpimm.addsub_imm.ADD_32_addsub_imm` → `EmulClass::AddSubImm`),
+  and emits `generated_x18_table.rs` and `generated_x18_tests.rs` into `OUT_DIR`.
+- `src/decoder.rs` shrank from ~2062 lines to ~200 — now just `EmulClass`,
+  `from_u8`, `references_x18`, `decode_emul_class`, and `include!`s of the
+  generated table.
+- `Cargo.toml`: removed the `disarm64` and `disarm64_defn` deps; added
+  `roxmltree` as a build-dependency only.
+- `src/trap.rs::emulate_x18_instruction()` was refactored from a ~740-line
+  if/else chain into a `match` on `EmulClass` with one named handler per
+  class. The handlers (`emul_addsub_imm`, `emul_logical_imm`, `emul_ldp_stp`, …)
+  contain the same semantics as the old branches, just extracted and
+  individually testable.
+
+**Bugs found during the rewrite** (all fixed TDD-style — tests first):
+Three audit subagents combed the new handlers in parallel and surfaced 8
+discrete bugs (signed loads emulated as stores, EXTR `lsb=0` returning the
+wrong operand, ORR with `Rd=31` discarding instead of writing SP, dead
+conditional in pre/post-index writeback, and others). Each is now covered
+by a regression test in `src/trap.rs`'s `tests` module.
+
+### Literal-pool detection (don't patch data as if it were code)
+
+Two distinct mechanisms feed `find_literal_pools` in `src/loader.rs`:
+
+1. **ADR + post-inc-load pattern**: detects `ADR x?, #imm; LDR ?, [x?, #imm]!`
+   constructs that mark the start of an embedded data table.
+2. **SHA-256 K-table fingerprint scan**: looks for the four-word signature
+   `0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5` in `.text` and excludes
+   the surrounding 256 bytes from x18/TPIDR patching.
+
+The fingerprint scan was added because libgcrypt loads the K constants
+through the GOT rather than via an ADR-relative literal pool, so the first
+mechanism alone missed it. Without this, the K constants (which happen to
+look like ARM instructions when scanned as opcodes) were being "patched"
+and apt's signature verification corrupted SHA-256 outputs.
+
+See `feedback_literal_pools.md` in the assistant memory for the rule of
+thumb: **anytime hashing breaks, suspect a literal pool that wasn't
+detected**.
+
+### The big one — signal-handler `sa_mask`
+
+Symptom: nested forks (e.g. `dash -c "echo \$(echo \$(echo deep))"`) hung
+about 15% of the time. Earlier theories (TPIDR overlapping the stack canary;
+LR corruption inside `__libc_fork`) were debunked once the LR-watch
+instrumentation was fixed for glibc 2.39's `_Fork` (which saves LR at
+`sp+8`, not the older `sp+0xE8`).
+
+The actual race was between two signal handlers, both running on the same
+thread, both mutating macOS's `mctx`:
+
+- `trap_handler` (SIGILL from a UDF) restores guest registers, redirects PC.
+- `signal_forwarder` (SIGCHLD when a child exits) builds a sigframe and
+  redirects PC into the guest's signal handler.
+
+`install_trap_handler()` was using `sigemptyset(&sa.sa_mask)`, so SIGCHLD
+could interrupt `trap_handler` mid-mctx-write — for nested forks, multiple
+SIGCHLDs arrive close together, blowing up the race window. Switching to
+`sigfillset(&sa.sa_mask)` blocks all other signals while `trap_handler` runs;
+they get delivered cleanly via `sigreturn`.
+
+**Verification**: 0/50 hangs after the fix (was 3/20 before). `apt-get
+update` started completing reliably immediately after this commit.
+
+`docs/theory.md` (added the same day) walks through the analysis that pointed
+at "shared mutable state across handlers" as the right place to look. The
+theory document was right about the mechanism even though the *original*
+hypothesis (multi-thread race on FORK trampoline state) named the wrong
+suspect — the actual race was single-thread signal-handler interleaving.
+
+### `apt-get install file` — getting through dpkg
+
+Once update worked, install surfaced its own crop of bugs. In order of
+discovery:
+
+1. **`/tmp` was not translated** under `FAKELINUX_ROOT`. The translator
+   passed `/tmp` straight through to the host, which on macOS becomes
+   `/private/tmp` — leaking host files into the guest and putting dpkg's
+   `/tmp/apt-dpkg-install-XXX/` staging directory on the wrong filesystem.
+   Now translated like any other path in full-rootfs mode (kept as-is in
+   sysroot-only mode for backward compat).
+2. **SIMD&FP `LDP/STP` via x18** (`emul_ldp_stp`). The decoder correctly
+   classified `LDP q0, q1, [x18]` (`0xAD400640`) as `LdpStp`, but the
+   handler only knew about the GPR variant — it wrote into x0/x1 instead
+   of v0/v1, corrupting tar's stack inside dpkg-deb. Symptom:
+   `tar: This does not look like a tar archive`. Now distinguishes the
+   V flag (bit 26) and routes to `mctx.ns.v[]` for the SIMD case, with
+   element width derived from `opc` per the A64 spec (S/D/Q for V=1).
+3. **`utimensat` `AT_SYMLINK_NOFOLLOW` flag value** is `0x100` on Linux
+   but `0x20` on macOS. Without translation macOS silently followed the
+   symlink. Also rewrote `do_utimensat` to delegate directly to macOS's
+   native `utimensat` (available since 10.13) instead of reimplementing
+   `UTIME_NOW`/`UTIME_OMIT` on top of `utimes`.
+4. **Final-component symlink resolution at the rootfs translation layer**.
+   `effective_path_ptr` always walked the full path, resolving every
+   symlink — which is wrong for syscalls that operate on the link itself
+   (`rename`, `unlink`, `link`, `utimensat`-NOFOLLOW). dpkg stages files
+   as `*.dpkg-new` symlinks pointing at not-yet-extracted targets, so
+   resolving the final component dereferences a dangling link → ENOENT.
+   Added `translate_path_nofollow` (translates parent components but
+   leaves the basename untouched) and `effective_path_ptr_nofollow`,
+   wired into `SYS_UNLINKAT`, `SYS_RENAMEAT`, `do_renameat2`, `do_linkat`
+   (when `AT_SYMLINK_FOLLOW` is *not* set), and `do_utimensat` (when
+   `AT_SYMLINK_NOFOLLOW` is set).
+5. **`do_renameat2` was passing untranslated guest paths straight to
+   macOS** — a long-standing oversight that became visible only once
+   the other fixes let dpkg get this far. Now uses the nofollow variant.
+6. **`PATH` default** widened from `/usr/bin:/bin` to
+   `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` so
+   dpkg-trigger / dpkg-divert and other `/usr/sbin` tools resolve when
+   maintainer scripts invoke them by basename.
+7. **PTY ioctls** `TIOCSPTLCK` (`0x4004_5431`) and `TIOCGPTN`
+   (`0x8004_5430`) added so `unlockpt()` / pty allocation works.
+
+**Result**: `apt-get install -y --no-install-recommends file` reaches
+`Status: install ok unpacked` for libmagic-mgc, libmagic1t64, and file.
+`/usr/bin/file` runs and correctly identifies ELF binaries, ASCII text,
+etc. inside the container.
+
+```
+$ FAKELINUX_ROOT=ubuntu-rootfs ./target/release/fakelinux \
+    --container ubuntu-rootfs/bin/bash -c 'file /etc/passwd /usr/bin/bash'
+/etc/passwd:   ASCII text
+/usr/bin/bash: ELF 64-bit LSB pie executable, ARM aarch64, ...
+```
+
+**Still blocked**: libc6 — its `preinst` exits 1 because debconf's
+`fcntl(F_SETLK)` on `/var/cache/debconf/config.dat` returns EAGAIN even on
+a fresh process tree. Likely a `linux_flock_to_mac` struct-layout quirk
+(Linux puts `l_type`/`l_whence` first in `struct flock`, macOS puts them
+last). Tracked in the assistant memory under `project_apt_install_status.md`.
+
+### Commits from this session (most recent first)
+
+```
+a74d28d  fix(loader): include /sbin and /usr/sbin in default PATH
+be987a9  fix(rootfs/syscall): translate /tmp; honor symlink-nofollow at translation layer
+cde26fc  fix(emul): handle SIMD&FP LDP/STP via x18 (V=1 variant)
+4b8f921  fix: block other signals during SIGILL handler — fixes nested fork race
+0179eea  docs: add fork concurrency theory analysis
+c2d96b5  debug: fix LR watch address for glibc 2.39's _Fork (was watching wrong slot)
+84cfdc0  fix: detect SHA-256 K table by fingerprint (catches libgcrypt's K constants)
+5c5ebbc  fix: keep IN_TRAP=true during deliver_pending_to_guest to prevent race
+edb4e3e  fix: literal pool detection — ADR + post-inc-load pattern
+e4c2233  feat: complete table-driven x18 detection, eliminate fallback code
+513aea8  feat: improve x18 detection coverage in decoder.rs
+4d5af9e  feat: integrate decoder.rs as single source of truth for x18 detection
+```
+
+Plus several decoder-classification commits earlier in the chain
+(`feat(decoder): add unified emulate function with EXTR support`, etc.).
+
+### What's worth carrying forward
+
+- Whenever a "race" appears on a single-threaded process, ask first
+  whether two signal handlers can interrupt each other. `sa_mask` is
+  cheap insurance for any handler that touches `mctx` or shared statics.
+- For signal handlers that mutate `mctx`, `sigfillset(&sa_mask)` should
+  be the default; only relax it when you've proven the handler is
+  re-entrant.
+- Path translation isn't a single thing. Distinguish syscalls that
+  operate on the symlink (`rename`/`unlink`/`lstat`/`utimensat`-NOFOLLOW)
+  from those that operate on the target (`open`/`stat`). Resolving the
+  final component for the former silently breaks dpkg-style staging.
+- AT_* flag values are not portable. `AT_SYMLINK_NOFOLLOW` is `0x100`
+  on Linux and `0x20` on macOS; `AT_SYMLINK_FOLLOW` happens to match,
+  but don't rely on coincidence — translate explicitly.
+- When a hash function corrupts output, suspect a literal pool that the
+  patcher mistook for code. Two detection mechanisms (ADR-pattern and
+  fingerprint scan) catch different cases.
+
 ### DNS Resolution Fails
 
 Create `/etc/resolv.conf` in the rootfs:
+
+```bash
+echo "nameserver 8.8.8.8" > ubuntu-rootfs/etc/resolv.conf
+```
