@@ -57,9 +57,16 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     if path.starts_with(b"/dev") {
         return None;
     }
-    // Don't translate /tmp (shared)
+    // For /tmp:
+    //   - Full rootfs mode (FAKELINUX_ROOT): translate, so guest /tmp → <root>/tmp.
+    //     Without this, the guest sees macOS /tmp which is a symlink to
+    //     /private/tmp — dpkg fails because files staged under /tmp/apt-dpkg-install-XXX
+    //     are not where it expects, and host filesystem leaks into the guest.
+    //   - Sysroot mode only: leave /tmp as host-shared (legacy behavior).
     if path.starts_with(b"/tmp") {
-        return None;
+        if !ROOT.get().map(|s| !s.is_empty()).unwrap_or(false) {
+            return None;
+        }
     }
 
     // Try FAKELINUX_ROOT first (full path translation)
@@ -153,10 +160,14 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
             let target = &link_buf[..link_len as usize];
 
             if target.starts_with(b"/") {
-                // Absolute symlink target → re-root under rootfs
-                // Check if it points to /proc, /dev, /tmp (don't re-root those)
-                if target.starts_with(b"/proc") || target.starts_with(b"/dev") || target.starts_with(b"/tmp") {
-                    // Let macOS handle these natively
+                // Absolute symlink target → re-root under rootfs.
+                // /proc and /dev always pass through (handled natively / virtually).
+                // /tmp passes through only in sysroot-only mode; in full rootfs mode
+                // it must be re-rooted so dpkg's /tmp staging stays inside the guest.
+                if target.starts_with(b"/proc") || target.starts_with(b"/dev") {
+                    return simple;
+                }
+                if target.starts_with(b"/tmp") && !in_full_rootfs_mode() {
                     return simple;
                 }
                 resolved = root.to_vec();
@@ -195,7 +206,10 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
                         let target2 = &link_buf[..link_len2 as usize];
 
                         if target2.starts_with(b"/") {
-                            if target2.starts_with(b"/proc") || target2.starts_with(b"/dev") || target2.starts_with(b"/tmp") {
+                            if target2.starts_with(b"/proc") || target2.starts_with(b"/dev") {
+                                return simple;
+                            }
+                            if target2.starts_with(b"/tmp") && !in_full_rootfs_mode() {
                                 return simple;
                             }
                             resolved = root.to_vec();
@@ -251,6 +265,56 @@ fn is_library_path(path: &[u8]) -> bool {
         || path.starts_with(b"/etc/ld.so.conf")
 }
 
+/// Translate a guest path, but DO NOT resolve a symlink at the final component
+/// (unless it's an absolute symlink that would otherwise escape the rootfs).
+///
+/// This is needed for syscalls invoked with `AT_SYMLINK_NOFOLLOW` and for ones
+/// that operate on the link itself rather than its target — `rename`, `unlink`,
+/// `link`, `lstat`, etc. Without this, dpkg's staged `*.dpkg-new` symlinks
+/// (which point at not-yet-extracted targets) get resolved during translation,
+/// and the syscall then operates on the (missing) target instead of the link
+/// itself, returning ENOENT.
+///
+/// Strategy: split path into parent + basename, translate the parent normally
+/// (resolving any intermediate symlinks), append the basename verbatim. Then
+/// inspect the final component: if it's a symlink with an *absolute* target,
+/// the symlink would escape to the macOS host, so we still re-root it. Relative
+/// symlinks at the final component are left alone — macOS will resolve them
+/// within the rootfs naturally.
+pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
+    if !path.starts_with(b"/") {
+        return None;
+    }
+    if path.starts_with(b"/proc") || path.starts_with(b"/dev") {
+        return None;
+    }
+    if path.starts_with(b"/tmp") && !in_full_rootfs_mode() {
+        return None;
+    }
+    let last_slash = path.iter().rposition(|&b| b == b'/').unwrap();
+    let (parent, basename) = if last_slash == 0 {
+        (&b"/"[..], &path[1..])
+    } else {
+        (&path[..last_slash], &path[last_slash + 1..])
+    };
+    // Translate the parent (with symlink resolution).
+    let mut translated_parent = match translate_path(parent) {
+        Some(p) => {
+            let mut v = p;
+            if v.ends_with(&[0]) { v.pop(); }
+            v
+        }
+        None => return None,
+    };
+    if !translated_parent.ends_with(b"/") {
+        translated_parent.push(b'/');
+    }
+    let mut full = translated_parent;
+    full.extend_from_slice(basename);
+    full.push(0);
+    Some(full)
+}
+
 /// Strip the rootfs prefix from an absolute host path, returning the guest path.
 /// E.g., with root="/home/user/rootfs", "/home/user/rootfs/var/lib" → "/var/lib".
 /// Returns None if the path doesn't start with the rootfs prefix.
@@ -297,7 +361,9 @@ mod tests {
 
     #[test]
     fn test_translate_path_skips_special_dirs() {
-        // /proc, /dev, /tmp should never be translated regardless of mode
+        // /proc and /dev are never translated (virtual / native).
+        // /tmp is translated under FAKELINUX_ROOT (these tests run with neither
+        // ROOT nor SYSROOT set, so /tmp is also a no-op here).
         assert!(translate_path(b"/proc/self/exe").is_none());
         assert!(translate_path(b"/dev/null").is_none());
         assert!(translate_path(b"/tmp/foo").is_none());

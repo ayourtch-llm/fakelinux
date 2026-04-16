@@ -49,6 +49,19 @@ fn effective_path_ptr(path_ptr: u64) -> (*const i8, Option<std::ffi::CString>) {
     }
 }
 
+/// Like `effective_path_ptr` but does NOT resolve a symlink at the final
+/// component — required for syscalls invoked with AT_SYMLINK_NOFOLLOW.
+fn effective_path_ptr_nofollow(path_ptr: u64) -> (*const i8, Option<std::ffi::CString>) {
+    let path = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const i8) };
+    if let Some(v) = rootfs::translate_path_nofollow(path.to_bytes()) {
+        let cs = unsafe { std::ffi::CString::from_vec_with_nul_unchecked(v) };
+        let ptr = cs.as_ptr();
+        (ptr, Some(cs))
+    } else {
+        (path_ptr as *const i8, None)
+    }
+}
+
 /// Write a diagnostic message to stderr using raw write() — safe after fork.
 /// eprintln! uses Rust's Mutex<Stderr> which deadlocks in forked children.
 fn raw_eprintln(msg: &str) {
@@ -277,7 +290,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         }
         SYS_UNLINKAT => {
             let mac_flags = if args[2] & 0x200 != 0 { libc::AT_REMOVEDIR } else { 0 };
-            let (eff_path, _hold) = effective_path_ptr(args[1]);
+            // unlink/rmdir act on the link itself — never resolve final symlink.
+            let (eff_path, _hold) = effective_path_ptr_nofollow(args[1]);
             let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), eff_path, mac_flags) };
             if ret == 0 { 0 }
             else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
@@ -286,8 +300,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             } else { translate::linux_errno() }
         }
         SYS_RENAMEAT => {
-            let (eff_old, _hold_old) = effective_path_ptr(args[1]);
-            let (eff_new, _hold_new) = effective_path_ptr(args[3]);
+            // rename acts on the link itself — never resolve final symlinks of either side.
+            let (eff_old, _hold_old) = effective_path_ptr_nofollow(args[1]);
+            let (eff_new, _hold_new) = effective_path_ptr_nofollow(args[3]);
             let ret = unsafe { libc::renameat(
                 translate::translate_dirfd(args[0] as i32), eff_old,
                 translate::translate_dirfd(args[2] as i32), eff_new,
@@ -844,6 +859,30 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
             let val = unsafe { (arg as *const i32).read_unaligned() };
             let ret = unsafe { libc::ioctl(fd, libc::FIONBIO, &val) };
             if ret < 0 { translate::linux_errno() } else { 0 }
+        }
+        // ── PTY ioctls (Linux uses these; macOS has equivalents but different API) ──
+        // TIOCSPTLCK (_IOW('T',0x31,int)) — set/clear pty lock. macOS pts are not
+        // locked by default, so unlock (val=0) is a no-op success. lock (val=1) is
+        // unsupported but rare.
+        0x4004_5431 => {
+            let val = unsafe { (arg as *const i32).read_unaligned() };
+            if val == 0 { 0 } else { (-25_i64) as u64 } // unlock=ok, lock=ENOTTY
+        }
+        // TIOCGPTN (_IOR('T',0x30,uint)) — get pty number. Use ptsname() to extract.
+        0x8004_5430 => {
+            extern "C" {
+                fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+            }
+            let p = unsafe { ptsname(fd) };
+            if p.is_null() { return translate::linux_errno(); }
+            let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+            // Extract trailing digits from "/dev/ttysNNN" or "/dev/pts/N"
+            let num: u32 = s.chars().rev().take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .chars().rev().collect::<String>()
+                .parse().unwrap_or(0);
+            unsafe { (arg as *mut u32).write_unaligned(num); }
+            0
         }
         _ => (-25_i64) as u64, // -ENOTTY
     }
@@ -2373,8 +2412,16 @@ fn do_symlinkat(target: u64, newdirfd: i32, linkpath: u64) -> u64 {
 }
 
 fn do_linkat(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags: i32) -> u64 {
-    let (eff_old, _hold_old) = effective_path_ptr(oldpath);
-    let (eff_new, _hold_new) = effective_path_ptr(newpath);
+    // linkat default: do NOT dereference oldpath if it is a symlink (Linux semantics).
+    // Only follow when AT_SYMLINK_FOLLOW (0x400) is set in flags.
+    const AT_SYMLINK_FOLLOW: i32 = 0x400;
+    let (eff_old, _hold_old) = if flags & AT_SYMLINK_FOLLOW != 0 {
+        effective_path_ptr(oldpath)
+    } else {
+        effective_path_ptr_nofollow(oldpath)
+    };
+    // newpath is the link to be created — always nofollow (it doesn't exist yet).
+    let (eff_new, _hold_new) = effective_path_ptr_nofollow(newpath);
     // Linux AT_EMPTY_PATH=0x1000, AT_SYMLINK_FOLLOW=0x400 — same on macOS
     let ret = unsafe {
         libc::linkat(
@@ -2395,115 +2442,60 @@ fn do_flock(fd: i32, operation: i32) -> u64 {
 }
 
 fn do_utimensat(dirfd: i32, pathname: u64, times_ptr: u64, flags: i32) -> u64 {
-    // Linux struct timespec is {i64 tv_sec, i64 tv_nsec} — same layout on macOS aarch64
-    // Special values: UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE
-    let mac_dirfd = translate::translate_dirfd(dirfd);
+    // Linux struct timespec is {i64 tv_sec, i64 tv_nsec} — same layout on macOS aarch64.
+    // UTIME_NOW (0x3FFFFFFF) and UTIME_OMIT (0x3FFFFFFE) match between the two,
+    // and macOS provides utimensat() natively (since 10.13) with matching semantics.
+    //
+    // BUT the AT_* flag values differ between platforms:
+    //   Linux  AT_SYMLINK_NOFOLLOW = 0x100
+    //   macOS  AT_SYMLINK_NOFOLLOW = 0x0020
+    // We must translate, otherwise macOS silently ignores the bit and follows
+    // the symlink — which makes dpkg's /usr/share/file/magic.mgc.dpkg-new
+    // (a dangling symlink staged before the target package is installed)
+    // fail with ENOENT.
+    extern "C" {
+        fn utimensat(fd: libc::c_int,
+                     path: *const libc::c_char,
+                     times: *const libc::timespec,
+                     flag: libc::c_int) -> libc::c_int;
+        fn futimens(fd: libc::c_int, times: *const libc::timespec) -> libc::c_int;
+    }
+
+    const LINUX_AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    let mac_flags = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+
+    let times = times_ptr as *const libc::timespec;
 
     if pathname == 0 {
-        // futimens variant: operate on fd directly
-        // macOS doesn't have futimens as a syscall, use futimes
-        if times_ptr == 0 {
-            // NULL times = set both to now
-            let ret = unsafe { libc::futimes(dirfd, std::ptr::null()) };
-            if ret < 0 { return translate::linux_errno(); }
-            return 0;
-        }
-        // Read Linux timespecs and convert to macOS timeval for futimes
-        let ts = times_ptr as *const libc::timespec;
-        let atime = unsafe { *ts };
-        let mtime = unsafe { *ts.add(1) };
-        let times = [
-            timespec_to_timeval(&atime),
-            timespec_to_timeval(&mtime),
-        ];
-        let ret = unsafe { libc::futimes(dirfd, times.as_ptr()) };
+        // futimens variant — Linux passes dirfd as the file fd.
+        let ret = unsafe { futimens(dirfd, times) };
         if ret < 0 { return translate::linux_errno(); }
         return 0;
     }
 
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    let mac_dirfd = translate::translate_dirfd(dirfd);
+    // When the caller asked for symlink-nofollow semantics, also avoid resolving
+    // the final symlink during rootfs path translation (otherwise a dangling
+    // .dpkg-new symlink turns into its missing target → ENOENT).
+    let (eff_path, _hold) = if mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        effective_path_ptr_nofollow(pathname)
+    } else {
+        effective_path_ptr(pathname)
+    };
 
-    if times_ptr == 0 {
-        // NULL times = set both to now; use utimes with NULL
-        let ret = unsafe { libc::utimes(eff_path, std::ptr::null()) };
-        if ret == 0 { return 0; }
-        if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
-            let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, std::ptr::null()) };
-            if ret2 < 0 { return translate::linux_errno(); }
-            return 0;
-        }
-        return translate::linux_errno();
-    }
-
-    // Read Linux timespecs
-    let ts = times_ptr as *const libc::timespec;
-    let atime = unsafe { *ts };
-    let mtime = unsafe { *ts.add(1) };
-
-    // Check for UTIME_OMIT — if both are OMIT, nothing to do
-    const UTIME_OMIT: i64 = 0x3FFFFFFE;
-    const UTIME_NOW: i64 = 0x3FFFFFFF;
-    if atime.tv_nsec as i64 == UTIME_OMIT && mtime.tv_nsec as i64 == UTIME_OMIT {
-        return 0;
-    }
-
-    // For UTIME_NOW/UTIME_OMIT we need to read current times first
-    // macOS doesn't support these flags natively, so we emulate
-    let mut tv = [
-        timespec_to_timeval(&atime),
-        timespec_to_timeval(&mtime),
-    ];
-
-    // If either is UTIME_NOW or UTIME_OMIT, get current times
-    if atime.tv_nsec as i64 == UTIME_NOW || atime.tv_nsec as i64 == UTIME_OMIT
-        || mtime.tv_nsec as i64 == UTIME_NOW || mtime.tv_nsec as i64 == UTIME_OMIT
-    {
-        // Get current time for NOW, current file time for OMIT
-        let mut now_tv: libc::timeval = unsafe { std::mem::zeroed() };
-        unsafe { libc::gettimeofday(&mut now_tv, std::ptr::null_mut()) };
-
-        if atime.tv_nsec as i64 == UTIME_NOW {
-            tv[0] = now_tv;
-        } else if atime.tv_nsec as i64 == UTIME_OMIT {
-            // Need to stat the file to get current atime
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let _r = if flags & 0x100 != 0 { // AT_SYMLINK_NOFOLLOW
-                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, libc::AT_SYMLINK_NOFOLLOW) }
-            } else {
-                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, 0) }
-            };
-            tv[0].tv_sec = st.st_atime;
-            tv[0].tv_usec = st.st_atime_nsec as i32 / 1000;
-        }
-        if mtime.tv_nsec as i64 == UTIME_NOW {
-            tv[1] = now_tv;
-        } else if mtime.tv_nsec as i64 == UTIME_OMIT {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let _r = if flags & 0x100 != 0 {
-                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, libc::AT_SYMLINK_NOFOLLOW) }
-            } else {
-                unsafe { libc::fstatat(mac_dirfd, eff_path, &mut st, 0) }
-            };
-            tv[1].tv_sec = st.st_mtime;
-            tv[1].tv_usec = st.st_mtime_nsec as i32 / 1000;
-        }
-    }
-
-    let ret = unsafe { libc::utimes(eff_path, tv.as_ptr()) };
+    let ret = unsafe { utimensat(mac_dirfd, eff_path, times, mac_flags) };
     if ret == 0 { return 0; }
     if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
-        let ret2 = unsafe { libc::utimes(pathname as *const libc::c_char, tv.as_ptr()) };
-        if ret2 < 0 { return translate::linux_errno(); }
-        return 0;
+        let ret2 = unsafe {
+            utimensat(mac_dirfd, pathname as *const libc::c_char, times, mac_flags)
+        };
+        if ret2 == 0 { return 0; }
     }
     translate::linux_errno()
-}
-
-fn timespec_to_timeval(ts: &libc::timespec) -> libc::timeval {
-    libc::timeval {
-        tv_sec: ts.tv_sec,
-        tv_usec: (ts.tv_nsec / 1000) as i32,
-    }
 }
 
 fn do_ftruncate(fd: i32, length: i64) -> u64 {
@@ -2655,22 +2647,24 @@ fn do_renameat2(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags:
     const RENAME_NOREPLACE: u32 = 1;
     const RENAME_EXCHANGE: u32 = 2;
 
-    let old_cstr = oldpath as *const libc::c_char;
-    let new_cstr = newpath as *const libc::c_char;
+    // rename acts on the link itself — never resolve final symlinks. Translation
+    // also rewrites paths to live under FAKELINUX_ROOT (was missing entirely).
+    let (eff_old, _hold_old) = effective_path_ptr_nofollow(oldpath);
+    let (eff_new, _hold_new) = effective_path_ptr_nofollow(newpath);
     let mac_olddir = translate::translate_dirfd(olddirfd);
     let mac_newdir = translate::translate_dirfd(newdirfd);
 
     if flags == 0 {
         // Plain rename
-        let ret = unsafe { libc::renameat(mac_olddir, old_cstr, mac_newdir, new_cstr) };
+        let ret = unsafe { libc::renameat(mac_olddir, eff_old, mac_newdir, eff_new) };
         if ret < 0 { translate::linux_errno() } else { 0 }
     } else if flags == RENAME_NOREPLACE {
         // Check destination doesn't exist first, then rename
-        let ret = unsafe { libc::faccessat(mac_newdir, new_cstr, libc::F_OK, 0) };
+        let ret = unsafe { libc::faccessat(mac_newdir, eff_new, libc::F_OK, 0) };
         if ret == 0 {
             return (-17_i64) as u64; // -EEXIST
         }
-        let ret = unsafe { libc::renameat(mac_olddir, old_cstr, mac_newdir, new_cstr) };
+        let ret = unsafe { libc::renameat(mac_olddir, eff_old, mac_newdir, eff_new) };
         if ret < 0 { translate::linux_errno() } else { 0 }
     } else if flags == RENAME_EXCHANGE {
         // macOS has renamex_np with RENAME_SWAP
@@ -2685,7 +2679,7 @@ fn do_renameat2(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags:
             if olddirfd != libc::AT_FDCWD || newdirfd != libc::AT_FDCWD {
                 return (-38_i64) as u64; // -ENOSYS
             }
-            let ret = unsafe { renamex_np(old_cstr, new_cstr, RENAME_SWAP) };
+            let ret = unsafe { renamex_np(eff_old, eff_new, RENAME_SWAP) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         #[cfg(not(target_os = "macos"))]
