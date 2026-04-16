@@ -335,6 +335,7 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         EmulClass::CondCompareImm => emul_ccmp_imm(orig_instr, mctx),
         EmulClass::FloatGprConvert => emul_fmov(orig_instr, mctx),
         EmulClass::Extract => emul_extract(orig_instr, mctx),
+        EmulClass::DataProc1Src => emul_dp1_src(orig_instr, mctx),
         other => {
             let pc = mctx.ss.pc;
             panic!(
@@ -1181,6 +1182,62 @@ fn emul_extract(orig_instr: u32, mctx: &mut MContext64) -> bool {
         if imms == 0 { lo }
         else { (hi << (64 - imms)) | (lo >> imms) }
     };
+    if rd != 31 { write_gpr(regs, rd, result); }
+    true
+}
+
+/// Data Processing 1-source: RBIT, REV16, REV, REV32, CLZ, CLS
+fn emul_dp1_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let regs = &mut mctx.ss;
+    let sf = (orig_instr >> 31) & 1;
+    let opcode = ((orig_instr >> 10) & 0x3F) as u32;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rd = (orig_instr & 0x1F) as usize;
+    let bits = if sf == 1 { 64u32 } else { 32 };
+    let src = read_gpr(regs, rn);
+    let src = if sf == 0 { src & 0xFFFF_FFFF } else { src };
+    let result = match opcode {
+        0 => { // RBIT — reverse bits
+            if bits == 64 { src.reverse_bits() }
+            else { (src as u32).reverse_bits() as u64 }
+        }
+        1 => { // REV16 — reverse bytes in each 16-bit half
+            if bits == 64 {
+                ((src & 0xFF00FF00FF00FF00) >> 8) | ((src & 0x00FF00FF00FF00FF) << 8)
+            } else {
+                (((src & 0xFF00FF00) >> 8) | ((src & 0x00FF00FF) << 8)) & 0xFFFFFFFF
+            }
+        }
+        2 => { // REV (32-bit) / REV32 (64-bit: reverse bytes in each 32-bit half)
+            if sf == 0 { (src as u32).swap_bytes() as u64 }
+            else {
+                let lo = (src as u32).swap_bytes() as u64;
+                let hi = ((src >> 32) as u32).swap_bytes() as u64;
+                (hi << 32) | lo
+            }
+        }
+        3 => { // REV (64-bit full byte reverse)
+            src.swap_bytes()
+        }
+        4 => { // CLZ — count leading zeros
+            if bits == 64 { src.leading_zeros() as u64 }
+            else { (src as u32).leading_zeros() as u64 }
+        }
+        5 => { // CLS — count leading sign bits
+            // CLS = number of consecutive bits following the MSB that are identical to it
+            if bits == 64 {
+                let v = src as i64;
+                if v < 0 { (v.leading_ones() - 1) as u64 }
+                else { (v.leading_zeros() - 1) as u64 }
+            } else {
+                let v = src as u32 as i32;
+                if v < 0 { (v.leading_ones() - 1) as u64 }
+                else { (v.leading_zeros() - 1) as u64 }
+            }
+        }
+        _ => return false,
+    };
+    let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
     if rd != 31 { write_gpr(regs, rd, result); }
     true
 }
@@ -2233,5 +2290,96 @@ mod tests {
 
         assert_eq!(mctx.ss.x[2], 0xBEEF, "should load from base+8");
         assert_eq!(mctx.ss.x[0], base_addr + 8, "x0 should be updated to base+8");
+    }
+
+    // ─── Data Processing 1-source (REV, RBIT, CLZ, CLS, REV16) ─────
+
+    #[test]
+    fn test_dp1_rbit_32() {
+        // RBIT w2, w0: sf=0, opcode=0, Rn=0, Rd=2
+        // 0_1_0_11010110_00000_000000_00000_00010 = 0x5AC00002
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x8000_0001;
+        let instr: u32 = 0x5AC00002;
+        assert!(emul_dp1_src(instr, &mut mctx));
+        // RBIT(0x80000001) = 0x80000001 (bit 31 ↔ bit 0 swap, symmetric)
+        assert_eq!(mctx.ss.x[2], 0x80000001, "RBIT 32-bit");
+    }
+
+    #[test]
+    fn test_dp1_rbit_64() {
+        // RBIT x2, x0: sf=1
+        // 1_1_0_11010110_00000_000000_00000_00010 = 0xDAC00002
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 1u64; // bit 0 set
+        assert!(emul_dp1_src(0xDAC00002, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 1u64 << 63, "RBIT 64-bit: bit 0 → bit 63");
+    }
+
+    #[test]
+    fn test_dp1_rev16_32() {
+        // REV16 w2, w0: sf=0, opcode=1
+        // 0_1_0_11010110_00000_000001_00000_00010 = 0x5AC00402
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x1234_5678;
+        assert!(emul_dp1_src(0x5AC00402, &mut mctx));
+        // REV16: swap bytes in each 16-bit half: 0x1234→0x3412, 0x5678→0x7856
+        assert_eq!(mctx.ss.x[2], 0x3412_7856, "REV16 32-bit");
+    }
+
+    #[test]
+    fn test_dp1_rev32() {
+        // REV w2, w0: sf=0, opcode=2
+        // 0_1_0_11010110_00000_000010_00000_00010 = 0x5AC00802
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x1234_5678;
+        assert!(emul_dp1_src(0x5AC00802, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 0x7856_3412, "REV 32-bit byte swap");
+    }
+
+    #[test]
+    fn test_dp1_rev64() {
+        // REV x2, x0: sf=1, opcode=3
+        // 1_1_0_11010110_00000_000011_00000_00010 = 0xDAC00C02
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x0102_0304_0506_0708;
+        assert!(emul_dp1_src(0xDAC00C02, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 0x0807_0605_0403_0201, "REV 64-bit byte swap");
+    }
+
+    #[test]
+    fn test_dp1_clz_32() {
+        // CLZ w2, w0: sf=0, opcode=4
+        // 0_1_0_11010110_00000_000100_00000_00010 = 0x5AC01002
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x0000_0100; // bit 8 is highest set bit → 23 leading zeros
+        assert!(emul_dp1_src(0x5AC01002, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 23, "CLZ 32-bit");
+    }
+
+    #[test]
+    fn test_dp1_cls_32_positive() {
+        // CLS w2, w0: sf=0, opcode=5
+        // 0_1_0_11010110_00000_000101_00000_00010 = 0x5AC01402
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0x0000_0001; // positive, 30 leading zeros after sign bit
+        assert!(emul_dp1_src(0x5AC01402, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 30, "CLS 32-bit positive");
+    }
+
+    #[test]
+    fn test_dp1_cls_32_negative() {
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0xFFFF_FFFE; // negative, 30 leading ones after sign bit
+        assert!(emul_dp1_src(0x5AC01402, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 30, "CLS 32-bit negative");
+    }
+
+    #[test]
+    fn test_dp1_cls_32_zero() {
+        let mut mctx = make_mctx();
+        mctx.ss.x[0] = 0; // all zeros → 31 leading sign bits
+        assert!(emul_dp1_src(0x5AC01402, &mut mctx));
+        assert_eq!(mctx.ss.x[2], 31, "CLS 32-bit zero");
     }
 }
