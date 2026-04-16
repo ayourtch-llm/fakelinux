@@ -526,6 +526,23 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
     if eventfd::is_eventfd(fd_i32) {
         return eventfd::do_write(fd_i32, buf, count);
     }
+    // DEBUG: optional per-pid raw-byte dump for write-side pipe tracing.
+    // Enable by setting FAKELINUX_DUMP_WRITE_FD=<fd> before launching. Output
+    // goes to /tmp/pipe_dump_pid<pid>_fd<fd>.bin (append). Intended for
+    // diagnosing pipe-integrity issues (e.g. libzstd data-corruption reports).
+    if let Ok(dump_fd) = std::env::var("FAKELINUX_DUMP_WRITE_FD") {
+        if let Ok(target_fd) = dump_fd.parse::<i32>() {
+            if fd_i32 == target_fd && buf != 0 && count > 0 {
+                let pid = unsafe { libc::getpid() };
+                let path = format!("/tmp/pipe_dump_pid{}_fd{}.bin", pid, fd_i32);
+                let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, count as usize) };
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = f.write_all(slice);
+                }
+            }
+        }
+    }
     // Probe fd 1 pipe inode on first write to track pipe identity
     if fd_i32 == 1 && TRACE.load(std::sync::atomic::Ordering::Relaxed) {
         static FD1_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -579,6 +596,21 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
         return eventfd::do_read(fd_i32, buf, count);
     }
     let ret = unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+    // DEBUG: optional per-pid raw-byte dump for read-side pipe tracing.
+    // Pair with FAKELINUX_DUMP_WRITE_FD to verify pipe integrity end-to-end.
+    if let Ok(dump_fd) = std::env::var("FAKELINUX_DUMP_READ_FD") {
+        if let Ok(target_fd) = dump_fd.parse::<i32>() {
+            if fd_i32 == target_fd && ret > 0 && buf != 0 {
+                let pid = unsafe { libc::getpid() };
+                let path = format!("/tmp/pipe_dump_read_pid{}_fd{}.bin", pid, fd_i32);
+                let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, ret as usize) };
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = f.write_all(slice);
+                }
+            }
+        }
+    }
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (fd_i32 <= 8) {
         let preview = if ret > 0 && buf != 0 {
             let len = (ret as usize).min(120);
@@ -1439,17 +1471,21 @@ unsafe fn collect_guest_env<'a>(envp_ptr: u64) -> Vec<&'a std::ffi::CStr> {
 }
 
 /// Build the FAKELINUX_* overrides that must propagate into every re-exec'd
-/// fakelinux supervisor. Values come from the host environment (or from the
-/// currently-computed signal state for SIGIGN/SIGMASK), so that toggles like
-/// `FAKELINUX_TRACE=1` set on the outermost invocation keep working after
-/// arbitrary fork/exec chains.
+/// fakelinux supervisor. Walks the current host environment and forwards
+/// every `FAKELINUX_*` variable, so that toggles like `FAKELINUX_TRACE=1`
+/// (and any future supervisor-internal knobs) keep working after arbitrary
+/// fork/exec chains. `build_guest_env` strips these before handing control
+/// to the guest binary, so there's no leak.
+///
+/// Note: the owned `String` keys are held in `StaticKeys`; we leak them so
+/// the `&'static str` lifetime on the returned tuple keys is valid. These
+/// leaks are bounded (once per unique FAKELINUX_* name seen per process).
 fn fakelinux_env_overrides() -> Vec<(&'static str, Option<String>)> {
     let mut v: Vec<(&'static str, Option<String>)> = Vec::new();
-    for key in &["FAKELINUX_TRACE", "FAKELINUX_ROOT", "FAKELINUX_SYSROOT",
-                 "FAKELINUX_LOG", "FAKELINUX_DEBUG"] {
-        match std::env::var(key) {
-            Ok(val) => v.push((*key, Some(val))),
-            Err(_) => v.push((*key, None)),
+    for (key, val) in std::env::vars() {
+        if key.starts_with("FAKELINUX_") {
+            let static_key: &'static str = Box::leak(key.into_boxed_str());
+            v.push((static_key, Some(val)));
         }
     }
     v
@@ -1578,11 +1614,11 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     }
 
                     // Merge guest env (DEBIAN_HAS_FRONTEND etc.) with FAKELINUX_* host overrides.
+                    // fakelinux_env_overrides() walks the host environment and picks up ALL
+                    // FAKELINUX_* vars — including FAKELINUX_SIGIGN / _SIGMASK that were just
+                    // set above, and any debug knobs like FAKELINUX_DUMP_WRITE_FD.
                     let guest_env = unsafe { collect_guest_env(envp_ptr) };
-                    let mut overrides = fakelinux_env_overrides();
-                    for key in &["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK"] {
-                        overrides.push((*key, std::env::var(key).ok()));
-                    }
+                    let overrides = fakelinux_env_overrides();
                     let merged = merge_envp(&guest_env, &overrides);
                     let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
                         .chain(std::iter::once(std::ptr::null()))
@@ -1673,12 +1709,10 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Build the final envp by merging the guest's environment (which
     // carries guest-set vars like DEBIAN_HAS_FRONTEND, LD_LIBRARY_PATH, ...)
     // with the FAKELINUX_* overrides that must reach the re-exec'd supervisor.
-    // Also pull in SIGIGN/SIGMASK host-set vars that were just written above.
+    // fakelinux_env_overrides() picks up all FAKELINUX_* host vars, including
+    // FAKELINUX_SIGIGN/_SIGMASK just set above.
     let guest_env = unsafe { collect_guest_env(envp_ptr) };
-    let mut overrides = fakelinux_env_overrides();
-    for key in &["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK"] {
-        overrides.push((*key, std::env::var(key).ok()));
-    }
+    let overrides = fakelinux_env_overrides();
     let merged = merge_envp(&guest_env, &overrides);
     let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
