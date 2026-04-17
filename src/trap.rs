@@ -649,6 +649,7 @@ fn emul_dp3_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
     let regs = &mut mctx.ss;
     {
         let sf = (orig_instr >> 31) & 1;
+        let op31 = (orig_instr >> 21) & 0x7;
         let rm = ((orig_instr >> 16) & 0x1F) as usize;
         let o0 = (orig_instr >> 15) & 1;
         let ra = ((orig_instr >> 10) & 0x1F) as usize;
@@ -656,9 +657,55 @@ fn emul_dp3_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
         let rd = (orig_instr & 0x1F) as usize;
         let a = read_gpr(regs, rn);
         let b = read_gpr(regs, rm);
-        let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
-        let product = a.wrapping_mul(b);
-        let result = if o0 == 0 { c.wrapping_add(product) } else { c.wrapping_sub(product) };
+        let result = match (sf, op31, o0) {
+            // MADD (64/32): Rd = Ra + Rn*Rm
+            (_, 0b000, 0) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                c.wrapping_add(a.wrapping_mul(b))
+            }
+            // MSUB (64/32): Rd = Ra - Rn*Rm
+            (_, 0b000, 1) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                c.wrapping_sub(a.wrapping_mul(b))
+            }
+            // SMADDL: Xd = Xa + Wn*Wm (signed 32×32→64)
+            (1, 0b001, 0) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                let prod = (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64;
+                c.wrapping_add(prod)
+            }
+            // SMSUBL: Xd = Xa - Wn*Wm (signed 32×32→64)
+            (1, 0b001, 1) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                let prod = (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64;
+                c.wrapping_sub(prod)
+            }
+            // SMULH: Xd = (Xn * Xm) >> 64 (signed high multiply)
+            (1, 0b010, 0) => {
+                ((a as i64 as i128).wrapping_mul(b as i64 as i128) >> 64) as u64
+            }
+            // UMADDL: Xd = Xa + Wn*Wm (unsigned 32×32→64)
+            (1, 0b101, 0) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                let prod = (a as u32 as u64).wrapping_mul(b as u32 as u64);
+                c.wrapping_add(prod)
+            }
+            // UMSUBL: Xd = Xa - Wn*Wm (unsigned 32×32→64)
+            (1, 0b101, 1) => {
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                let prod = (a as u32 as u64).wrapping_mul(b as u32 as u64);
+                c.wrapping_sub(prod)
+            }
+            // UMULH: Xd = (Xn * Xm) >> 64 (unsigned high multiply)
+            (1, 0b110, 0) => {
+                ((a as u128).wrapping_mul(b as u128) >> 64) as u64
+            }
+            _ => {
+                // Fallback: MADD-like (for any unrecognized subtype)
+                let c = if ra == 31 { 0 } else { read_gpr(regs, ra) };
+                c.wrapping_add(a.wrapping_mul(b))
+            }
+        };
         let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
         if rd != 31 { write_gpr(regs, rd, result); }
         return true;
@@ -1806,7 +1853,29 @@ unsafe extern "C" fn trap_handler(
 
                 // Save emulating instruction for crash diagnostics
                 unsafe { CURRENT_X18_INSTR = orig_instr; CURRENT_X18_PC = pc; }
+                // FAKELINUX_TRACE_X18_OPS: log every emulated x18 op
+                // with pre/post x18 value + all GPRs, but only after
+                // a threshold count (to capture just the failing block).
+                let trace_ops = x18_store_trace_enabled();
+                let pre_x18_for_trace = if trace_ops { get_thread_x18() } else { 0 };
+                let pre_regs_for_trace: [u64; 4] = if trace_ops {
+                    [mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3]]
+                } else { [0;4] };
+
                 if emulate_x18_instruction(orig_instr, mctx) {
+                    // Log full op trace when enabled and past threshold
+                    if trace_ops && seq >= 13500 {
+                        let post_x18 = get_thread_x18();
+                        let pid = libc::getpid();
+                        let mut buf = [0u8; 300];
+                        let n = raw_fmt(&mut buf, format_args!(
+                            "fakelinux: [{}] X18_OP#{} pc={:#x} instr={:#010x} x18={:#x}→{:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
+                            pid, seq, pc, orig_instr, pre_x18_for_trace, post_x18,
+                            pre_regs_for_trace[0], pre_regs_for_trace[1],
+                            pre_regs_for_trace[2], pre_regs_for_trace[3]
+                        ));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
                     // FORK_TRAP logging for x18
                     let tcnt = FORK_TRAP_COUNT.load(Ordering::Relaxed);
                     if tcnt > 0 {
@@ -2650,5 +2719,57 @@ mod tests {
                 "LDR round-trip failed at index {}: expected {:#x}, got {:#x}",
                 i, expected, mctx.ss.x[3]);
         }
+    }
+
+    // ─── Bug #10: UMULH computed lower 64 bits instead of upper 64 ─────
+
+    #[test]
+    fn test_umulh_x18_division_constant() {
+        // UMULH x0, x0, x18 — the exact instruction from libzstd+0x4ef60
+        // Used for integer division by constants. x18 = 0xCCCCCCCCCCCCCCCD
+        // (magic constant for unsigned division by 5).
+        // UMULH returns the UPPER 64 bits of a 128-bit unsigned multiply.
+        let mut mctx = make_mctx();
+        let magic_div5: u64 = 0xCCCC_CCCC_CCCC_CCCD;
+        set_thread_x18(magic_div5);
+
+        // Test: 254 / 5 = 50 (truncated)
+        // UMULH(254, 0xCCCC...CD) should give 0xCB
+        // Then 0xCB >> 2 = 50 (the quotient)
+        mctx.ss.x[0] = 254;
+
+        // UMULH x0, x0, x18: sf=1, op31=110, Rm=18, o0=0, Ra=31, Rn=0, Rd=0
+        // 1_00_11011_110_10010_0_11111_00000_00000 = 0x9BD27C00
+        let instr: u32 = 0x9BD2_7C00;
+        let result = emul_dp3_src(instr, &mut mctx);
+        assert!(result, "UMULH should be handled");
+
+        // UMULH(254, 0xCCCCCCCCCCCCCCCD) = upper 64 of:
+        // 254 * 0xCCCCCCCCCCCCCCCD = 0xCB_329B329B329B3292 (128-bit)
+        // Upper 64 bits = 0xCB = 203
+        let expected = ((254u128 * magic_div5 as u128) >> 64) as u64;
+        assert_eq!(mctx.ss.x[0], expected,
+            "UMULH(254, 0xCCCC...CD) should give {:#x}, got {:#x}",
+            expected, mctx.ss.x[0]);
+        assert_eq!(mctx.ss.x[0], 0xCB, "UMULH(254, div5_magic) = 0xCB");
+    }
+
+    #[test]
+    fn test_smulh_x18() {
+        // SMULH x0, x0, x18 — signed high multiply
+        let mut mctx = make_mctx();
+        set_thread_x18(0x7FFF_FFFF_FFFF_FFFF); // large positive
+        mctx.ss.x[0] = 2;
+
+        // SMULH x0, x0, x18: sf=1, op31=010, Rm=18, o0=0, Ra=31, Rn=0, Rd=0
+        // 1_00_11011_010_10010_0_11111_00000_00000 = 0x9B527C00
+        let instr: u32 = 0x9B52_7C00;
+        let result = emul_dp3_src(instr, &mut mctx);
+        assert!(result, "SMULH should be handled");
+
+        let expected = ((2i128 * 0x7FFF_FFFF_FFFF_FFFFi128) >> 64) as u64;
+        assert_eq!(mctx.ss.x[0], expected,
+            "SMULH(2, 0x7FFF...F) should give {:#x}, got {:#x}",
+            expected, mctx.ss.x[0]);
     }
 }
