@@ -383,6 +383,19 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
     // Set up per-thread sigaltstack
     setup_thread_signal_stack();
 
+    // CRITICAL: unblock all signals. This thread was created by
+    // pthread_create called from inside the SIGILL trap handler, which
+    // has sa_mask = sigfillset (blocking all signals). New threads
+    // inherit the creating thread's signal mask, so SIGILL is blocked.
+    // Without unblocking, UDF instructions (patched SVC/TPIDR/x18) on
+    // this thread would pend SIGILL without delivery, causing the
+    // thread to silently skip over them and eventually deadlock.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+
     // Jump to guest code with all saved registers restored.
     let regs_ptr = &args.saved_regs as *const SavedRegs;
     let pc = args.saved_regs.pc;
