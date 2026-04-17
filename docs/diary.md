@@ -1027,5 +1027,36 @@ Commits from this session:
 ```
 7238801  debug(trap): FAKELINUX_TRACE_X18_STORES store-destination tracer + procfs snapshot_maps
 20e11d5  debug(trap): round-trip x18 tests + mmap/brk tracing
-<pending> docs(diary): session 2 follow-up — file-based zstd test confirms internal state corruption
+db1e181  docs(diary): session 2 follow-up — file-based zstd test confirms internal state corruption
+0967e5a  fix(trap): emulate UMULH/SMULH/UMADDL/SMADDL in DataProc3Src
 ```
+
+### Session 3 — ROOT CAUSE FOUND AND FIXED
+
+**Bug**: `emul_dp3_src` treated ALL DataProc3Src instructions as MADD
+(lower-64-bit multiply-add).  UMULH and SMULH, which return the
+**upper 64 bits** of a 128-bit multiply, got the wrong result.
+
+**How found**: Per-block DCtx checksum comparison (native ARM64 Docker
+vs fakelinux) showed ALL non-pointer DCtx data was identical — meaning
+the corruption was purely in runtime computation, not stored state.
+Adding full x18-op tracing for the last ~500 operations revealed that
+the failing instruction was `UMULH x0, x0, x18` with x18 =
+0xCCCCCCCCCCCCCCCD (division-by-5 magic constant).  The broken
+UMULH returned `(a*b) mod 2^64` instead of `(a*b) >> 64`, producing
+garbage quotients for libzstd's internal division operations.
+
+**Why it took 342 blocks to manifest**: earlier blocks used x18
+exclusively as a data pointer (for Huffman table construction stores).
+Block 343 was the first to trigger the UMULH-via-x18 code path in
+libzstd's Huffman decode logic.
+
+**Fix**: dispatch on `(sf, op31, o0)` in `emul_dp3_src` to handle
+UMULH (`u128` multiply + right-shift 64), SMULH (`i128` multiply +
+right-shift 64), UMADDL/UMSUBL (32×32→64 unsigned), and
+SMADDL/SMSUBL (32×32→64 signed) correctly.
+
+**Verified**: `dpkg-deb --contents libc6_2.39-0ubuntu8.7_arm64.deb`
+now decompresses all 23,777,280 bytes correctly.  SHA256 of
+decompressed output matches native macOS `zstd -d`.  All 288 unit
+tests pass.
