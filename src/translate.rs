@@ -23,10 +23,11 @@ const LINUX_O_NOCTTY: i32 = 0o400;
 const LINUX_O_TRUNC: i32 = 0o1000;
 const LINUX_O_APPEND: i32 = 0o2000;
 const LINUX_O_NONBLOCK: i32 = 0o4000;
-const LINUX_O_DIRECTORY: i32 = 0o200000;
-const LINUX_O_NOFOLLOW: i32 = 0o400000;
+const LINUX_O_DIRECTORY: i32 = 0o40000;   // 0x4000 — asm-generic
+const LINUX_O_NOFOLLOW: i32 = 0o100000;   // 0x8000 — asm-generic
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 const LINUX_O_LARGEFILE: i32 = 0o100000; // no-op on 64-bit
+const LINUX_O_PATH: i32 = 0o10000000;    // 0x200000 — fd for path ops only
 
 pub fn translate_open_flags(linux_flags: i32) -> i32 {
     let mut mac = linux_flags & (LINUX_O_RDONLY | LINUX_O_WRONLY | LINUX_O_RDWR); // 0,1,2 same
@@ -49,7 +50,12 @@ pub fn translate_open_flags(linux_flags: i32) -> i32 {
         }
     }
 
-    // O_LARGEFILE is meaningless on 64-bit macOS; ignore it
+    // O_LARGEFILE is meaningless on 64-bit macOS; ignore it.
+    // O_PATH (Linux-only: get a handle for path operations without opening
+    // the file) has no macOS equivalent.  Drop it — macOS open() without
+    // O_PATH works for the fstatat/renameat-based operations that coreutils
+    // uses O_PATH for.  The important thing is that we correctly translated
+    // O_DIRECTORY so the open fails on non-directories.
     mac
 }
 

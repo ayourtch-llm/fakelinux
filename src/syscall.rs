@@ -770,8 +770,15 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
 
-    // Translate path through rootfs layer
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    // When AT_SYMLINK_NOFOLLOW is set, use nofollow path translation so that
+    // the final component (which might be a symlink) is NOT resolved.  Without
+    // this, lstat() can never see symlinks — resolve_in_rootfs follows them all.
+    let nofollow = mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0;
+    let (eff_path, _hold) = if nofollow {
+        effective_path_ptr_nofollow(pathname)
+    } else {
+        effective_path_ptr(pathname)
+    };
 
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
@@ -1224,7 +1231,14 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
         }
     }
 
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    // When AT_SYMLINK_NOFOLLOW is set, use nofollow path translation so that
+    // the final component (which might be a symlink) is NOT resolved.
+    let nofollow = mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0;
+    let (eff_path, _hold) = if nofollow {
+        effective_path_ptr_nofollow(pathname)
+    } else {
+        effective_path_ptr(pathname)
+    };
     unsafe {
         let mut mac_stat: libc::stat = std::mem::zeroed();
         let ret = libc::fstatat(mac_dirfd, eff_path, &mut mac_stat, mac_flags);
@@ -1275,7 +1289,9 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
     }
 
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    // readlinkat operates on the symlink itself — must NOT follow the final
+    // component, otherwise we'd readlink a resolved regular file → EINVAL.
+    let (eff_path, _hold) = effective_path_ptr_nofollow(pathname);
     let ret = unsafe {
         libc::readlinkat(mac_dirfd, eff_path, buf as *mut i8, bufsiz as usize)
     };
