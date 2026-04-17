@@ -967,8 +967,65 @@ problem.  If it works, the issue is in the tar pipe plumbing.
 the finding that x18 emulation is NOT ruled out and libzstd uses x18
 as a data pointer.
 
+### Follow-up experiments (same session)
+
+**File-based decompression**: compiled minimal zstd test programs
+(`zstd_test*.c` in `/tmp/`) via Docker cross-compilation.  Running
+`ZSTD_decompressStream` on the extracted `data.tar.zst` directly
+(mmap'd into memory, no pipes) reproduces the SAME failure at
+**exactly** output=18,874,368 bytes, input=1,046,423 bytes.
+
+**Definitively ruled out**:
+- Pipe semantics (file-based test fails identically)
+- Output buffer handling (discard-output test fails identically)
+- Output buffer size (tested 64K, 128K, 256K, 1M — all fail at same offset)
+- Address collision in mmap/brk (traced — all allocations in separate regions)
+
+**Per-iteration analysis** (iter 144 = last before error):
+```
+iter=144 in=1046423..1046423 out_this=0 total_out=18874368 ret=-20 ERROR
+```
+libzstd consumed **zero bytes** and produced **zero output** on the
+failing call.  The error is detected at the START of block 343's
+header parse, before reading any of its data.  Block 343's header
+is valid (`type=Compressed, size=19558`).
+
+**Conclusion**: libzstd's internal decoder state is corrupt after
+342 correct blocks (blocks 0-341 produce 18 MiB of byte-perfect
+output verified via SHA256 against native macOS `zstd -d`).  The
+corruption is in libzstd's state machine or table state, NOT in the
+input data, output path, or pipe plumbing.
+
+### Handoff — start here next session
+
+**Goal**: identify which x18-emulated instruction corrupts libzstd's
+internal DCtx state over 342 blocks of otherwise-correct operation.
+
+**Most productive experiment**: Build a debug libzstd.so.1.5.5 for
+aarch64 with extra assertions/logging at the block-header parse path.
+Cross-compile with `docker run --platform linux/arm64 ubuntu:noble`
+and link against it.  Specifically, log the `ZSTD_DCtx.stage` and
+the bytes read for the block header at the start of each iteration.
+
+**Alternative**: add a "ring buffer" to the trap handler that records
+the last N emulated x18 instructions (pc, instr, x18, addr, val).
+On ZSTD error (detectable by the error message on fd 2), dump the
+ring.  This captures the exact instruction sequence that led to the
+corrupt state without the overhead of logging every instruction.
+
+**Key data points**:
+- Error: `ZSTD_error_corruption_detected` (code -20)
+- Failure at: iter 144, in_pos=1,046,423, out=18,874,368
+- Block 342: 18,148 bytes compressed (unusually large)
+- Block 343 header: valid (`0x346302` = type=Compressed, size=19558)
+- 14,241 x18 stores total for the decompressor
+- 5 distinct store PCs (all in libzstd)
+- No new PCs near the failure — same code paths throughout
+
 Commits from this session:
 
 ```
-<pending>  debug(trap): FAKELINUX_TRACE_X18_STORES store-destination tracer + procfs snapshot_maps
+7238801  debug(trap): FAKELINUX_TRACE_X18_STORES store-destination tracer + procfs snapshot_maps
+20e11d5  debug(trap): round-trip x18 tests + mmap/brk tracing
+<pending> docs(diary): session 2 follow-up — file-based zstd test confirms internal state corruption
 ```
