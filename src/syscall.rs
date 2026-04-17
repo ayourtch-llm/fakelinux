@@ -509,6 +509,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_RENAMEAT2 => do_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
         SYS_MEMFD_CREATE => do_memfd_create(args[0], args[1] as u32),
         SYS_COPY_FILE_RANGE => do_copy_file_range(args[0] as i32, args[1], args[2] as i32, args[3], args[4], args[5] as u32),
+        // Keyring syscalls — stub to -ENOSYS silently (used by apt/gpg, not critical)
+        216 | 217 | 219 => (-38_i64) as u64,
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
