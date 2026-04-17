@@ -2573,4 +2573,82 @@ mod tests {
         assert_eq!(buf[0], 0x1122_3344_5566_7788);
         assert_eq!(buf[1], 0xAABB_CCDD_EEFF_0011);
     }
+
+    // ─── libzstd Huffman table round-trip (STR/LDR via x18 reg offset) ──
+
+    #[test]
+    fn test_str_ldr_x18_reg_offset_roundtrip() {
+        // Reproduces the exact pattern from libzstd+0x86d90:
+        //   STR x1, [x18, x2, LSL #3]    ; 0xF8227A41
+        //   LDR x3, [x18, x2, LSL #3]    ; 0xF8627A43
+        // x18 = table base (heap ptr), x2 = index, x1 = value
+        let mut mctx = make_mctx();
+        let mut table: [u64; 16] = [0xDEAD; 16];
+        let table_base = table.as_mut_ptr() as u64;
+
+        // Store 0xba09ba09ba09ba09 at table[5] via x18
+        set_thread_x18(table_base);
+        mctx.ss.x[1] = 0xba09_ba09_ba09_ba09;
+        mctx.ss.x[2] = 5;
+
+        // STR x1, [x18, x2, LSL #3]: size=11 V=0 opc=00 Rm=2 opt=011 S=1 Rn=18 Rt=1
+        let str_instr: u32 = 0xF822_7A41;
+        let result = emul_ldr_str_reg_offset(str_instr, &mut mctx);
+        assert!(result, "STR x1, [x18, x2, LSL #3] should succeed");
+        assert_eq!(table[5], 0xba09_ba09_ba09_ba09, "table[5] should be written");
+
+        // Load it back via LDR x3, [x18, x2, LSL #3]
+        mctx.ss.x[3] = 0xCAFE; // sentinel
+        // LDR x3, [x18, x2, LSL #3]: size=11 V=0 opc=01 Rm=2 opt=011 S=1 Rn=18 Rt=3
+        let ldr_instr: u32 = 0xF862_7A43;
+        let result = emul_ldr_str_reg_offset(ldr_instr, &mut mctx);
+        assert!(result, "LDR x3, [x18, x2, LSL #3] should succeed");
+        assert_eq!(mctx.ss.x[3], 0xba09_ba09_ba09_ba09,
+            "round-trip through x18 reg-offset should preserve value, got {:#x}", mctx.ss.x[3]);
+    }
+
+    #[test]
+    fn test_str_ldr_x18_reg_offset_multiple_indices() {
+        // Simulate a full Huffman table build loop: write entries at indices 0..8,
+        // then read them all back and verify.
+        let mut mctx = make_mctx();
+        let mut table: [u64; 16] = [0; 16];
+        let table_base = table.as_mut_ptr() as u64;
+        set_thread_x18(table_base);
+
+        let test_values: [u64; 8] = [
+            0x0d09_0d09_0d09_0d09,
+            0x0e09_0e09_0e09_0e09,
+            0x1509_1509_1509_1509,
+            0x1609_1609_1609_1609,
+            0x1909_1909_1909_1909,
+            0x1a09_1a09_1a09_1a09,
+            0x1e09_1e09_1e09_1e09,
+            0x2309_2309_2309_2309,
+        ];
+
+        // STR x1, [x18, x2, LSL #3] for each index
+        let str_instr: u32 = 0xF822_7A41;
+        for (i, &val) in test_values.iter().enumerate() {
+            mctx.ss.x[1] = val;
+            mctx.ss.x[2] = i as u64;
+            assert!(emul_ldr_str_reg_offset(str_instr, &mut mctx));
+        }
+
+        // Verify memory directly
+        for (i, &expected) in test_values.iter().enumerate() {
+            assert_eq!(table[i], expected, "table[{}] mismatch", i);
+        }
+
+        // Read back via LDR x3, [x18, x2, LSL #3]
+        let ldr_instr: u32 = 0xF862_7A43;
+        for (i, &expected) in test_values.iter().enumerate() {
+            mctx.ss.x[2] = i as u64;
+            mctx.ss.x[3] = 0xDEAD;
+            assert!(emul_ldr_str_reg_offset(ldr_instr, &mut mctx));
+            assert_eq!(mctx.ss.x[3], expected,
+                "LDR round-trip failed at index {}: expected {:#x}, got {:#x}",
+                i, expected, mctx.ss.x[3]);
+        }
+    }
 }

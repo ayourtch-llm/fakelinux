@@ -1762,6 +1762,13 @@ fn do_brk(addr: u64) -> u64 {
         if ret == libc::MAP_FAILED {
             return current;
         }
+        // Trace brk growth when FAKELINUX_TRACE_MMAP is set.
+        if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
+            let pid = unsafe { libc::getpid() };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] BRK {:#x} → {:#x} (mmap {:#x}..{:#x}, {} bytes)\n",
+                pid, current, addr, old_end, new_end, new_end - old_end));
+        }
     }
     BRK_CURRENT.store(addr, Ordering::SeqCst);
     addr
@@ -1865,6 +1872,14 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     let ret = unsafe { libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64) };
     if ret == libc::MAP_FAILED {
         return translate::linux_errno();
+    }
+    // Trace anonymous mmap allocations when FAKELINUX_TRACE_MMAP is set.
+    if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
+        let pid = unsafe { libc::getpid() };
+        let result_addr = ret as u64;
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] MMAP anon addr={:#x} len={:#x} prot={} flags={:#x} → {:#x}..{:#x}\n",
+            pid, addr, length, prot, flags, result_addr, result_addr + length));
     }
     ret as u64
 }
