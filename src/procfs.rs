@@ -445,6 +445,12 @@ fn visible_ppid() -> i32 {
 
 // ─── /proc file generators ──────────────────────────────────────────────────
 
+/// Public wrapper for [`generate_maps`] so other modules (e.g. trap.rs's
+/// FAKELINUX_TRACE_X18_STORES tracer) can snapshot the current memory map.
+pub fn snapshot_maps() -> Vec<u8> {
+    generate_maps()
+}
+
 fn generate_maps() -> Vec<u8> {
     with(|pfs| {
         let mut out = String::new();

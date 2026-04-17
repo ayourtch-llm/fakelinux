@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use crate::syscall;
 
@@ -666,7 +666,69 @@ fn emul_dp3_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
     false
 }
 
+// ─── X18-relative store tracer (FAKELINUX_TRACE_X18_STORES) ──────────────────
+//
+// Diagnostic helper for the libc6 zstd "Data corruption detected" blocker
+// (see project_libc6_zstd_corruption.md). Every emulated x18-aware STR/STP
+// path reports its destination so we can cross-reference stores against the
+// decompressor's heap layout — a stray store landing inside libzstd's DCtx
+// would explain why decompression sees corrupt state with intact input bytes.
+//
+// Cached so the env-var lookup is O(1) per store after the first call.
+// -1 = uninitialised, 0 = disabled, 1 = enabled.
+
+static X18_STORE_TRACE: AtomicI8 = AtomicI8::new(-1);
+/// pid for which we've already snapshotted /proc/self/maps. 0 = none yet.
+static X18_STORE_MAPS_DUMPED_PID: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn x18_store_trace_enabled() -> bool {
+    let cached = X18_STORE_TRACE.load(Ordering::Relaxed);
+    if cached >= 0 { return cached == 1; }
+    let v: i8 = if std::env::var_os("FAKELINUX_TRACE_X18_STORES").is_some() { 1 } else { 0 };
+    X18_STORE_TRACE.store(v, Ordering::Relaxed);
+    v == 1
+}
+
+/// On the first store seen in each process, snapshot /proc/self/maps to
+/// /tmp/x18_maps_pid<pid>.txt so the X18_STORE addr= lines can be looked up
+/// against the decompressor's libraries / heap regions.
+fn maybe_dump_maps_for_tracer() {
+    let pid = unsafe { libc::getpid() } as u64;
+    let last = X18_STORE_MAPS_DUMPED_PID.load(Ordering::Relaxed);
+    if last == pid { return; }
+    X18_STORE_MAPS_DUMPED_PID.store(pid, Ordering::Relaxed);
+    let maps = crate::procfs::snapshot_maps();
+    let path = format!("/tmp/x18_maps_pid{}.txt\0", pid);
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr() as *const i8,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        if fd >= 0 {
+            libc::write(fd, maps.as_ptr() as *const _, maps.len());
+            libc::close(fd);
+        }
+    }
+}
+
+#[inline]
+fn trace_x18_store(pc: u64, base_reg: usize, addr: u64, val: u128, size_bytes: u32) {
+    if !x18_store_trace_enabled() { return; }
+    maybe_dump_maps_for_tracer();
+    let pid = unsafe { libc::getpid() };
+    let x18_val = get_thread_x18();
+    let mut buf = [0u8; 256];
+    let n = raw_fmt(&mut buf, format_args!(
+        "fakelinux: [{}] X18_STORE pc={:#x} base=x{} addr={:#x} val={:#x} size={} x18={:#x}\n",
+        pid, pc, base_reg, addr, val, size_bytes, x18_val
+    ));
+    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+}
+
 fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let pc = mctx.ss.pc;
     let size = (orig_instr >> 30) & 0x3;
     let v_bit = (orig_instr >> 26) & 1;
     let opc = (orig_instr >> 22) & 0x3; // full 2-bit opc: 0=STR, 1=LDR, 2=signed64, 3=signed32/PRFM
@@ -703,6 +765,7 @@ fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
             ns.v[rt] = val;
         } else {
             let val = ns.v[rt];
+            trace_x18_store(pc, rn, addr, val, 1u32 << scale);
             match scale {
                 0 => unsafe { *(addr as *mut u8) = val as u8 },
                 1 => unsafe { *(addr as *mut u16) = val as u16 },
@@ -719,6 +782,7 @@ fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
             0 => {
                 // STR
                 let val = read_gpr(regs, rt);
+                trace_x18_store(pc, rn, addr, val as u128, 1u32 << size);
                 unsafe { store_mem(addr, size, val); }
             }
             1 => {
@@ -754,6 +818,7 @@ fn emul_ldr_str_unsigned_imm(orig_instr: u32, mctx: &mut MContext64) -> bool {
 }
 
 fn emul_ldr_str_unscaled(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let pc = mctx.ss.pc;
     let regs = &mut mctx.ss;
     let size = (orig_instr >> 30) & 0x3;
     let opc = (orig_instr >> 22) & 0x3;
@@ -765,7 +830,11 @@ fn emul_ldr_str_unscaled(orig_instr: u32, mctx: &mut MContext64) -> bool {
     // PRFUM: size=3, opc=2 — prefetch unscaled, no-op
     if size == 3 && opc == 2 { return true; }
     match opc {
-        0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+        0 => {
+            let val = read_gpr(regs, rt);
+            trace_x18_store(pc, rn, addr, val as u128, 1u32 << size);
+            unsafe { store_mem(addr, size, val); }
+        }
         1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
         2 => {
             let raw = unsafe { load_mem(addr, size) };
@@ -792,6 +861,7 @@ fn emul_ldr_str_unscaled(orig_instr: u32, mctx: &mut MContext64) -> bool {
 }
 
 fn emul_ldr_str_prepost(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let pc = mctx.ss.pc;
     let regs = &mut mctx.ss;
     let size = (orig_instr >> 30) & 0x3;
     let opc = (orig_instr >> 22) & 0x3;
@@ -802,7 +872,11 @@ fn emul_ldr_str_prepost(orig_instr: u32, mctx: &mut MContext64) -> bool {
     let base = read_gpr_sp(regs, rn);
     let addr = if wb == 0b11 { base.wrapping_add(imm9) } else { base }; // pre vs post
     match opc {
-        0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+        0 => {
+            let val = read_gpr(regs, rt);
+            trace_x18_store(pc, rn, addr, val as u128, 1u32 << size);
+            unsafe { store_mem(addr, size, val); }
+        }
         1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
         2 => {
             let raw = unsafe { load_mem(addr, size) };
@@ -833,6 +907,7 @@ fn emul_ldr_str_prepost(orig_instr: u32, mctx: &mut MContext64) -> bool {
 
 fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
     {
+        let pc = mctx.ss.pc;
         let size = (orig_instr >> 30) & 0x3;
         let v_bit = (orig_instr >> 26) & 1;
         let opc = (orig_instr >> 22) & 0x3;
@@ -866,6 +941,7 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
                 ns.v[rt] = val;
             } else {
                 let val = ns.v[rt];
+                trace_x18_store(pc, rn, addr, val, 1u32 << scale);
                 match scale {
                     0 => unsafe { *(addr as *mut u8) = val as u8 },
                     1 => unsafe { *(addr as *mut u16) = val as u16 },
@@ -878,7 +954,11 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
         } else {
             let regs = &mut mctx.ss;
             match opc {
-                0 => { let val = read_gpr(regs, rt); unsafe { store_mem(addr, size, val); } }
+                0 => {
+                    let val = read_gpr(regs, rt);
+                    trace_x18_store(pc, rn, addr, val as u128, 1u32 << size);
+                    unsafe { store_mem(addr, size, val); }
+                }
                 1 => { let val = unsafe { load_mem(addr, size) }; if rt != 31 { write_gpr(regs, rt, val); } }
                 2 => {
                     let raw = unsafe { load_mem(addr, size) };
@@ -908,6 +988,7 @@ fn emul_ldr_str_reg_offset(orig_instr: u32, mctx: &mut MContext64) -> bool {
 }
 
 fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let pc = mctx.ss.pc;
     let opc = (orig_instr >> 30) & 0x3;
     let v_flag = (orig_instr >> 26) & 1;     // 0 = GPR, 1 = SIMD&FP
     let wb_type = (orig_instr >> 23) & 0x3;  // 01=post, 10=offset, 11=pre, 00=no-alloc
@@ -951,6 +1032,8 @@ fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
         } else {
             let v1 = read_gpr(regs, rt);
             let v2 = read_gpr(regs, rt2);
+            trace_x18_store(pc, rn, addr, v1 as u128, elem_size as u32);
+            trace_x18_store(pc, rn, addr.wrapping_add(elem_size), v2 as u128, elem_size as u32);
             unsafe { store_mem(addr, scale as u32, v1); }
             unsafe { store_mem(addr.wrapping_add(elem_size), scale as u32, v2); }
         }
@@ -966,6 +1049,8 @@ fn emul_ldp_stp(orig_instr: u32, mctx: &mut MContext64) -> bool {
         } else {
             let v1 = ns.v[rt];
             let v2 = ns.v[rt2];
+            trace_x18_store(pc, rn, addr, v1, elem_size as u32);
+            trace_x18_store(pc, rn, addr.wrapping_add(elem_size), v2, elem_size as u32);
             unsafe { store_simd(addr, elem_size, v1); }
             unsafe { store_simd(addr.wrapping_add(elem_size), elem_size, v2); }
         }

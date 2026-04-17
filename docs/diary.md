@@ -851,3 +851,124 @@ DCtx (you can dump the heap layout from `/proc/self/maps` in the guest).
 Reproducer, dump-file layout, and what's already been ruled out are
 there — read them before instrumenting, so you don't repeat the same
 experiments.
+
+---
+
+## 2026-04-17 (session 2) — x18 store tracer experiment
+
+### What was done
+
+Added `FAKELINUX_TRACE_X18_STORES=1` env knob to `src/trap.rs`.
+When enabled, every emulated x18-relative store logs `(pid, pc,
+base_reg, addr, val, size, x18_value)` to stderr.  Also snapshots
+`/proc/self/maps` once per process to `/tmp/x18_maps_pid<pid>.txt`.
+Covers all 5 store paths: `emul_ldr_str_unsigned_imm`,
+`_unscaled`, `_prepost`, `_reg_offset`, and `emul_ldp_stp`.
+
+Reproduced the dpkg-deb libc6 "Data corruption detected" failure
+with the tracer on.  14086 stores logged for the decompressor
+process (pid 97519), across 5 distinct instruction PCs.
+
+### Key finding: the 2147-x18 segment is **libzstd** (not libc)
+
+The runtime patch block with 2147 x18 patches (size 0xb0090) is
+**libzstd.so.1.5.5** — confirmed by matching the instruction at
+offset 0x86d90 against the libzstd binary on disk.
+
+libzstd uses x18 as a **general-purpose data register** for
+Huffman/FSE decode table construction (NOT for TLS as previously
+assumed).  The hot instruction is:
+
+    STR x1, [x18, x2, LSL #3]   ; libzstd+0x86d90
+
+This is a tight loop that stores computed 8-byte entries (replicated
+16-bit {nbBits, symbol} values like 0xba09ba09ba09ba09) into
+heap-allocated decode tables, using x18 as the table base pointer
+and x2 as the index.
+
+12313 of 14086 total stores hit this single PC.  190 unique
+destination addresses spanning ~1.5 KB of heap (0x5000cf3bc–
+0x5000cf9a4), with 18 unique x18 base values — consistent with
+~65 block iterations, each rebuilding a 256-entry table.
+
+The values are 100% deterministic across runs (identical addresses,
+values, and ordering), so the emulation is at least consistent.
+
+### FAKELINUX_NO_X18=1 is NOT a valid control
+
+The previous session noted "FAKELINUX_NO_X18=1 still reproduces the
+same symptom", concluding x18 emulation was ruled out.
+
+**This conclusion is incorrect.**  When NO_X18=1, libzstd's x18-
+relative stores/loads execute natively using macOS's x18 (the
+reserved TLS pointer), NOT the guest's heap-allocated table pointer.
+This causes SIGSEGV at pc=0x0 (null function pointer from corrupted
+TLS data) — a **completely different failure** from the zstd "Data
+corruption detected" error.
+
+### What the stores look like
+
+All base=x18 stores land in the heap (0x5000c*):
+- 12313 stores at 190 unique heap addresses (Huffman table writes)
+- 1773 stores at stack addresses (register spills + SIMD copies)
+
+The store emulation path (`emul_ldr_str_reg_offset` with
+STR reg offset) reads x18 from thread storage (`get_thread_x18()`),
+computes addr = x18 + extend_reg(x2, LSL, 3), reads x1 from
+mcontext, stores via `store_mem`.  Code review shows no bug.
+
+### Other PCs
+
+| PC offset | Count | Instruction | Notes |
+|-----------|-------|-------------|-------|
+| libzstd+0x86d90 | 12313 | STR x1, [x18, x2, LSL #3] | Huffman table writes |
+| libzstd+0x4ee60 | 400 | STP q0, q1, [x18] | SIMD pair to stack |
+| libzstd+0x5626c | 686 | STP x22, x18, [sp, #...] | Register spill |
+| libzstd+0x562e8 | 686 | STP x0, x18, [sp, #...] | Register spill |
+| ld-linux+0x8cfc | 1 | STR ..., [sp] | ld-linux init |
+
+### What's still open
+
+1. **Emulation correctness** — the stores LOOK correct but we
+   haven't verified the VALUES against native libzstd output.
+   A unit test exercising `STR x1, [x18, x2, LSL #3]` emulation
+   with known inputs would help.
+
+2. **Load-side correctness** — we only traced stores.  If
+   `LDR xN, [x18, xM, LSL #3]` returns wrong data, the
+   decompressor would see "corruption" in its own table.
+
+3. **Missed patches** — there are ~2975 instructions in libzstd's
+   .text with 18 in register fields (naive count), of which 2147
+   were patched.  The ~800 delta is likely instructions where "18"
+   is in an immediate or non-GPR field (correctly ignored by the
+   decoder), but this needs verification.
+
+4. **Non-x18 hypotheses remain viable**: fork semantics around
+   libzstd state, short-read interleaving at block boundaries, or
+   a mmap/brk overlap.
+
+### Handoff — start here next session
+
+**Goal**: same as before — unblock dpkg-deb libc6 inside fakelinux.
+
+**Most productive next experiment**: add a LOAD tracer (symmetric to
+the store tracer) for x18-relative loads in the decompressor.  If a
+load returns the wrong value from a correctly-written table, we've
+found the bug.  Check `emul_ldr_str_reg_offset` LDR path for any
+size/sign-extension issues.
+
+**Quick win to try**: run `dpkg-deb --fsys-tarfile libc6...deb >
+/tmp/out.tar` inside the guest (different dpkg-deb code path, same
+libzstd).  If it fails at the same offset, libzstd is definitely the
+problem.  If it works, the issue is in the tar pipe plumbing.
+
+**State for memory**: updated `project_libc6_zstd_corruption.md` with
+the finding that x18 emulation is NOT ruled out and libzstd uses x18
+as a data pointer.
+
+Commits from this session:
+
+```
+<pending>  debug(trap): FAKELINUX_TRACE_X18_STORES store-destination tracer + procfs snapshot_maps
+```
