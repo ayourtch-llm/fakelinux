@@ -737,17 +737,34 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
     let last = last.min(first.saturating_add(65536));
 
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        // CLOSE_RANGE_CLOEXEC: only close fds that have FD_CLOEXEC set.
-        // glibc's __libc_fork uses this in the child to clean up CLOEXEC fds
-        // without closing pipes/fds the child needs for exec.
+        // CLOSE_RANGE_CLOEXEC: close fds that have FD_CLOEXEC set.
+        //
+        // Complication: before macOS fork(), we strip FD_CLOEXEC from all fds
+        // (to prevent atfork handlers from closing them). We only restore it in
+        // the parent. In the child, fds that SHOULD have CLOEXEC don't have it
+        // yet — the child needs to do dup2 first (to set up stdin/stdout from
+        // pipe fds). We can't close those pipe fds before dup2.
+        //
+        // Strategy: for fds that currently lack CLOEXEC but HAD it before fork
+        // (per FORK_SAVED_CLOEXEC), SET the CLOEXEC flag NOW instead of closing.
+        // The actual close happens later at exec time (macOS execve closes
+        // CLOEXEC fds natively). This lets the child dup2 from them first.
         for fd in first..=last {
-            let fd = fd as i32;
-            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            if fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0 {
-                eventfd::on_close(fd);
-                epoll::on_close(fd);
-                procfs::on_close(fd);
-                unsafe { libc::close(fd); }
+            let fd_i = fd as i32;
+            let fd_flags = unsafe { libc::fcntl(fd_i, libc::F_GETFD) };
+            let has_cloexec = fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0;
+            if has_cloexec {
+                // Already has CLOEXEC — close it now (native behavior)
+                eventfd::on_close(fd_i);
+                epoll::on_close(fd_i);
+                procfs::on_close(fd_i);
+                unsafe { libc::close(fd_i); }
+            } else if thread::FORK_SAVED_CLOEXEC.take(fd as usize) {
+                // Had CLOEXEC before fork — restore the flag so exec closes it.
+                // Don't close now: the child may need this fd for dup2.
+                if fd_flags >= 0 {
+                    unsafe { libc::fcntl(fd_i, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC); }
+                }
             }
         }
     } else {

@@ -8,6 +8,41 @@ use std::sync::{Condvar, Mutex, Arc};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
+// ─── Saved CLOEXEC mask for fork children ──────────────────────────────────
+//
+// When we strip FD_CLOEXEC before macOS fork (to prevent atfork handlers from
+// closing fds), the child loses the CLOEXEC information.  We can't restore
+// it in the child immediately (guest code needs to dup2 first), so we stash
+// the mask here and let do_close_range(CLOSE_RANGE_CLOEXEC) consult it.
+
+pub struct SavedCloexecMask {
+    bits: std::sync::Mutex<[bool; 256]>,
+}
+
+impl SavedCloexecMask {
+    const fn new() -> Self {
+        Self { bits: std::sync::Mutex::new([false; 256]) }
+    }
+    pub fn store_mask(&self, mask: &[bool; 256]) {
+        *self.bits.lock().unwrap() = *mask;
+    }
+    /// Check if fd had CLOEXEC before the fork and consume it (one-shot).
+    pub fn take(&self, fd: usize) -> bool {
+        let mut m = self.bits.lock().unwrap();
+        if fd < 256 && m[fd] { m[fd] = false; true } else { false }
+    }
+    /// Check if fd had CLOEXEC (non-consuming peek).
+    pub fn had_cloexec(&self, fd: usize) -> bool {
+        let m = self.bits.lock().unwrap();
+        fd < 256 && m[fd]
+    }
+    pub fn clear(&self) {
+        *self.bits.lock().unwrap() = [false; 256];
+    }
+}
+
+pub static FORK_SAVED_CLOEXEC: SavedCloexecMask = SavedCloexecMask::new();
+
 // ─── Per-thread TID via pthread key ─────────────────────────────────────────
 
 static TID_KEY: AtomicU64 = AtomicU64::new(0);
@@ -559,17 +594,29 @@ extern "C" fn fork_trampoline_entry() -> ! {
         unsafe { libc::_exit(127); }
     }
 
-    // Restore FD_CLOEXEC in both parent AND child.
-    // The child needs CLOEXEC restored so that close_range(CLOSE_RANGE_CLOEXEC)
-    // (called by glibc between fork and exec) correctly closes inherited pipe
-    // fds that the method shouldn't keep open. Without this, fds leak through
-    // exec, causing self-pipe deadlocks (e.g., apt's store method holding both
-    // ends of its data pipes).
-    for fd in 0..256i32 {
-        let old = saved_cloexec[fd as usize];
-        if old > 0 && old & libc::FD_CLOEXEC != 0 {
-            unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
+    // Restore FD_CLOEXEC in the PARENT only.
+    // We must NOT restore in the child here because the guest's glibc calls
+    // close_range(CLOSE_RANGE_CLOEXEC) BEFORE doing dup2 to set up the child's
+    // stdin/stdout. If we restore CLOEXEC now, close_range would close the pipe
+    // fds the child needs for dup2, causing exec with wrong stdin/stdout.
+    //
+    // For the child, CLOEXEC-based cleanup is handled in do_close_range() which
+    // consults FORK_SAVED_CLOEXEC to know which fds originally had CLOEXEC.
+    if pid != 0 {
+        for fd in 0..256i32 {
+            let old = saved_cloexec[fd as usize];
+            if old > 0 && old & libc::FD_CLOEXEC != 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
+            }
         }
+    } else {
+        // Child: save the CLOEXEC set for do_close_range() to use later
+        let mut mask = [false; 256];
+        for fd in 0..256usize {
+            let old = saved_cloexec[fd];
+            mask[fd] = old > 0 && old & libc::FD_CLOEXEC != 0;
+        }
+        FORK_SAVED_CLOEXEC.store_mask(&mask);
     }
 
     if pid == 0 {
