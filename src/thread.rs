@@ -336,10 +336,13 @@ fn setup_thread_signal_stack() {
         // Install SIGILL handler on this thread (macOS requires per-thread setup
         // for sigaltstack, but sigaction is process-wide, so this is technically
         // redundant — but ensures the handler is installed).
+        // CRITICAL: use sigfillset to block all signals during the handler,
+        // matching install_trap_handler(). Using sigemptyset here would override
+        // the process-wide handler to not block signals during traps.
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = crate::trap::trap_handler_ptr();
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigfillset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
 
         // Also install crash handlers
@@ -748,7 +751,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
             do_set_tid_address(child_tid_ptr);
         }
 
-        // Enable SVC tracing for first 10 SVCs in the fork child
+        // Enable SVC tracing for first SVCs in the fork child
         crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
         crate::trap::FORK_TRAP_COUNT.store(50, std::sync::atomic::Ordering::Relaxed);
         // Store canary address/value for verification during FORK_TRAP logging
@@ -1029,7 +1032,31 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
             0
         }
         None => {
-            let _guard = waiter.condvar.wait(guard).unwrap();
+            // Diagnostic: use a 3-second timeout to detect deadlocks.
+            // A single-threaded forked child with an infinite futex_wait
+            // will NEVER be woken — detect and log this.
+            let result = waiter.condvar.wait_timeout(guard, Duration::from_secs(3)).unwrap();
+            if result.1.timed_out() && !*result.0 {
+                let pid = unsafe { libc::getpid() };
+                let cur_val = current.load(Ordering::SeqCst);
+                let guest_pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
+                let mut buf = [0u8; 250];
+                let n = {
+                    use std::io::Write;
+                    let mut c = std::io::Cursor::new(&mut buf[..]);
+                    let _ = c.write_fmt(format_args!(
+                        "fakelinux: [{}] FUTEX_DEADLOCK uaddr={:#x} val={} cur={} pc={:#x} — aborting wait\n",
+                        pid, uaddr, val, cur_val, guest_pc
+                    ));
+                    c.position() as usize
+                };
+                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                // Remove ourselves from waiter list
+                if let Ok(mut waiters) = entry.waiters.lock() {
+                    waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                }
+                return (-11_i64) as u64; // -EAGAIN to break out
+            }
             0
         }
     }

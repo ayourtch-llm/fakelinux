@@ -52,6 +52,9 @@ pub static LIBAPT_B_REPORTED: AtomicBool = AtomicBool::new(false);
 static mut CURRENT_X18_INSTR: u32 = 0;
 static mut CURRENT_X18_PC: u64 = 0;
 
+/// Last guest PC that issued a SVC — used by futex deadlock diagnostics.
+pub static LAST_SVC_PC: AtomicU64 = AtomicU64::new(0);
+
 /// Format into a stack buffer using raw write — no Mutex, safe after fork.
 fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
     use std::io::Write;
@@ -1976,6 +1979,9 @@ unsafe extern "C" fn trap_handler(
         let args = [
             mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[4], mctx.ss.x[5],
         ];
+
+        // Store guest PC for futex deadlock diagnostics
+        LAST_SVC_PC.store(pc, Ordering::Relaxed);
 
         let result = syscall::emulate(nr, &args, mctx);
 
