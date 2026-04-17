@@ -1060,3 +1060,184 @@ SMADDL/SMSUBL (32×32→64 signed) correctly.
 now decompresses all 23,777,280 bytes correctly.  SHA256 of
 decompressed output matches native macOS `zstd -d`.  All 288 unit
 tests pass.
+
+---
+
+## 2026-04-17 (session 3, continued) — Seven fixes, two architectures
+
+This was a long session that went well beyond the UMULH fix into
+end-to-end apt testing, .eh_frame code classification, symlink
+handling, pty translation, and a deep dive into fork CLOEXEC
+semantics.  Seven commits landed.
+
+### Fix 1: UMULH/SMULH/UMADDL emulation (0967e5a)
+
+**Root cause of the libc6 zstd "Data corruption detected" at 18 MiB.**
+
+`emul_dp3_src` treated ALL DataProc3Src instructions as MADD
+(lower 64 bits of multiply).  UMULH needs the **upper** 64 bits of a
+128-bit unsigned multiply; SMULH needs signed upper-64.  UMADDL and
+SMADDL are 32×32→64 widening multiplies.
+
+Discovery chain:
+- Per-block DCtx checksums (native Docker ARM64 vs fakelinux) showed
+  ALL non-pointer data identical after 143 iterations.  The error was
+  in runtime computation, not stored state.
+- Full x18-op tracing for the last 500 operations pinpointed the
+  instruction: `UMULH x0, x0, x18` with x18 = 0xCCCCCCCCCCCCCCCD
+  (magic constant for unsigned division by 5).
+- libzstd uses x18 as a general-purpose register for Huffman/FSE
+  table construction (data pointer, not TLS).  The first 342 blocks
+  only used x18 for table stores; block 343 was the first to use
+  UMULH through x18 in the decode path.
+
+### Fix 2: Keyring syscall stubs (0b2797c)
+
+Silenced warnings for `add_key` (216), `request_key` (217),
+`keyctl` (219).  Return -ENOSYS without printing "unimplemented".
+
+### Fix 3: .eh_frame FDE parser (6fb2a8f)
+
+Replaced the coarse section-header code classification (entire .text
+= code) and the fragile SHA-256 K-table fingerprint with function-
+level precision from .eh_frame Frame Description Entries.
+
+Every modern aarch64 ELF has .eh_frame with (start, length) per
+function.  Gaps between FDEs in .text are literal pools / alignment
+padding, not code.  Measured coverage:
+
+| Library    | FDEs   | Coverage | Data excluded |
+|------------|--------|----------|---------------|
+| libzstd    |    535 | 99.7%    | 1.6 KB        |
+| libc       |  3,487 | 97.8%    | 25 KB         |
+| libcrypto  | 10,518 | 89.0%    | 263 KB        |
+| libgcrypt  |  1,136 | 86.4%    | 81 KB         |
+
+SHA-256 K table at libcrypto+0x25a9c0 falls in an FDE gap
+automatically — no fingerprint needed.  The parser handles CIE
+augmentation strings, sdata4+pcrel encoding, and personality pointer
+skipping.
+
+### Fix 4: O_DIRECTORY / O_NOFOLLOW / lstat / readlinkat (d029884)
+
+Three bugs found during ca-certificates postinst investigation:
+
+1. **O_DIRECTORY and O_NOFOLLOW had wrong values** in translate.rs:
+   0o200000 instead of 0o40000, and 0o400000 instead of 0o100000.
+   On macOS, the untranslated Linux O_PATH bit (0x200000) matched
+   O_SYMLINK, making `ln -sf` think symlinks were directories.
+
+2. **do_newfstatat / do_statx ignored AT_SYMLINK_NOFOLLOW** during
+   path translation: `effective_path_ptr` resolves all symlinks, so
+   `lstat` could never see symlinks.  Fixed to use
+   `effective_path_ptr_nofollow` when the flag is set.
+
+3. **do_readlinkat resolved the symlink before reading it** — same
+   issue, readlinkat on a resolved regular file always returned
+   EINVAL.
+
+Root cause of `update-ca-certificates` failure: it calls `ln -sf` to
+create 140+ `/etc/ssl/certs/*.pem` symlinks.
+
+### Fix 5: /dev/pts/N → /dev/ttysN pty slave translation (651aeba)
+
+apt opens `/dev/ptmx` (pty master) then constructs the slave path as
+`/dev/pts/N` (Linux convention).  macOS uses `/dev/ttysNNN`.  The
+open fails, apt falls back to pipes, and TIOCSWINSZ/tcsetattr on
+pipes return ENOTTY, printing errors and corrupting the terminal.
+
+Fix: intercept `/dev/pts/N` in `do_openat` and translate to
+`/dev/ttysNNN`.
+
+### Fix 6: FD_CLOEXEC restore in fork child (084035b)
+
+Root cause of Debian sid `apt-get update` hanging at 93%: the
+`store` method held both read and write ends of its data pipes,
+causing `pselect` to never see EOF — a self-pipe deadlock.
+
+The fork trampoline strips FD_CLOEXEC from all fds before macOS
+`fork()` (to prevent atfork handlers from closing them in the child).
+After fork, CLOEXEC was restored in the **parent** but not the
+**child**.  The child's `close_range(CLOSE_RANGE_CLOEXEC)` was a
+no-op — no fds had CLOEXEC — so all pipe fds leaked through exec.
+
+Discovery chain:
+- Traced `pselect6` calls: `store` watching fds 5,6,7 with 500ms
+  timeout, always returning 0 (timeout).
+- Process tree: `store` blocked in pselect, `apt-get` blocked in
+  wait4 — circular deadlock.
+- Native strace showed apt calls `pipe2(fds, 0)` then
+  `fcntl(F_SETFD, FD_CLOEXEC)` separately.
+- `close_range` probe showed `cloexec_fds=[]` in ALL children —
+  CLOEXEC flags never inherited.
+- Fork trampoline line 461-473: strips CLOEXEC from all fds,
+  saves mask, restores only in parent.
+
+### Fix 7: Deferred CLOEXEC restore to close_range (3d88fdb)
+
+Fix 6 caused a regression: restoring CLOEXEC in the child caused
+`close_range(CLOEXEC)` to close pipe fds BEFORE `dup3` could
+redirect them to stdin/stdout.  apt method capabilities leaked to
+the terminal.
+
+New approach: save the pre-fork CLOEXEC set in
+`FORK_SAVED_CLOEXEC`.  When the child's `close_range(CLOEXEC)` runs:
+- Fds with actual CLOEXEC → close immediately (native behavior)
+- Fds with saved CLOEXEC (stripped for macOS fork) → SET the flag
+  instead of closing, so `dup2` can copy the fd first and `exec`
+  closes it later.
+
+Lifecycle: `fork → close_range sets flags → dup2 copies needed fds →
+exec closes flagged fds → no leak, no premature close.`
+
+### Known issue: XZ decompression futex deadlock
+
+Debian sid .debs use XZ compression.  dpkg-deb's forked decompressor
+child deadlocks in `futex_wait` on a glibc-internal mutex.  Verified
+this is **pre-existing** (not a regression from the CLOEXEC fixes)
+by testing with code from before commit 084035b.
+
+Root cause: our fork trampoline calls macOS `libc::fork()` instead
+of going through glibc's `_Fork`.  glibc's `pthread_atfork` child
+handlers (which reset malloc arena locks, stdio locks, etc.) don't
+run.  If a lock was held at fork time, the child inherits it locked
+and deadlocks when trying to acquire it.
+
+Ubuntu noble is unaffected because it uses zstd-compressed .debs.
+
+### Commits from this session
+
+```
+0967e5a  fix(trap): emulate UMULH/SMULH/UMADDL/SMADDL in DataProc3Src
+0b2797c  fix(syscall): stub keyring syscalls (216/217/219)
+6fb2a8f  feat(elf): .eh_frame FDE parser for precise code-vs-data classification
+d029884  fix(syscall): correct O_DIRECTORY/O_NOFOLLOW; fix lstat/readlinkat
+651aeba  fix(syscall): translate /dev/pts/N to macOS /dev/ttysN
+084035b  fix(thread): restore FD_CLOEXEC in child after fork
+3d88fdb  fix(thread): defer CLOEXEC restore to close_range
+```
+
+### Handoff — start here next session
+
+**Goal 1 — XZ futex deadlock**: glibc's `pthread_atfork` child
+handlers must run after our macOS fork.  Options:
+- Call glibc's `__fork_handler` directly (if we can find its address
+  in the loaded libc)
+- Ensure no glibc locks are held at fork time (difficult — the guest
+  main thread might be in malloc when SIGILL fires)
+- Implement a "fork-safe" path that returns control to glibc's
+  `_Fork` child path before resuming guest code
+- Scan for and reset known glibc mutex patterns in the child
+
+**Goal 2 — x18 trampoline optimization**: replace SIGILL traps with
+branch-to-trampoline for ~100× speedup.  See memory file
+`project_x18_trampoline.md`.  Currently every x18 instruction takes
+~5μs (SIGILL + handler); a branch trampoline would be ~50ns.
+
+**Goal 3 — Performance**: dpkg-deb on Debian sid .debs is extremely
+slow due to x18 trap overhead (~2000 x18 patches in libgcrypt alone).
+The trampoline optimization would fix this.
+
+**Goal 4 — Terminal**: `isatty` works with real PTY, but interactive
+programs (vim) need further work on termios raw mode handling and
+proper pty lifecycle management.
