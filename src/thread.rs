@@ -559,13 +559,16 @@ extern "C" fn fork_trampoline_entry() -> ! {
         unsafe { libc::_exit(127); }
     }
 
-    // Restore FD_CLOEXEC in the parent (child will exec → fds close then)
-    if pid != 0 {
-        for fd in 0..256i32 {
-            let old = saved_cloexec[fd as usize];
-            if old > 0 && old & libc::FD_CLOEXEC != 0 {
-                unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
-            }
+    // Restore FD_CLOEXEC in both parent AND child.
+    // The child needs CLOEXEC restored so that close_range(CLOSE_RANGE_CLOEXEC)
+    // (called by glibc between fork and exec) correctly closes inherited pipe
+    // fds that the method shouldn't keep open. Without this, fds leak through
+    // exec, causing self-pipe deadlocks (e.g., apt's store method holding both
+    // ends of its data pipes).
+    for fd in 0..256i32 {
+        let old = saved_cloexec[fd as usize];
+        if old > 0 && old & libc::FD_CLOEXEC != 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, old); }
         }
     }
 

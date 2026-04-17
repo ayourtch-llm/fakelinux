@@ -698,6 +698,13 @@ fn do_close(fd: i32) -> u64 {
 fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
     const CLOSE_RANGE_CLOEXEC: u32 = 4;
 
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] close_range({}, {:#x}, flags={:#x})\n",
+            pid, first, last, flags));
+    }
+
     // Clamp to a reasonable range to avoid iterating millions of fds.
     let last = last.min(first.saturating_add(65536));
 
@@ -1365,8 +1372,9 @@ fn do_pipe2(pipefd_ptr: u64, flags: i32) -> u64 {
     if ret < 0 {
         return translate::linux_errno();
     }
+    let has_cloexec = flags & 0o2000000 != 0;
     // Handle O_CLOEXEC and O_NONBLOCK
-    if flags & 0o2000000 != 0 {
+    if has_cloexec {
         unsafe {
             libc::fcntl((*fds)[0], libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl((*fds)[1], libc::F_SETFD, libc::FD_CLOEXEC);
