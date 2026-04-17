@@ -1983,6 +1983,18 @@ unsafe extern "C" fn trap_handler(
         // Store guest PC for futex deadlock diagnostics
         LAST_SVC_PC.store(pc, Ordering::Relaxed);
 
+        // Trace all SVCs from fork children (including worker threads)
+        if crate::thread::is_fork_child() {
+            let pid = libc::getpid();
+            let tid = libc::pthread_self() as u64;
+            let mut buf = [0u8; 160];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: [{}] CHILD_SVC nr={} x0={:#x} tid={:#x} pc={:#x}\n",
+                pid, nr, mctx.ss.x[0], tid, pc
+            ));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
+
         let result = syscall::emulate(nr, &args, mctx);
 
         // Check if any trampoline was requested (fork, patch, etc.)

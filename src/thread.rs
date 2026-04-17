@@ -729,6 +729,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
+        IS_FORK_CHILD.store(true, Ordering::Relaxed);
 
         // Handle CLONE_CHILD_SETTID: write the child's TID to the
         // child_tid_ptr in the child's address space. On real Linux, the kernel
@@ -909,6 +910,13 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
 
 // ─── Futex emulation ────────────────────────────────────────────────────────
 
+/// Set in fork children (for futex diagnostics).
+static IS_FORK_CHILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_fork_child() -> bool {
+    IS_FORK_CHILD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
 pub const FUTEX_WAIT_BITSET: u32 = 9;
@@ -958,6 +966,25 @@ fn parse_timeout(timeout_ptr: u64) -> Option<Duration> {
 
 pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64, val3: u32) -> u64 {
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+
+    // Trace futex ops from fork children
+    if IS_FORK_CHILD.load(Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        let tid = unsafe { libc::pthread_self() } as u64;
+        let cur_val = unsafe { (uaddr as *const i32).read_volatile() };
+        let guest_pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
+        let mut buf = [0u8; 250];
+        let n = {
+            use std::io::Write;
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            let _ = c.write_fmt(format_args!(
+                "fakelinux: [{}] FUTEX op={} uaddr={:#x} val={} cur={} tid={:#x} pc={:#x}\n",
+                pid, cmd, uaddr, val, cur_val, tid, guest_pc
+            ));
+            c.position() as usize
+        };
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+    }
 
     match cmd {
         FUTEX_WAIT => {
@@ -1065,6 +1092,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
 fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
     let entry = get_futex(uaddr);
     let mut waiters = entry.waiters.lock().unwrap();
+    let num_waiters = waiters.len();
     let mut woken = 0u32;
     let mut remaining = Vec::new();
 
@@ -1083,6 +1111,22 @@ fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
         }
     }
     *waiters = remaining;
+
+    // Log wake results when there were waiters or when waking the deadlock addr
+    if num_waiters > 0 || woken > 0 {
+        let pid = unsafe { libc::getpid() };
+        let mut buf = [0u8; 160];
+        let n = {
+            use std::io::Write;
+            let mut c = std::io::Cursor::new(&mut buf[..]);
+            let _ = c.write_fmt(format_args!(
+                "fakelinux: [{}] FUTEX_WAKE_RESULT uaddr={:#x} waiters={} woken={}\n",
+                pid, uaddr, num_waiters, woken
+            ));
+            c.position() as usize
+        };
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+    }
 
     woken as u64
 }
