@@ -397,7 +397,7 @@ fn addr_in_code_ranges(addr: u64, code_ranges: &[(u64, u64)]) -> bool {
 /// the post-increment load to match before excluding a region. A bare ADR
 /// (e.g. for code addresses, switch table bases) is NOT excluded.
 fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
-    // Hard cap on pool size. SHA-256 K table is 256 bytes; rare to see larger.
+    // Hard cap on pool size.
     const MAX_LITERAL_POOL_SIZE: u64 = 512;
     // How many instructions after the ADR to look for the post-inc load.
     const LOOKAHEAD_INSTRS: usize = 8;
@@ -406,21 +406,14 @@ fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
     let base = start as *const u32;
     let mut pool_starts: Vec<u64> = Vec::new();
 
-    // Detect SHA-256 K table by fingerprint: K[0..3] = 0x428a2f98, 0x71374491,
-    // 0xb5c0fbcf, 0xe9b5dba5. Some libraries (libgcrypt) load the K table via
-    // an indirect GOT lookup, so we can't trace ADR/ADRP statically. Direct
-    // fingerprint matching catches all cases.
-    for i in 0..(count as usize).saturating_sub(4) {
-        let w0 = unsafe { base.add(i).read() };
-        if w0 != 0x428a2f98 { continue; }
-        let w1 = unsafe { base.add(i + 1).read() };
-        let w2 = unsafe { base.add(i + 2).read() };
-        let w3 = unsafe { base.add(i + 3).read() };
-        if w1 == 0x71374491 && w2 == 0xb5c0fbcf && w3 == 0xe9b5dba5 {
-            // SHA-256 K table found — 64 entries × 4 bytes = 256 bytes
-            pool_starts.push(start + (i as u64) * 4);
-        }
-    }
+    // NOTE: The SHA-256 K-table fingerprint that used to be here was removed.
+    // It's no longer needed because:
+    // 1. Modern aarch64 toolchains place K tables in .rodata (not .text).
+    // 2. Even if in .text, the .eh_frame FDE-based code range extraction
+    //    (Strategy 1 in extract_code_ranges_from_memory) automatically
+    //    excludes inter-function data gaps.
+    // The ADR+load heuristic below remains as a secondary defense for
+    // INTRA-function literal pools (data embedded inside a function body).
 
     for i in 0..count as usize {
         let pc = start + (i as u64) * 4;
@@ -653,9 +646,13 @@ pub fn patch_new_code(start: u64, len: u64) {
 }
 
 /// Try to extract code ranges from ELF headers in mapped memory.
-/// First tries section headers (most precise), then falls back to program headers
-/// + PT_DYNAMIC parsing to identify and exclude known data regions (.dynstr, .dynsym,
-/// .rela, etc.) from executable segments.
+///
+/// Strategies (tried in order):
+/// 1. .eh_frame FDE ranges — most precise, function-level granularity.
+///    Automatically excludes literal pools, crypto constant tables, etc.
+/// 2. Section headers (SHF_EXECINSTR) — broad, marks entire .text/.plt.
+/// 3. Program headers + PT_DYNAMIC exclusion — coarsest, subtracts known data.
+///
 /// Returns empty vec if no code ranges can be determined.
 fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> {
     const SHF_EXECINSTR: u64 = 4;
@@ -666,7 +663,13 @@ fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> 
         return Vec::new();
     }
 
-    // Strategy 1: section headers (most precise)
+    // Strategy 1: .eh_frame FDE ranges (function-level precision)
+    let fde_ranges = elf::find_code_ranges_from_eh_frame(data, base_addr);
+    if !fde_ranges.is_empty() {
+        return fde_ranges;
+    }
+
+    // Strategy 2: section headers (SHF_EXECINSTR)
     let e_shoff = elf::read_u64_pub(data, 40) as usize;
     let e_shentsize = elf::read_u16_pub(data, 58) as usize;
     let e_shnum = elf::read_u16_pub(data, 60) as usize;
@@ -692,7 +695,7 @@ fn extract_code_ranges_from_memory(base_addr: u64, len: u64) -> Vec<(u64, u64)> 
         }
     }
 
-    // Strategy 2: program headers + PT_DYNAMIC to exclude known data regions
+    // Strategy 3: program headers + PT_DYNAMIC to exclude known data regions
     extract_code_ranges_via_phdrs(data, base_addr, len)
 }
 
