@@ -645,11 +645,39 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         return (-2_i64) as u64; // -ENOENT
     }
 
+    // Translate Linux pty slave paths /dev/pts/N → macOS /dev/ttysN.
+    // Linux convention: /dev/pts/0, /dev/pts/1, ...
+    // macOS convention: /dev/ttys000, /dev/ttys001, ...
+    let pts_path_holder;
+    let (eff_pathname, pts_hold);
+    let path_bytes = path.to_bytes();
+    if path_bytes.starts_with(b"/dev/pts/") {
+        let num_str = std::str::from_utf8(&path_bytes[9..]).unwrap_or("");
+        if let Ok(num) = num_str.parse::<u32>() {
+            let mac_path = format!("/dev/ttys{:03}\0", num);
+            pts_path_holder = unsafe {
+                std::ffi::CString::from_vec_with_nul_unchecked(mac_path.into_bytes())
+            };
+            eff_pathname = pts_path_holder.as_ptr();
+            pts_hold = Some(pts_path_holder);
+        } else {
+            eff_pathname = 0 as *const i8; // will be set below
+            pts_hold = None;
+        }
+    } else {
+        eff_pathname = 0 as *const i8;
+        pts_hold = None;
+    }
+
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_open_flags(linux_flags);
 
-    // Translate path through rootfs layer
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    // Use translated pts path if available, otherwise normal rootfs translation
+    let (eff_path, _hold) = if pts_hold.is_some() {
+        (eff_pathname, None)
+    } else {
+        effective_path_ptr(pathname)
+    };
 
     let ret = unsafe { libc::openat(mac_dirfd, eff_path, mac_flags, mode) };
     if ret >= 0 {
