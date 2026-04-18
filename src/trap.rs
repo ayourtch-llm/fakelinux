@@ -169,20 +169,14 @@ pub fn init_x18_key() {
 
 /// Set the per-thread guest x18 value.
 pub fn set_thread_x18(val: u64) {
-    if !X18_KEY_INIT.load(Ordering::SeqCst) {
-        return;
-    }
-    let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
-    unsafe { libc::pthread_setspecific(key, val as *const libc::c_void); }
+    // Use the global — shared with x18 trampolines for consistency.
+    crate::x18_trampoline::GUEST_X18_GLOBAL.store(val, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Get the per-thread guest x18 value.
 pub fn get_thread_x18() -> u64 {
-    if !X18_KEY_INIT.load(Ordering::SeqCst) {
-        return 0;
-    }
-    let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
-    (unsafe { libc::pthread_getspecific(key) }) as u64
+    // Use the global — shared with x18 trampolines for consistency.
+    crate::x18_trampoline::GUEST_X18_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // macOS aarch64 mcontext structures

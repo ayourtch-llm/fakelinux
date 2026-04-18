@@ -15,6 +15,7 @@ mod thread;
 mod translate;
 mod trampoline;
 mod trap;
+mod x18_trampoline;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();

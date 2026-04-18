@@ -559,13 +559,16 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
                 if (!have_code_ranges || addr_in_code_ranges(pc_addr, code_ranges))
                     && !addr_in_pools(pc_addr, &literal_pools)
                     && offset < x18_max_offset {
-                    add_tpidr_patch(pc_addr, instr);
-                    base.add(i).write(trap::UDF_MARKER);
+                    if !crate::x18_trampoline::patch_x18_with_trampoline(pc_addr, instr) {
+                        add_tpidr_patch(pc_addr, instr);
+                        base.add(i).write(trap::UDF_MARKER);
+                    }
                     x18_patched += 1;
                 }
             }
         }
     }
+    crate::x18_trampoline::flush_all_islands();
     if svc_patched > 0 {
         eprintln!("fakelinux: patched {} SVC→UDF instructions", svc_patched);
     }
@@ -618,8 +621,10 @@ pub fn patch_new_code(start: u64, len: u64) {
                 // AND we're not in a literal pool (data embedded in .text).
                 if have_code_ranges && addr_in_code_ranges(pc_addr, &code_ranges)
                     && !addr_in_pools(pc_addr, &literal_pools) {
-                    add_runtime_tpidr_patch(pc_addr, instr);
-                    base.add(i).write(trap::UDF_MARKER);
+                    if !crate::x18_trampoline::patch_x18_with_trampoline(pc_addr, instr) {
+                        add_runtime_tpidr_patch(pc_addr, instr);
+                        base.add(i).write(trap::UDF_MARKER);
+                    }
                     x18_patched += 1;
                 } else if !have_code_ranges {
                     x18_skipped += 1;
@@ -627,6 +632,7 @@ pub fn patch_new_code(start: u64, len: u64) {
             }
         }
     }
+    crate::x18_trampoline::flush_all_islands();
     if svc_patched > 0 || tpidr_patched > 0 || x18_patched > 0 || x18_skipped > 0 {
         eprintln!(
             "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR, {} x18{}",
