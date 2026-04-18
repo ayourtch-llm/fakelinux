@@ -265,6 +265,7 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
         tls: tls_val,
         set_tls,
         clear_tid_ptr,
+        guest_x18: crate::trap::get_thread_x18(),
     });
     let arg_ptr = Box::into_raw(arg) as *mut libc::c_void;
 
@@ -301,6 +302,7 @@ struct CloneArgs {
     tls: u64,
     set_tls: bool,
     clear_tid_ptr: u64,
+    guest_x18: u64,
 }
 
 /// Set up a per-thread sigaltstack and install the SIGILL trap handler.
@@ -379,6 +381,9 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
     if args.clear_tid_ptr != 0 {
         set_clear_tid_ptr(args.clear_tid_ptr);
     }
+
+    // Propagate parent's guest x18 to this thread's TSD slot
+    crate::trap::set_thread_x18(args.guest_x18);
 
     // Set up per-thread sigaltstack
     setup_thread_signal_stack();

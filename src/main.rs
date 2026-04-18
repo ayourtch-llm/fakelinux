@@ -98,6 +98,7 @@ fn main() {
     // Initialize per-thread pthread keys before anything else
     trap::init_tpidr_key();
     trap::init_x18_key();
+    trap::set_thread_x18(0); // Initialize main thread's x18 TSD slot
     thread::init_tid_key();
     thread::init_clear_tid_key();
 

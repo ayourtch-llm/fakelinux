@@ -1,23 +1,34 @@
 //! X18 branch-to-trampoline: replaces SIGILL traps with inline branches
-//! for ~100× speedup on x18-touching instructions.
+//! for ~100x speedup on x18-touching instructions.
 //!
 //! Each x18 instruction is replaced with `B <trampoline>`. The trampoline
 //! swaps the guest x18 value in, runs the original instruction natively,
 //! swaps back, and branches to the next instruction.
 //!
-//! Guest x18 is stored in a global AtomicU64. Multi-threaded guests use
-//! the existing pthread_key via get/set_thread_x18 for the SIGILL fallback,
-//! but the trampoline uses this global for speed. Single-process guests
-//! (the common case for dpkg-deb, apt, etc.) only have one thread executing
-//! x18 code at a time, so a global is correct.
+//! Guest x18 is stored per-thread using macOS's thread-specific data (TSD)
+//! accessed via `MRS TPIDRRO_EL0` + a fixed offset. This is correct for
+//! multi-threaded guests where each thread has its own x18 value.
+//! The TSD slot is allocated via `pthread_key_create` at startup, and the
+//! trampoline reads/writes `[TPIDRRO_EL0 + key*8]` directly.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// The guest's x18 value. Accessed by trampoline code via absolute address.
-/// Must be pub so the linker keeps it and we can take its address.
+/// The guest's x18 value (global fallback, used before TSD is initialized).
+/// Kept for backward compatibility with the SIGILL fallback path.
 #[no_mangle]
 pub static GUEST_X18_GLOBAL: AtomicU64 = AtomicU64::new(0);
+
+/// TSD byte offset: key * 8, set once at startup by init_x18_key().
+/// Used by trampolines to access per-thread guest x18 via TPIDRRO_EL0.
+static TSD_BYTE_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+/// Set the TSD byte offset for x18 trampolines. Called once from init_x18_key().
+pub fn set_tsd_offset(byte_offset: u32) {
+    assert!(byte_offset % 8 == 0 && byte_offset / 8 < 4096,
+            "TSD offset {} doesn't fit in LDR/STR unsigned imm12", byte_offset);
+    TSD_BYTE_OFFSET.store(byte_offset, Ordering::SeqCst);
+}
 
 // ─── ARM64 instruction encoding ─────────────────────────────────────────────
 
@@ -92,67 +103,50 @@ impl CodeIsland {
 
     /// Emit one trampoline. Returns trampoline address or None if full/out-of-range.
     fn emit(&mut self, orig_pc: u64, orig_instr: u32) -> Option<u64> {
-        // 12 instructions × 4 bytes = 48 bytes per trampoline
+        // 13 instructions x 4 bytes = 52 bytes per trampoline
         //
         // Saves/restores x16 and x17 via the stack so hand-written assembly
         // (like libgcrypt's crypto routines) that uses x16/x17 as temporaries
-        // is not corrupted. SP is offset by -16 during the original instruction
-        // but x18-touching instructions almost never reference SP.
-        let size = 12 * 4;
-        if self.used + size > self.capacity { return None; }
-
-        let tramp_pc = self.base + self.used as u64;
-        let return_pc = orig_pc + 4;
-        let x18_addr = &GUEST_X18_GLOBAL as *const AtomicU64 as u64;
-        let x18_page = x18_addr & !0xFFF;
-        let x18_page_off = (x18_addr & 0xFFF) as u32;
-
-        //  0: stp x16, x17, [sp, #-16]! ; save scratch regs
-        //  1: mov x16, x18              ; save macOS x18 in x16
-        //  2: adrp x17, <x18_page>
-        //  3: ldr x18, [x17, #off]      ; x18 = guest x18
-        //  4: ldp x16, x17, [sp], #16   ; restore scratch regs
-        //  5: <original instruction>     ; x16/x17 correct, x18 = guest
-        //  6: stp x16, x17, [sp, #-16]! ; save scratch regs again
-        //  7: adrp x17, <x18_page>
-        //  8: str x18, [x17, #off]      ; save guest x18
-        //  9: ldr x18, [sp, #-16]       ; restore macOS x18 (saved at step 0's [sp])
-        //                                 ; step 0 pushed to [sp-16], step 6 re-pushed to current [sp-16]
-        //                                 ; actually we saved macOS x18 in x16 at step 1, then restored x16 at step 4.
-        //                                 ; We need to save macOS x18 somewhere persistent.
+        // is not corrupted. SP is restored before the original instruction.
         //
-        // Revised approach: save macOS x18 in the stack frame alongside x16/x17:
+        // Per-thread x18 is accessed via MRS TPIDRRO_EL0 + TSD offset:
         //  0: stp x16, x17, [sp, #-32]! ; push frame: [sp]=x16, [sp+8]=x17
         //  1: str x18, [sp, #16]         ; [sp+16] = macOS x18
-        //  2: adrp x16, <x18_page>
-        //  3: ldr x18, [x16, #off]       ; x18 = guest x18
+        //  2: mrs x16, tpidrro_el0       ; get thread-local base
+        //  3: ldr x18, [x16, #(key*8)]   ; x18 = per-thread guest x18
         //  4: ldp x16, x17, [sp]         ; restore x16/x17
         //  5: add sp, sp, #32            ; restore SP for the original instruction
         //  6: <original instruction>      ; x16/x17/SP all correct, x18 = guest
         //  7: sub sp, sp, #32            ; re-lower SP to access our frame
-        //  8: adrp x16, <x18_page>
-        //  9: str x18, [x16, #off]       ; save guest x18
+        //  8: mrs x16, tpidrro_el0       ; get thread-local base again
+        //  9: str x18, [x16, #(key*8)]   ; save per-thread guest x18
         // 10: ldr x18, [sp, #16]         ; restore macOS x18
         // 11: ldp x16, x17, [sp], #32    ; restore x16/x17; sp += 32
         // 12: b <return_pc>
         let size = 13 * 4;
         if self.used + size > self.capacity { return None; }
 
-        let adrp_0 = encode_adrp(16, tramp_pc + 2*4, x18_page)?;
-        let adrp_1 = encode_adrp(16, tramp_pc + 8*4, x18_page)?;
+        let tramp_pc = self.base + self.used as u64;
+        let return_pc = orig_pc + 4;
+        let tsd_off = TSD_BYTE_OFFSET.load(Ordering::Relaxed);
+        assert!(tsd_off != 0, "TSD_BYTE_OFFSET not initialized before emitting trampoline");
+
         let b_back = encode_b(tramp_pc + 12*4, return_pc)?;
+
+        // MRS x16, TPIDRRO_EL0 = 0xD53BD060 | Rt, Rt=16 → 0xD53BD070
+        const MRS_X16_TPIDRRO: u32 = 0xD53BD070;
 
         let instrs: [u32; 13] = [
             0xA9BE_47F0,                               // stp x16, x17, [sp, #-32]!
             0xF900_0BF2,                               // str x18, [sp, #16]
-            adrp_0,                                     // adrp x16, <page>
-            encode_ldr_unsigned(18, 16, x18_page_off),  // ldr x18, [x16, #off]
+            MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
+            encode_ldr_unsigned(18, 16, tsd_off),       // ldr x18, [x16, #(key*8)]
             0xA940_47F0,                               // ldp x16, x17, [sp]
             0x9100_83FF,                               // add sp, sp, #32
             orig_instr,                                 // original instruction
             0xD100_83FF,                               // sub sp, sp, #32
-            adrp_1,                                     // adrp x16, <page>
-            encode_str_unsigned(18, 16, x18_page_off),  // str x18, [x16, #off]
+            MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
+            encode_str_unsigned(18, 16, tsd_off),       // str x18, [x16, #(key*8)]
             0xF940_0BF2,                               // ldr x18, [sp, #16]
             0xA8C2_47F0,                               // ldp x16, x17, [sp], #32
             b_back,                                     // b <return>

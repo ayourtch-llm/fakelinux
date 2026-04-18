@@ -165,18 +165,27 @@ pub fn init_x18_key() {
     }
     X18_KEY.store(key as u64, Ordering::SeqCst);
     X18_KEY_INIT.store(true, Ordering::SeqCst);
+    // Tell the trampoline system the TSD byte offset
+    crate::x18_trampoline::set_tsd_offset(key as u32 * 8);
 }
 
 /// Set the per-thread guest x18 value.
 pub fn set_thread_x18(val: u64) {
-    // Use the global — shared with x18 trampolines for consistency.
-    crate::x18_trampoline::GUEST_X18_GLOBAL.store(val, std::sync::atomic::Ordering::Relaxed);
+    if !X18_KEY_INIT.load(Ordering::SeqCst) {
+        crate::x18_trampoline::GUEST_X18_GLOBAL.store(val, Ordering::Relaxed);
+        return;
+    }
+    let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+    unsafe { libc::pthread_setspecific(key, val as *const libc::c_void); }
 }
 
 /// Get the per-thread guest x18 value.
 pub fn get_thread_x18() -> u64 {
-    // Use the global — shared with x18 trampolines for consistency.
-    crate::x18_trampoline::GUEST_X18_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
+    if !X18_KEY_INIT.load(Ordering::SeqCst) {
+        return crate::x18_trampoline::GUEST_X18_GLOBAL.load(Ordering::Relaxed);
+    }
+    let key = X18_KEY.load(Ordering::SeqCst) as libc::pthread_key_t;
+    unsafe { libc::pthread_getspecific(key) as u64 }
 }
 
 // macOS aarch64 mcontext structures
