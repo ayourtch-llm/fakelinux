@@ -1190,20 +1190,12 @@ New approach: save the pre-fork CLOEXEC set in
 Lifecycle: `fork → close_range sets flags → dup2 copies needed fds →
 exec closes flagged fds → no leak, no premature close.`
 
-### Known issue: XZ decompression futex deadlock
+### Known issue: XZ decompression deadlock (FIXED — see session 4)
 
-Debian sid .debs use XZ compression.  dpkg-deb's forked decompressor
-child deadlocks in `futex_wait` on a glibc-internal mutex.  Verified
-this is **pre-existing** (not a regression from the CLOEXEC fixes)
-by testing with code from before commit 084035b.
-
-Root cause: our fork trampoline calls macOS `libc::fork()` instead
-of going through glibc's `_Fork`.  glibc's `pthread_atfork` child
-handlers (which reset malloc arena locks, stdio locks, etc.) don't
-run.  If a lock was held at fork time, the child inherits it locked
-and deadlocks when trying to acquire it.
-
-Ubuntu noble is unaffected because it uses zstd-compressed .debs.
+> **2026-04-17 hypothesis was WRONG.** The `pthread_atfork` child
+> handlers DO run (confirmed by tracing MRS at offset 0xC8634 in
+> `__libc_fork`). The actual root cause was SIGILL being blocked on
+> worker threads — see session 4 below.
 
 ### Commits from this session
 
@@ -1217,27 +1209,326 @@ d029884  fix(syscall): correct O_DIRECTORY/O_NOFOLLOW; fix lstat/readlinkat
 3d88fdb  fix(thread): defer CLOEXEC restore to close_range
 ```
 
+---
+
+## 2026-04-18 (session 4) — XZ deadlock fix, x18 trampoline optimization
+
+Two major achievements: found and fixed the XZ decompression deadlock
+(which had a wrong hypothesis from session 3), and implemented the
+x18 branch-to-trampoline optimization for ~6.4× speedup.
+
+### XZ deadlock: root cause and fix
+
+**Previous hypothesis (WRONG)**: Session 3 hypothesized that glibc's
+`pthread_atfork` child handlers weren't running after our macOS fork.
+Tracing proved this was incorrect — the MRS TPIDR at `__libc_fork`
+offset 0xC8634 fires in the child, confirming atfork handlers run.
+
+**Actual root cause**: The fork child creates a worker thread via
+`clone(CLONE_THREAD)` for liblzma XZ decompression. The worker thread
+starts but immediately goes silent — zero SVCs, zero traps.
+
+Investigation chain:
+1. Added `IS_FORK_CHILD` flag and `CHILD_SVC` tracing to log all
+   syscalls from fork children with thread IDs.
+2. Found: main thread does 166+ SVCs, worker thread does **zero**.
+3. Added `CHILD_MRS_TPIDR` logging — only the main thread gets
+   TPIDR traps. Worker thread gets zero traps of any kind.
+4. Key insight: `clone(CLONE_THREAD)` → `do_clone_with_regs()` →
+   `pthread_create()` is called from **inside the SIGILL trap
+   handler**, which has `sa_mask = sigfillset` (blocking ALL signals).
+5. macOS `pthread_create` makes the new thread **inherit the creating
+   thread's signal mask**. So the worker thread starts with SIGILL
+   blocked.
+6. When the worker thread hits UDF instructions, SIGILL is raised but
+   blocked — the signal pends without delivery. The thread silently
+   executes past all patched instructions without trapping.
+7. The main thread waits forever on a condvar that the worker can
+   never signal.
+
+**Fix** (commit `9c1cebb`): Add `sigprocmask(SIG_SETMASK, &empty, NULL)`
+in `clone_entry` before jumping to guest code, unblocking all signals.
+
+**Verification**: Zero FUTEX_DEADLOCK messages, worker thread does
+49 SVCs (was zero before), dpkg-deb completes.
+
+**Secondary fix** (commit `d56231f`):
+- `setup_thread_signal_stack()` was using `sigemptyset(&sa.sa_mask)`
+  for the SIGILL handler, which would override the process-wide
+  handler (installed with `sigfillset`) to not block signals during
+  traps. Fixed to use `sigfillset`, matching `install_trap_handler()`.
+- Added futex deadlock detection: 3-second timeout on `futex_wait`
+  with diagnostic logging (guest PC, futex address, value).
+
+### x18 branch-to-trampoline optimization (commit `82853a0`)
+
+**Problem**: Every x18-touching instruction was patched to UDF,
+causing SIGILL on every execution (~5μs per trap = 2 kernel
+transitions + signal delivery). libgcrypt has ~2000 x18 patches.
+dpkg-deb XZ decompression took 3.4s with UDF traps.
+
+**Solution**: Replace each x18 instruction with `B <trampoline>`
+instead of UDF. The trampoline swaps guest x18 in, executes the
+original instruction natively, swaps back, and returns.
+
+Trampoline structure (13 ARM64 instructions = 52 bytes):
+```
+stp x16, x17, [sp, #-32]!    // save scratch regs + make frame
+str x18, [sp, #16]            // save macOS x18
+adrp x16, <GUEST_X18_GLOBAL>  // compute global address
+ldr x18, [x16, #off]          // load guest x18
+ldp x16, x17, [sp]            // restore scratch (still on frame)
+add sp, sp, #32               // restore SP before instruction
+<original instruction>        // runs natively with correct x18+SP
+sub sp, sp, #32               // re-access frame
+adrp x16, <GUEST_X18_GLOBAL>
+str x18, [x16, #off]          // save guest x18 back
+ldr x18, [sp, #16]            // restore macOS x18
+ldp x16, x17, [sp], #32       // restore scratch + pop frame
+b <return_pc>                  // back to instruction+4
+```
+
+Key design decisions:
+- **Guest x18 storage**: global `AtomicU64` (`GUEST_X18_GLOBAL`)
+  for speed. Single address accessible via ADRP+LDR from any
+  trampoline.
+- **Code islands**: mmap'd RWX pages (MAP_JIT on macOS) near the
+  guest .text. Each island is 256 KB, holds ~5000 trampolines.
+- **SP correctness**: SP is restored before the original instruction
+  and re-decremented after, so SP-relative accesses in the original
+  instruction see the correct stack offset.
+- **Fallback**: Instructions that reference x16 or x17 (our scratch
+  regs) can't be trampolined — they fall back to UDF/SIGILL
+  emulation. ~205 out of ~2200 instructions need this fallback.
+- **icache**: `sys_icache_invalidate` + `pthread_jit_write_protect_np`
+  for W^X compliance on macOS.
+- **Disable**: `FAKELINUX_NO_X18_TRAMP=1` env var forces all x18
+  instructions through UDF path (for debugging).
+
+**Performance results** (dpkg-deb --extract on XZ .deb, release mode):
+
+| Mode | Wall time | User | System |
+|------|-----------|------|--------|
+| With trampolines | **0.53s** | 0.42s | 0.25s |
+| UDF only | 3.41s | 1.00s | 2.61s |
+
+**6.4× speedup**. System time dropped from 2.61s → 0.25s (10×
+fewer kernel transitions).
+
+**Encoding bugs found and fixed during development**:
+- STP encoding: `0xA9BE07F0` stored x16+x1 instead of x16+x17
+  (Rt2 field wrong). Fixed to `0xA9BE47F0`.
+
+### Commits from this session
+
+```
+d56231f  fix(thread): sigfillset for thread signal handler; futex deadlock detection
+25f86a3  diag(thread): add fork-child SVC tracing and futex wake logging
+9c1cebb  fix(thread): unblock signals in clone_entry, fixing XZ decompression deadlock
+82853a0  feat(x18): branch-to-trampoline optimization for x18 instructions
+```
+
 ### Handoff — start here next session
 
-**Goal 1 — XZ futex deadlock**: glibc's `pthread_atfork` child
-handlers must run after our macOS fork.  Options:
-- Call glibc's `__fork_handler` directly (if we can find its address
-  in the loaded libc)
-- Ensure no glibc locks are held at fork time (difficult — the guest
-  main thread might be in malloc when SIGILL fires)
-- Implement a "fork-safe" path that returns control to glibc's
-  `_Fork` child path before resuming guest code
-- Scan for and reset known glibc mutex patterns in the child
+**Goal 1 — curl hang**: `curl http://stdio.be/` inside fakelinux
+hangs after completing the HTTP request. Stuck in `ppoll` (syscall
+73) with no timeout. Works with `FAKELINUX_TRACE=1` (timing change).
+Likely a signal-delivery race or a poll/epoll edge case. Intermittent
+— test multiple times.
 
-**Goal 2 — x18 trampoline optimization**: replace SIGILL traps with
-branch-to-trampoline for ~100× speedup.  See memory file
-`project_x18_trampoline.md`.  Currently every x18 instruction takes
-~5μs (SIGILL + handler); a branch trampoline would be ~50ns.
+**Goal 2 — apt-get install vim**: `FAKELINUX_ROOT=tttt-root
+./target/release/fakelinux tttt-root/bin/bash -c "apt-get -y install
+vim"` hits errors (possibly intermittent SIGSEGV or package list
+parsing errors). The trampoline optimization is NOT the cause (same
+errors with `FAKELINUX_NO_X18_TRAMP=1`). Likely pre-existing
+signal-handling race. Test with multiple iterations.
 
-**Goal 3 — Performance**: dpkg-deb on Debian sid .debs is extremely
-slow due to x18 trap overhead (~2000 x18 patches in libgcrypt alone).
-The trampoline optimization would fix this.
+**Goal 3 — Trampoline thread safety**: The global `GUEST_X18_GLOBAL`
+is a single `AtomicU64`. Multi-threaded guests need per-thread x18
+storage in the trampoline path. Current workaround: worker threads
+still use the global (works for single-threaded-at-a-time patterns
+like liblzma's fork+thread). True fix: use macOS TPIDR_EL0 to index
+a per-thread slot.
 
 **Goal 4 — Terminal**: `isatty` works with real PTY, but interactive
 programs (vim) need further work on termios raw mode handling and
 proper pty lifecycle management.
+
+**Testing discipline**: Many bugs in this project are intermittent
+signal-handling races. Always test at least 5 iterations before
+declaring something fixed or broken. A single pass/fail is not
+reliable.
+
+### Investigation details (for reference)
+
+**curl hang analysis**: The hang is a Heisenbug — works WITH
+`FAKELINUX_TRACE=1` (the trace overhead changes timing), hangs WITHOUT
+it. With tracing enabled, the full syscall sequence completes: curl
+writes the response to stdout, calls `rt_sigaction(SIGPIPE, SIG_IGN)`
+many times during cleanup, closes fds 3/4/5, and reaches
+`exit_group(0)` (syscall 94). Without tracing, the last visible
+syscall is `ppoll` (syscall 73, nfds=2, with timeout) which returns 0
+(timeout). After ppoll returns, the process does zero more syscalls
+and hangs in guest code — suggesting a spin loop on a condition that
+the tracing overhead perturbs.
+
+**apt-get install vim actual error**: No SIGSEGV was observed in
+testing. The actual error is a package list parsing failure:
+`E: Problem parsing dependency 46 of rdate:arm64=1:1.11-3+b2` /
+`E: Problem with MergeList .../Packages.lz4`. Same error with
+`FAKELINUX_NO_X18_TRAMP=1`, confirming trampolines are not the cause.
+Likely a data corruption issue in lz4 decompression or a pre-existing
+issue with the cached Packages.lz4 file in the rootfs.
+
+**x18 trampoline SP-offset bug**: The original 8-instruction
+trampoline (without SP save/restore) produced garbled XZ output.
+Root cause: `stp x16,x17,[sp,#-32]!` leaves SP decremented by 32
+during the original instruction. Instructions like `str x18,[sp,#N]`
+or `ldr x0,[sp,#N]` saw wrong stack offsets. Adding `add sp,sp,#32`
+before and `sub sp,sp,#32` after the instruction (13-instruction
+version) fixed decompression correctness.
+
+**SIMD false positives in references_x18**: The `references_x18()`
+detector flags SIMD instructions where register field 18 is a
+SIMD/FP register (Q18/D18/B18), not GPR x18. Example:
+`0x385f9032` = `LDRB` with V=1 (SIMD), Rt=18 (D18). These are
+harmless false positives for trampolines (the trampoline swaps GPR
+x18 in/out, but the SIMD instruction doesn't touch GPR x18, so the
+swap is a no-op). Could be filtered to reduce trampoline count but
+no correctness impact.
+
+---
+
+## 2026-04-18 (session 5) — Per-thread x18, ET_EXEC relocation, fork TSD
+
+Four commits this session, focused on multi-thread/multi-process
+correctness for x18 trampolines and ET_EXEC binary support.
+
+### Per-thread x18 via TPIDRRO_EL0 (commit `ab0eeea`)
+
+Replaced the single global `GUEST_X18_GLOBAL` AtomicU64 with per-thread
+TSD storage accessed via `MRS TPIDRRO_EL0 + key*8`.
+
+**Key discovery**: on macOS ARM64, `pthread_getspecific(key)` is just
+`[TPIDRRO_EL0 + key * 8]`. TPIDRRO_EL0 is kernel-set, per-thread, and
+NOT clobbered by signal handlers (unlike TPIDR_EL0 which macOS clobbers
+on every signal entry/return). Verified empirically with a C test program
+across 4 threads + 10,000 signals.
+
+Trampoline now emits `MRS x16, TPIDRRO_EL0` (constant `0xD53BD070`)
+instead of `ADRP x16, <global>`. Same 13-instruction structure, same
+performance (~0.4s on dpkg-deb), now thread-safe.
+
+Changes: `x18_trampoline.rs` (MRS instead of ADRP), `trap.rs`
+(get/set_thread_x18 use pthread_getspecific/setspecific), `thread.rs`
+(clone_entry propagates parent x18 to child TSD), `main.rs` (init
+main thread TSD).
+
+### ET_EXEC relocation for dynamically-linked binaries (commit `3f55445`)
+
+**Problem**: Python 3.13 on Debian sid is ET_EXEC (non-PIE). macOS
+blocks mmap below 4GB (PAGEZERO), so we relocate the binary above 4GB.
+But non-PIE has absolute addresses baked into data without RELA entries.
+
+**Three-part fix**:
+
+1. **Skip PT_DYNAMIC and RELA-covered addresses** in the heuristic
+   pointer scan. ld-linux reads DT_* values and adds the load delta
+   itself (double relocation for .dynamic). JUMP_SLOT lazy binding adds
+   delta to the current GOT value (double relocation for .got.plt).
+   New `fixup_exec_pointers_skip_dynamic()` builds a HashSet of RELA
+   r_offset targets and skips them.
+
+2. **Lazy SIGSEGV fixup**: when PC or fault_addr is in the original
+   (unrelocated) ET_EXEC range, the handler adjusts the register/PC
+   by base_offset and retries. Handles function pointer calls (PC
+   redirect) and direct base register fixups.
+
+3. **crash_handler safety**: `mach_vm_read_overwrite` for safe
+   instruction read at faulting PC (avoids recursive EXC_BAD_ACCESS);
+   `SA_RESETHAND` + `AtomicBool` re-entry guard.
+
+**Attempted but failed**: building fakelinux with `-pagezero_size,0x10000`
+to map the binary at its original address. macOS enforces 4GB PAGEZERO
+on Apple Silicon with SIGKILL — even a hello-world binary gets killed.
+
+**Limitation**: computed addresses from unrelocated pointers (e.g.
+`x0+x10` where x10 is derived from an unrelocated base) can't be fixed
+at SIGSEGV time. This affects Python 3.13 (ET_EXEC) but not Ubuntu
+binaries (all PIE).
+
+### Fork child TSD initialization (commit `de6c96c`)
+
+**Problem**: `apt-get install` crashed with SIGSEGV at fault_addr=0x0
+in trampolines of fork child processes. After macOS `fork()`, the child
+inherits the parent's TPIDRRO_EL0 and TSD (COW), so TSD values ARE
+preserved. But after fork+exec (re-exec), TSD is wiped.
+
+**Fix**: save parent's guest x18 before `libc::fork()`, call
+`set_thread_x18(parent_x18)` and `set_thread_tpidr(parent_tpidr)` in
+the fork child.
+
+**Remaining issue**: after re-exec, the new fakelinux process
+initializes x18=0 (correct per Linux ABI — exec zeroes all registers).
+But some libraries (libcrypto/libgcrypt) use x18 as a scratch register
+and expect it to be set by function prologues. If the FIRST x18
+instruction in a function is an ADD or STR (reads x18), and x18 was
+set by a prior instruction via a trampoline that read TSD=0, the
+trampoline faithfully loads 0 into x18 and the instruction crashes.
+
+The diagnostic confirmed: TSD offset (2080 = key 260 * 8) is consistent
+across all re-exec'd processes. `raw_tsd` and `pthread_getspecific`
+agree. The value is non-zero at crash_handler time because a SIGILL
+(UDF fallback) between the trampoline's LDR and the crash_handler
+updated TSD — but the trampoline had already loaded x18=0.
+
+### Commits from this session
+
+```
+ab0eeea  feat(x18): per-thread guest x18 via TPIDRRO_EL0 TSD slot
+3f55445  fix(loader): ET_EXEC relocation for dynamically-linked binaries + crash_handler safety
+de6c96c  fix(thread): initialize x18 TSD slot in fork child
+```
+
+### Handoff — start here next session
+
+**Goal**: fix the x18=0 crash during `apt-get install` on ubuntu-rootfs.
+
+**Root cause**: after fork+exec (re-exec), TSD[x18_key]=0. The first
+x18 instruction that READS x18 via a trampoline gets 0 → NULL deref.
+The instruction `ADD x18, x18, x21, LSL #2` (libcrypto) expects x18
+to already hold a valid base pointer set by an earlier instruction in
+the same function.
+
+**What happens**: the prior instruction (which SETS x18) also goes
+through a trampoline. That trampoline loads x18=0 from TSD, executes
+the instruction (e.g. `ADRP x18, <page>` which overwrites x18 with a
+valid value), then saves the new x18 back to TSD. So TSD gets the
+correct value. Then the NEXT instruction's trampoline loads x18 from
+TSD — should get the correct value. But the crash says x18=0.
+
+**Most likely explanation**: a SIGILL fires (for a UDF-patched
+instruction) BETWEEN two consecutive trampolines. The SIGILL handler
+emulates some x18 instruction via the UDF fallback path, which calls
+`set_thread_x18(new_val)` — updating TSD. When the SIGILL handler
+returns, it restores `mctx.ss.x[18]` from the saved context (where
+x18=0, since macOS reserved x18 is 0). The next trampoline then reads
+the correct TSD value. But somehow the crash still shows x18=0.
+
+**Experiment to try**: add a check in the trampoline itself — if the
+loaded x18 is 0 and the instruction reads x18 (not just writes), fall
+back to UDF emulation. This avoids the NULL deref while the x18 value
+is still being established.
+
+**Alternative**: in `set_thread_x18(val)`, also store to the GLOBAL
+`GUEST_X18_GLOBAL` as a fallback. Modify the trampoline to check the
+TSD first, and if 0, read from the global. This adds 2-3 instructions
+but handles the bootstrap case.
+
+**What works**: `apt-get update` (5/5), `dpkg-deb` (5/5), `file`,
+`sha256sum`, interactive bash. The crash is specific to `apt-get
+install` which fork+exec's dpkg subprocesses that use libcrypto.
+
+**Ubuntu vs Debian**: Ubuntu 24.04 is all PIE (ET_DYN) — no ET_EXEC
+relocation issues. Debian sid Python 3.13 is ET_EXEC (non-PIE) and
+hits the fundamental PAGEZERO limitation. Focus on Ubuntu for now.
