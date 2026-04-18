@@ -225,7 +225,13 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
     // Non-PIE executables have absolute addresses baked into their data segments.
     // When we relocate past the 4GB PAGEZERO, these pointers must be adjusted.
     // PC-relative code (ADRP/ADR/B/BL) works automatically, but data pointers don't.
-    if elf.header.e_type == ET_EXEC && base_offset != 0 {
+    //
+    // IMPORTANT: only do this for statically-linked ET_EXEC (no interpreter).
+    // For dynamically-linked ET_EXEC, ld-linux computes the load delta from the
+    // program headers and applies all R_AARCH64_RELATIVE relocations itself.
+    // The heuristic scan would double-relocate .dynamic entries (DT_SYMTAB etc.)
+    // that ld-linux also adjusts, producing addresses like orig + 2*delta.
+    if elf.header.e_type == ET_EXEC && base_offset != 0 && interp_entry == 0 {
         fixup_exec_pointers(elf, base_offset);
     }
 
