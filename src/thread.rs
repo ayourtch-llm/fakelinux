@@ -603,6 +603,10 @@ extern "C" fn fork_trampoline_entry() -> ! {
         }
     }
 
+    // Save parent's guest x18 BEFORE fork — after fork, the child's TSD
+    // slots may be empty (macOS gives fork children a new thread/TPIDRRO).
+    let parent_x18 = crate::trap::get_thread_x18();
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         // Restore CLOEXEC flags before returning error
@@ -641,6 +645,16 @@ extern "C" fn fork_trampoline_entry() -> ! {
     }
 
     if pid == 0 {
+        // Re-initialize per-thread x18 TSD slot in the fork child.
+        // macOS fork() gives the child a new thread with fresh TSD slots (all 0).
+        // The x18 trampolines read guest x18 from [TPIDRRO_EL0 + key*8], which
+        // would be 0 without this, causing NULL dereference on the first x18
+        // instruction in the child. Use the value saved BEFORE fork.
+        crate::trap::set_thread_x18(parent_x18);
+        // Also re-initialize TPIDR TSD slot (same issue).
+        let parent_tpidr = crate::trap::get_thread_tpidr();
+        crate::trap::set_thread_tpidr(parent_tpidr);
+
         // Restore __libc_fork's stack canary if it was corrupted by the
         // STP in _Fork's child path (see diary for full explanation).
         // The STP writes [TPIDR-0x668]; if TLS is near the stack, this
