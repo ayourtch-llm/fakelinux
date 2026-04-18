@@ -3,10 +3,34 @@ use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use crate::syscall;
 
+extern "C" {
+    fn mach_task_self() -> u32;
+    fn mach_vm_read_overwrite(
+        target_task: u32,
+        address: u64,
+        size: u64,
+        data: u64,
+        outsize: *mut libc::vm_size_t,
+    ) -> i32;
+}
+
 /// Flag indicating we're inside our trap handler. When set, other signal
 /// handlers (signal_forwarder) must defer delivery by queuing to pending,
 /// because the ucontext contains trap handler registers, not guest registers.
 pub static IN_TRAP: AtomicBool = AtomicBool::new(false);
+
+// ─── Lazy relocation for relocated ET_EXEC ──────────────────────────────────
+// When a non-PIE ET_EXEC is relocated (macOS 4GB PAGEZERO), some absolute
+// pointers lack RELA entries and remain unrelocated. When the guest accesses
+// one, we get SIGSEGV at the original (pre-relocation) address. The fixup
+// handler detects this and adjusts the faulting register or PC on the fly.
+
+/// ET_EXEC relocation delta (0 if not relocated or PIE).
+pub static EXEC_BASE_OFFSET: AtomicU64 = AtomicU64::new(0);
+/// Original ET_EXEC address range (lowest PT_LOAD vaddr).
+pub static EXEC_ORIG_LO: AtomicU64 = AtomicU64::new(0);
+/// Original ET_EXEC address range (highest PT_LOAD vaddr + memsz).
+pub static EXEC_ORIG_HI: AtomicU64 = AtomicU64::new(0);
 
 /// Debug counter: trace first N SVC syscalls in a fork child.
 pub static FORK_SVC_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2173,14 +2197,69 @@ pub fn install_handler() {
         libc::sigemptyset(&mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
 
-        // Install SIGSEGV/SIGBUS handlers for debugging guest crashes
+        // Install SIGSEGV/SIGBUS handler that tries lazy relocation fixup
+        // for relocated ET_EXEC before falling through to crash diagnostics.
         let mut sa2: libc::sigaction = std::mem::zeroed();
-        sa2.sa_sigaction = crash_handler as *const () as libc::sighandler_t;
+        sa2.sa_sigaction = segv_fixup_handler as *const () as libc::sighandler_t;
         sa2.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa2.sa_mask);
+        libc::sigfillset(&mut sa2.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa2, std::ptr::null_mut());
     }
+}
+
+/// SIGSEGV handler that tries lazy relocation fixup for relocated ET_EXEC.
+/// If the fault address or PC is in the original (unrelocated) ET_EXEC range,
+/// adjust the register/PC by base_offset and retry the instruction.
+unsafe extern "C" fn segv_fixup_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut c_void,
+) {
+    let base_offset = EXEC_BASE_OFFSET.load(Ordering::Relaxed);
+    if base_offset != 0 {
+        let orig_lo = EXEC_ORIG_LO.load(Ordering::Relaxed);
+        let orig_hi = EXEC_ORIG_HI.load(Ordering::Relaxed);
+        let uctx = &mut *(ctx as *mut UContext);
+        let mctx = &mut *uctx.uc_mcontext;
+        let pc = mctx.ss.pc;
+        let fault_addr = mctx.es.far;
+
+        // Case 1: instruction fetch at unrelocated address (branch to unrelocated
+        // function pointer). Redirect PC to the relocated address.
+        if pc >= orig_lo && pc < orig_hi {
+            static FIXUP_PC_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = FIXUP_PC_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!("fakelinux: lazy reloc: PC {:#x} → {:#x}", pc, pc + base_offset);
+            }
+            mctx.ss.pc = pc + base_offset;
+            return; // retry instruction at relocated address
+        }
+
+        // Case 2: data access at unrelocated address. Try to fix a register
+        // that contains an unrelocated pointer. Scan ALL GPRs — the unrelocated
+        // value might be in any register (not just the instruction's Rn/Rm),
+        // because address computation can involve intermediate registers.
+        if fault_addr >= orig_lo && fault_addr < orig_hi {
+            for i in 0..29 { // x0-x28 (skip x29=fp, x30=lr)
+                let val = mctx.ss.x[i];
+                if val >= orig_lo && val < orig_hi {
+                    static FIXUP_REG_COUNT: AtomicU64 = AtomicU64::new(0);
+                    let n = FIXUP_REG_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 5 {
+                        eprintln!("fakelinux: lazy reloc: x{} {:#x} → {:#x} (fault_addr={:#x} pc={:#x})",
+                                  i, val, val + base_offset, fault_addr, pc);
+                    }
+                    mctx.ss.x[i] = val + base_offset;
+                    return; // retry with fixed register
+                }
+            }
+        }
+    }
+
+    // Fixup failed — fall through to crash diagnostics
+    crash_handler(sig, info, ctx);
 }
 
 unsafe extern "C" fn crash_handler(
@@ -2188,6 +2267,14 @@ unsafe extern "C" fn crash_handler(
     _info: *mut libc::siginfo_t,
     ctx: *mut c_void,
 ) {
+    // Guard against recursive SIGSEGV (e.g. accessing unmapped guest PC).
+    // Must use atomic + SeqCst to ensure the store is visible before any
+    // subsequent instruction that might fault.
+    static IN_CRASH: AtomicBool = AtomicBool::new(false);
+    if IN_CRASH.swap(true, Ordering::SeqCst) {
+        libc::_exit(128 + sig);
+    }
+
     // Use raw write() — safe after fork (no Rust Mutex deadlock)
     let uctx = &*(ctx as *const UContext);
     let mctx = &*uctx.uc_mcontext;
@@ -2195,10 +2282,20 @@ unsafe extern "C" fn crash_handler(
     let fault_addr = mctx.es.far;
     let guest_tpidr = get_thread_tpidr();
     let signame = if sig == libc::SIGSEGV { "SIGSEGV" } else { "SIGBUS" };
-    // Try to read the instruction at PC
-    let instr_at_pc = if regs.pc > 0x1000 {
-        *(regs.pc as *const u32)
-    } else { 0 };
+    // Read the instruction at PC using Mach vm_read_overwrite to avoid
+    // recursive SIGSEGV if PC points to unmapped memory.
+    let instr_at_pc = {
+        let mut val: u32 = 0;
+        let mut out_size: libc::vm_size_t = 0;
+        let kr = mach_vm_read_overwrite(
+            mach_task_self(),
+            regs.pc as u64,
+            4,
+            &mut val as *mut u32 as u64,
+            &mut out_size,
+        );
+        if kr == 0 && out_size == 4 { val } else { 0 }
+    };
     let mut buf = [0u8; 768];
     let n = raw_fmt(&mut buf, format_args!(
         "\nfakelinux: {} at pc={:#x} fault_addr={:#x} instr={:#010x}\n  x0={:#x}  x1={:#x}  x2={:#x}  x3={:#x}\n  x4={:#x}  x5={:#x}  x6={:#x}  x7={:#x}\n  x8={:#x}  x9={:#x}  x10={:#x}  x11={:#x}\n  x12={:#x}  x13={:#x}  x14={:#x}  x15={:#x}\n  x16={:#x}  x17={:#x}  x18(emu)={:#x}  x18(hw)={:#x}\n  x19={:#x}  x20={:#x}  x21={:#x}  x22={:#x}\n  fp={:#x}  sp={:#x}  lr={:#x}  tpidr={:#x}\n",

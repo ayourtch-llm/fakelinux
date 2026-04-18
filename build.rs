@@ -88,6 +88,7 @@ fn main() {
     println!("cargo:rerun-if-changed=data/encoding/");
     println!("cargo:rerun-if-changed=build.rs");
 
+
     let encoding_dir = Path::new("data/encoding");
     if !encoding_dir.exists() {
         eprintln!("Warning: data/encoding/ not found, skipping table generation");

@@ -226,13 +226,41 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
     // When we relocate past the 4GB PAGEZERO, these pointers must be adjusted.
     // PC-relative code (ADRP/ADR/B/BL) works automatically, but data pointers don't.
     //
-    // IMPORTANT: only do this for statically-linked ET_EXEC (no interpreter).
-    // For dynamically-linked ET_EXEC, ld-linux computes the load delta from the
-    // program headers and applies all R_AARCH64_RELATIVE relocations itself.
-    // The heuristic scan would double-relocate .dynamic entries (DT_SYMTAB etc.)
-    // that ld-linux also adjusts, producing addresses like orig + 2*delta.
-    if elf.header.e_type == ET_EXEC && base_offset != 0 && interp_entry == 0 {
-        fixup_exec_pointers(elf, base_offset);
+    // For dynamically-linked ET_EXEC (has interpreter), apply RELA relocations
+    // ourselves. ld-linux will also apply them, but RELA uses absolute assignment
+    // (*(B+r_offset) = B+r_addend) so the second application is idempotent.
+    // We do NOT use the heuristic fixup_exec_pointers scan here because it
+    // double-relocates pointers that ld-linux also adjusts via DT_* parsing.
+    //
+    // For statically-linked ET_EXEC (no interpreter), use the heuristic scan
+    // since there's no ld-linux to handle relocations.
+    if elf.header.e_type == ET_EXEC && base_offset != 0 {
+        if interp_entry != 0 {
+            // For dynamically-linked ET_EXEC: heuristic scan fixes data pointers
+            // that have no RELA entries. Skip .dynamic (ld-linux adds delta to
+            // DT_* values itself) and skip addresses with RELA entries (ld-linux's
+            // JUMP_SLOT lazy binding adds delta to the current GOT value, so
+            // pre-adjusting would cause double relocation).
+            fixup_exec_pointers_skip_dynamic(elf, base_offset);
+
+            // Enable lazy relocation: SIGSEGV handler will fix up remaining
+            // unrelocated pointers on demand (addresses in the original ET_EXEC
+            // range that have no RELA entries and weren't caught by the scan).
+            let mut orig_lo = u64::MAX;
+            let mut orig_hi: u64 = 0;
+            for phdr in &elf.phdrs {
+                if phdr.p_type != PT_LOAD { continue; }
+                let lo = phdr.p_vaddr;
+                let hi = phdr.p_vaddr + phdr.p_memsz;
+                if lo < orig_lo { orig_lo = lo; }
+                if hi > orig_hi { orig_hi = hi; }
+            }
+            crate::trap::EXEC_BASE_OFFSET.store(base_offset, std::sync::atomic::Ordering::SeqCst);
+            crate::trap::EXEC_ORIG_LO.store(orig_lo, std::sync::atomic::Ordering::SeqCst);
+            crate::trap::EXEC_ORIG_HI.store(orig_hi, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            fixup_exec_pointers(elf, base_offset);
+        }
     }
 
     // Set up the guest stack
@@ -1037,9 +1065,117 @@ fn setup_stack(
     Ok(sp)
 }
 
+/// Like fixup_exec_pointers but skips PT_DYNAMIC and all addresses covered
+/// by RELA entries. Used for dynamically-linked ET_EXEC.
+///
+/// ld-linux processes RELA entries itself. For R_AARCH64_RELATIVE, ld-linux
+/// uses absolute assignment (idempotent). But for R_AARCH64_JUMP_SLOT with
+/// lazy binding, ld-linux ADDS the load delta to the current GOT value.
+/// If we pre-adjust those GOT entries, ld-linux double-relocates them.
+fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
+    // Find PT_DYNAMIC range to exclude
+    let dyn_phdr = elf.phdrs.iter().find(|p| p.p_type == 2 /* PT_DYNAMIC */);
+    let (dyn_start, dyn_end) = if let Some(dp) = dyn_phdr {
+        let ds = base_offset + dp.p_vaddr;
+        (ds, ds + dp.p_memsz)
+    } else {
+        (0u64, 0u64)
+    };
+
+    // Build set of addresses covered by RELA entries (skip these in the scan).
+    // Read .dynamic from memory to find .rela.dyn and .rela.plt.
+    let mut rela_targets = std::collections::HashSet::new();
+    if let Some(dp) = dyn_phdr {
+        let dyn_mem = base_offset + dp.p_vaddr;
+        let dyn_size = dp.p_filesz;
+
+        let mut rela_vaddr: u64 = 0;
+        let mut rela_size: u64 = 0;
+        let mut rela_ent: u64 = 24;
+        let mut jmprel_vaddr: u64 = 0;
+        let mut jmprel_size: u64 = 0;
+
+        let mut i: u64 = 0;
+        while i + 16 <= dyn_size {
+            let tag = unsafe { *((dyn_mem + i) as *const u64) };
+            let val = unsafe { *((dyn_mem + i + 8) as *const u64) };
+            match tag {
+                0 => break,
+                7 => rela_vaddr = val,
+                8 => rela_size = val,
+                9 => rela_ent = val,
+                23 => jmprel_vaddr = val,
+                2 => jmprel_size = val,
+                _ => {}
+            }
+            i += 16;
+        }
+
+        // Collect r_offset from each RELA section
+        for &(vaddr, size) in &[(rela_vaddr, rela_size), (jmprel_vaddr, jmprel_size)] {
+            if vaddr == 0 || size == 0 { continue; }
+            let mem = base_offset + vaddr;
+            let count = size / rela_ent;
+            for j in 0..count {
+                let entry = mem + j * rela_ent;
+                let r_offset = unsafe { *(entry as *const u64) };
+                // r_offset is the original vaddr; the relocated address is base_offset + r_offset
+                rela_targets.insert(base_offset + r_offset);
+            }
+        }
+    }
+
+    let mut orig_lo = u64::MAX;
+    let mut orig_hi: u64 = 0;
+    for phdr in &elf.phdrs {
+        if phdr.p_type != PT_LOAD { continue; }
+        let lo = phdr.p_vaddr;
+        let hi = phdr.p_vaddr + phdr.p_memsz;
+        if lo < orig_lo { orig_lo = lo; }
+        if hi > orig_hi { orig_hi = hi; }
+    }
+    if orig_lo >= orig_hi { return; }
+
+    let mut fixed = 0u64;
+    let mut skipped_rela = 0u64;
+    for phdr in &elf.phdrs {
+        if phdr.p_type != PT_LOAD { continue; }
+        if phdr.p_flags & 2 == 0 { continue; }
+
+        let seg_start = base_offset + phdr.p_vaddr;
+        let seg_filesz = phdr.p_filesz;
+        let mut off: u64 = 0;
+        while off + 8 <= seg_filesz {
+            let ptr_addr = seg_start + off;
+            // Skip PT_DYNAMIC
+            if dyn_end > dyn_start && ptr_addr >= dyn_start && ptr_addr < dyn_end {
+                off += 8;
+                continue;
+            }
+            // Skip addresses with RELA entries (ld-linux handles them)
+            if rela_targets.contains(&ptr_addr) {
+                off += 8;
+                skipped_rela += 1;
+                continue;
+            }
+            let val = unsafe { *(ptr_addr as *const u64) };
+            if val >= orig_lo && val < orig_hi {
+                unsafe { *(ptr_addr as *mut u64) = val + base_offset; }
+                fixed += 1;
+            }
+            off += 8;
+        }
+    }
+    if fixed > 0 || skipped_rela > 0 {
+        eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data ({} skipped, RELA-covered)",
+                  fixed, skipped_rela);
+    }
+}
+
 /// Fix up absolute pointers in relocated ET_EXEC data segments.
 /// Scans writable PT_LOAD segments for 8-byte values that fall within the
 /// binary's original address range and adjusts them by base_offset.
+/// Used only for statically-linked ET_EXEC (no interpreter).
 fn fixup_exec_pointers(elf: &Elf, base_offset: u64) {
     // Determine the binary's original address range from PT_LOAD segments
     let mut orig_lo = u64::MAX;
@@ -1079,6 +1215,85 @@ fn fixup_exec_pointers(elf: &Elf, base_offset: u64) {
     if fixed > 0 {
         eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data", fixed);
     }
+}
+
+/// Apply R_AARCH64_RELATIVE relocations from memory for relocated ET_EXEC.
+/// Reads the already-loaded .dynamic and .rela.dyn from their memory locations
+/// (base_offset + vaddr). Uses absolute RELA semantics: *(B + r_offset) = B + r_addend,
+/// which is idempotent with ld-linux's own processing.
+fn apply_relocations_from_memory(elf: &Elf, base_offset: u64) {
+    let dyn_phdr = match elf.phdrs.iter().find(|p| p.p_type == 2 /* PT_DYNAMIC */) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Read .dynamic from memory at its relocated address
+    let dyn_mem = base_offset + dyn_phdr.p_vaddr;
+    let dyn_size = dyn_phdr.p_filesz;
+
+    let mut rela_vaddr: u64 = 0;
+    let mut rela_size: u64 = 0;
+    let mut rela_ent: u64 = 24;
+    let mut jmprel_vaddr: u64 = 0;
+    let mut jmprel_size: u64 = 0;
+
+    let mut i: u64 = 0;
+    while i + 16 <= dyn_size {
+        let tag = unsafe { *((dyn_mem + i) as *const u64) };
+        let val = unsafe { *((dyn_mem + i + 8) as *const u64) };
+        match tag {
+            0 => break,           // DT_NULL
+            7 => rela_vaddr = val,    // DT_RELA
+            8 => rela_size = val,     // DT_RELASZ
+            9 => rela_ent = val,      // DT_RELAENT
+            23 => jmprel_vaddr = val, // DT_JMPREL
+            2 => jmprel_size = val,   // DT_PLTRELSZ
+            _ => {}
+        }
+        i += 16;
+    }
+
+    let mut applied = 0u64;
+
+    // Apply .rela.dyn from memory
+    if rela_vaddr != 0 && rela_size != 0 {
+        applied += apply_rela_from_memory(base_offset, rela_vaddr, rela_size, rela_ent);
+    }
+
+    // Apply .rela.plt from memory
+    if jmprel_vaddr != 0 && jmprel_size != 0 {
+        applied += apply_rela_from_memory(base_offset, jmprel_vaddr, jmprel_size, rela_ent);
+    }
+
+    if applied > 0 {
+        eprintln!("fakelinux: applied {} RELA relocations for ET_EXEC", applied);
+    }
+}
+
+/// Apply R_AARCH64_RELATIVE entries from a RELA section already in memory.
+fn apply_rela_from_memory(base: u64, rela_vaddr: u64, rela_size: u64, rela_ent: u64) -> u64 {
+    let rela_mem = base + rela_vaddr;
+    let count = rela_size / rela_ent;
+    let mut applied = 0u64;
+
+    for j in 0..count {
+        let entry = rela_mem + j * rela_ent;
+        let r_offset = unsafe { *(entry as *const u64) };
+        let r_info = unsafe { *((entry + 8) as *const u64) };
+        let r_addend = unsafe { *((entry + 16) as *const u64) };
+
+        let r_type = (r_info & 0xFFFFFFFF) as u32;
+
+        // R_AARCH64_RELATIVE = 0x403
+        if r_type == 0x403 {
+            let target_addr = base + r_offset;
+            let value = base + r_addend;
+            unsafe { (target_addr as *mut u64).write(value); }
+            applied += 1;
+        }
+    }
+
+    applied
 }
 
 /// Apply R_AARCH64_RELATIVE relocations from the DYNAMIC segment.
