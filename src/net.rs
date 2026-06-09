@@ -58,6 +58,35 @@ fn translate_msg_flags(linux_flags: i32) -> i32 {
 
 /// Patch a Linux sockaddr buffer in-place to macOS format before passing to kernel.
 /// Returns the macOS sa_family for callers that need it.
+/// Copy a guest (Linux-format) sockaddr into a local macOS-format buffer.
+///
+/// The guest buffer is NOT modified: it may live in read-only memory (e.g.
+/// glibc syslog's static const sockaddr_un for /dev/log). Mutating guest
+/// memory in place faulted there — and since the trap handler runs with all
+/// signals blocked, the faulting store re-executed forever (useradd hung at
+/// 100% CPU connecting to /dev/log during apt-get install).
+///
+/// Use this for inbound addresses (connect/bind/sendto/sendmsg). Outbound
+/// buffers (accept/recvfrom/getsockname/...) are guest-writable by contract
+/// and may be converted in place.
+fn linux_sockaddr_to_mac_copy(addr_ptr: u64, addrlen: u32) -> libc::sockaddr_storage {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    if addr_ptr == 0 || addrlen < 2 {
+        return ss;
+    }
+    let len = (addrlen as usize).min(std::mem::size_of::<libc::sockaddr_storage>());
+    unsafe {
+        std::ptr::copy_nonoverlapping(addr_ptr as *const u8, &mut ss as *mut _ as *mut u8, len);
+        let p = &mut ss as *mut _ as *mut u8;
+        // Linux: offset 0 = sa_family as u16 LE → low byte is the family
+        let family = *p;
+        // macOS: offset 0 = sa_len, offset 1 = sa_family (u8)
+        *p = addrlen as u8;
+        *p.add(1) = family;
+    }
+    ss
+}
+
 fn linux_sockaddr_to_mac(addr_ptr: u64, addrlen: u32) -> u8 {
     if addr_ptr == 0 || addrlen < 2 {
         return 0;
@@ -129,15 +158,14 @@ pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
 }
 
 pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
-    linux_sockaddr_to_mac(addr_ptr, addrlen);
+    let mac_addr = linux_sockaddr_to_mac_copy(addr_ptr, addrlen);
     let ret = unsafe {
         libc::bind(
             fd,
-            addr_ptr as *const libc::sockaddr,
+            &mac_addr as *const _ as *const libc::sockaddr,
             addrlen as libc::socklen_t,
         )
     };
-    mac_sockaddr_to_linux(addr_ptr, addrlen); // restore for guest
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -186,15 +214,27 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
 }
 
 pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
-    linux_sockaddr_to_mac(addr_ptr, addrlen);
+    if std::env::var_os("FAKELINUX_TRACE").is_some() && addr_ptr != 0 && addrlen >= 2 {
+        unsafe {
+            let p = addr_ptr as *const u8;
+            let family = *p; // still Linux layout here
+            if family == 1 && addrlen > 2 {
+                // AF_UNIX: print sun_path
+                let path_bytes = std::slice::from_raw_parts(p.add(2), (addrlen - 2) as usize);
+                let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                let path = String::from_utf8_lossy(&path_bytes[..end]);
+                eprintln!("fakelinux: connect(fd={}, AF_UNIX \"{}\", len={})", fd, path, addrlen);
+            }
+        }
+    }
+    let mac_addr = linux_sockaddr_to_mac_copy(addr_ptr, addrlen);
     let ret = unsafe {
         libc::connect(
             fd,
-            addr_ptr as *const libc::sockaddr,
+            &mac_addr as *const _ as *const libc::sockaddr,
             addrlen as libc::socklen_t,
         )
     };
-    mac_sockaddr_to_linux(addr_ptr, addrlen); // restore for guest
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -204,26 +244,24 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
 
 pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u32) -> u64 {
     let mac_flags = translate_msg_flags(flags);
-    if dest_addr != 0 {
-        linux_sockaddr_to_mac(dest_addr, addrlen);
-    }
+    let mac_addr = if dest_addr != 0 {
+        Some(linux_sockaddr_to_mac_copy(dest_addr, addrlen))
+    } else {
+        None
+    };
     let ret = unsafe {
         libc::sendto(
             fd,
             buf as *const libc::c_void,
             len as usize,
             mac_flags,
-            if dest_addr == 0 {
-                std::ptr::null()
-            } else {
-                dest_addr as *const libc::sockaddr
+            match &mac_addr {
+                Some(a) => a as *const _ as *const libc::sockaddr,
+                None => std::ptr::null(),
             },
             addrlen as libc::socklen_t,
         )
     };
-    if dest_addr != 0 {
-        mac_sockaddr_to_linux(dest_addr, addrlen); // restore for guest
-    }
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -416,15 +454,14 @@ fn linux_msghdr_to_mac(linux_ptr: u64) -> libc::msghdr {
 pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
     let mac_flags = translate_msg_flags(flags);
     let mut mac_msg = linux_msghdr_to_mac(msg_ptr);
-    // Translate sockaddr in msg_name if present
+    // Translate sockaddr in msg_name if present — into a local copy, the
+    // guest's buffer may be read-only (see linux_sockaddr_to_mac_copy).
+    let mut mac_addr;
     if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
-        linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+        mac_addr = linux_sockaddr_to_mac_copy(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+        mac_msg.msg_name = &mut mac_addr as *mut _ as *mut libc::c_void;
     }
     let ret = unsafe { libc::sendmsg(fd, &mac_msg, mac_flags) };
-    // Restore sockaddr for guest
-    if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
-        mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
-    }
     if ret < 0 {
         translate::linux_errno()
     } else {
@@ -471,17 +508,14 @@ pub fn do_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> u64 {
         let mmsghdr_ptr = msgvec + (i as u64) * (LINUX_MMSGHDR_SIZE as u64);
         let mut mac_msg = linux_msghdr_to_mac(mmsghdr_ptr);
 
-        // Translate sockaddr if present
+        // Translate sockaddr if present — local copy, guest buffer may be read-only
+        let mut mac_addr;
         if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
-            linux_sockaddr_to_mac(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+            mac_addr = linux_sockaddr_to_mac_copy(mac_msg.msg_name as u64, mac_msg.msg_namelen);
+            mac_msg.msg_name = &mut mac_addr as *mut _ as *mut libc::c_void;
         }
 
         let ret = unsafe { libc::sendmsg(fd, &mac_msg, mac_flags) };
-
-        // Restore sockaddr
-        if !mac_msg.msg_name.is_null() && mac_msg.msg_namelen > 0 {
-            mac_sockaddr_to_linux(mac_msg.msg_name as u64, mac_msg.msg_namelen);
-        }
 
         if ret < 0 {
             if sent == 0 {
