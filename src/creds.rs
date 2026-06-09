@@ -34,6 +34,40 @@ static CREDS: Mutex<Creds> = Mutex::new(Creds {
     groups: Vec::new(),
 });
 
+// ---- Host-id → guest-userns mapping ----
+
+/// Overflow id reported for host ids that have no mapping in our virtual
+/// user namespace (Linux `/proc/sys/kernel/overflowuid` default).
+pub const OVERFLOW_ID: u32 = 65534;
+
+/// Map a host uid/gid into the guest's view, like `unshare -r`: our own
+/// host id appears as 0 (root), every other host id as 65534 (nobody).
+/// Pure helper so it's unit-testable.
+pub fn map_host_id(host_id: u32, own_host_id: u32) -> u32 {
+    if host_id == own_host_id { 0 } else { OVERFLOW_ID }
+}
+
+/// Guest view of a host file owner uid (see `map_host_id`).
+pub fn map_host_uid(host_uid: u32) -> u32 {
+    map_host_id(host_uid, unsafe { libc::getuid() })
+}
+
+/// Guest view of a host file group gid. Any of our supplementary host
+/// groups also maps to 0 — files we create land in group staff/wheel etc.
+/// depending on the directory, and they should all look root-owned.
+pub fn map_host_gid(host_gid: u32) -> u32 {
+    if host_gid == unsafe { libc::getgid() } {
+        return 0;
+    }
+    // Check supplementary groups (cheap: NGROUPS_MAX is small).
+    let mut groups = [0 as libc::gid_t; 64];
+    let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+    if n > 0 && groups[..n as usize].contains(&host_gid) {
+        return 0;
+    }
+    OVERFLOW_ID
+}
+
 // ---- Simple getters ----
 
 pub fn do_getuid() -> u64 {
@@ -291,4 +325,31 @@ pub fn do_setgroups(size: u32, list_ptr: u64) -> u64 {
     }
     c.groups = groups;
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_host_id_own_uid_is_root() {
+        assert_eq!(map_host_id(501, 501), 0);
+    }
+
+    #[test]
+    fn map_host_id_other_uid_is_nobody() {
+        assert_eq!(map_host_id(0, 501), OVERFLOW_ID);
+        assert_eq!(map_host_id(502, 501), OVERFLOW_ID);
+    }
+
+    #[test]
+    fn map_host_uid_self_is_root() {
+        // Files owned by whoever runs the tests must appear root-owned.
+        assert_eq!(map_host_uid(unsafe { libc::getuid() }), 0);
+    }
+
+    #[test]
+    fn map_host_gid_self_is_root() {
+        assert_eq!(map_host_gid(unsafe { libc::getgid() }), 0);
+    }
 }

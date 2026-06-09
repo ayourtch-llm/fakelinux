@@ -386,8 +386,10 @@ pub fn mac_stat_to_linux(mac: &libc::stat, out: *mut u8) {
         // macOS st_mode is u16, Linux is u32
         w32(16, mac.st_mode as u32);
         w32(20, mac.st_nlink as u32);
-        w32(24, mac.st_uid);
-        w32(28, mac.st_gid);
+        // Map host ownership into the guest's virtual user namespace:
+        // our files appear root-owned (sudo/dpkg check this).
+        w32(24, crate::creds::map_host_uid(mac.st_uid));
+        w32(28, crate::creds::map_host_gid(mac.st_gid));
         w64(32, mac.st_rdev as u64);
         // __pad1 at 40 stays zero
         wi64(48, mac.st_size);
@@ -450,8 +452,8 @@ pub fn mac_stat_to_linux_statx(mac: &libc::stat, out: *mut u8) {
         w32(4, mac.st_blksize as u32);      // stx_blksize
         w64(8, 0);                            // stx_attributes
         w32(16, mac.st_nlink as u32);        // stx_nlink
-        w32(20, mac.st_uid);                  // stx_uid
-        w32(24, mac.st_gid);                  // stx_gid
+        w32(20, crate::creds::map_host_uid(mac.st_uid)); // stx_uid (userns view)
+        w32(24, crate::creds::map_host_gid(mac.st_gid)); // stx_gid (userns view)
         w16(28, mac.st_mode as u16);         // stx_mode
         w64(32, mac.st_ino);                  // stx_ino
         w64(40, mac.st_size as u64);         // stx_size
