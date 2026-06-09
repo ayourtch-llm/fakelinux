@@ -1,6 +1,39 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-09 (session 7, mid-session context refresh). Full story in `docs/diary.md`._
+_Last update: 2026-06-09 late (session 7, refresh #2). Narrative in `history.md` (NEW — keep appending for the user!), full story in `docs/diary.md`._
+
+## REFRESH #2 STATUS — read this first
+
+DONE since refresh #1 (all committed, 338 tests green):
+- **vim FULLY WORKS** (aaa62ce): gettimeofday wrote i32 tv_usec via
+  passthrough; Linux expects i64 → garbage high bytes → vim deferred all
+  redraws. User-confirmed on real terminal.
+- **python3.12 WORKS** (f7319ff): (a) lazy_reloc_pick_register in
+  trap.rs decodes faulting load/store and fixes the right register;
+  (b) fixup_exec_rodata_pointers in loader.rs — .rodata had 6094
+  unrelocated const pointers (caused 28GB mmap loop → SIGKILL);
+  (c) restore per-page prot from PT_LOAD (edge page shared with .text
+  needs EXEC). `python3.12 -c 'import sys,hashlib;…'` exit 0.
+- Debug spam gated behind FAKELINUX_TRACE (49cee40).
+- [ESC] alias committed in ../mcp-pty-server (247e02b).
+
+USER DIRECTIVES (granted FULL AUTONOMY, gone to sleep):
+1. North star: make fakelinux behave like real Linux.
+   `git clone http://gerrit.fd.io/r/vpp` then BUILD VPP inside = ultimate test.
+2. Keep appending narrative to history.md as you go.
+3. Fun side-quests: alpine minimal rootfs; install rust in ubuntu
+   container and run programs; install Claude Code in container and
+   drive it (user will give API key tomorrow).
+4. Optionally watch own screen via tttt to time /clear before compaction.
+
+NEXT (task list in TaskList tool):
+- #3 repair dpkg: dpkg --configure -a (python3.12-minimal was
+  half-configured), reinstall git, verify apt clean exit 0.
+- #4 symlink resolution through rootfs (see below).
+- #5 git clone vpp (http first; gerrit may need https → certs).
+- Then: try building VPP (will need make/gcc/cmake via apt).
+- Sweep remaining macOS-i32-vs-Linux-i64 timeval bugs: getrusage
+  (syscall.rs ~2455), wait4 rusage passthrough (thread.rs do_wait4).
 
 ## What this project is
 
