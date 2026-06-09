@@ -127,24 +127,44 @@ pub fn translate_fcntl_cmd(linux_cmd: i32) -> Option<i32> {
     }
 }
 
+/// Translate Linux flock l_type to macOS.
+/// Linux: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2 — macOS: F_RDLCK=1, F_UNLCK=2, F_WRLCK=3.
+/// Passing the value through unmapped turns a Linux write lock (1) into a macOS
+/// READ lock (1), which fails with EBADF on an O_WRONLY fd (broke lckpwdf() in
+/// groupadd/useradd during apt-get install).
+fn flock_type_linux_to_mac(l_type: i16) -> i16 {
+    match l_type {
+        0 => libc::F_RDLCK,
+        1 => libc::F_WRLCK,
+        2 => libc::F_UNLCK,
+        other => other, // unknown — let the kernel reject it
+    }
+}
+
+/// Translate macOS flock l_type back to Linux.
+fn flock_type_mac_to_linux(l_type: i16) -> i16 {
+    match l_type {
+        libc::F_RDLCK => 0,
+        libc::F_WRLCK => 1,
+        libc::F_UNLCK => 2,
+        other => other,
+    }
+}
+
 /// Translate Linux struct flock (aarch64) to macOS struct flock.
-/// Linux aarch64: { i16 l_type, i16 l_whence, i64 l_start, i64 l_len, i32 l_pid } = 28 bytes
-/// macOS:         { i64 l_start, i64 l_len, i32 l_pid, i16 l_type, i16 l_whence } = 24 bytes
+/// Linux aarch64 layout:
+/// offset 0:  i16 l_type
+/// offset 2:  i16 l_whence
+/// offset 4:  padding (4 bytes to align l_start to 8)
+/// offset 8:  i64 l_start
+/// offset 16: i64 l_len
+/// offset 24: i32 l_pid
+/// macOS: { i64 l_start, i64 l_len, i32 l_pid, i16 l_type, i16 l_whence }
 pub fn linux_flock_to_mac(linux_ptr: u64) -> libc::flock {
     unsafe {
         let p = linux_ptr as *const u8;
         let l_type = (p as *const i16).read_unaligned();
         let l_whence = (p.add(2) as *const i16).read_unaligned();
-        let l_start = (p.add(4) as *const i64).read_unaligned();    // offset 4 on aarch64 (padded)
-        let l_len = (p.add(16) as *const i64).read_unaligned();     // offset 8+8=16 — actually let me re-check
-        let l_pid = (p.add(24) as *const i32).read_unaligned();
-        // Actually Linux aarch64 struct flock layout:
-        // offset 0:  i16 l_type
-        // offset 2:  i16 l_whence
-        // offset 4:  padding (4 bytes to align l_start to 8)
-        // offset 8:  i64 l_start
-        // offset 16: i64 l_len
-        // offset 24: i32 l_pid
         let l_start = (p.add(8) as *const i64).read_unaligned();
         let l_len = (p.add(16) as *const i64).read_unaligned();
         let l_pid = (p.add(24) as *const i32).read_unaligned();
@@ -152,7 +172,7 @@ pub fn linux_flock_to_mac(linux_ptr: u64) -> libc::flock {
             l_start,
             l_len,
             l_pid,
-            l_type,
+            l_type: flock_type_linux_to_mac(l_type),
             l_whence,
         }
     }
@@ -162,7 +182,7 @@ pub fn linux_flock_to_mac(linux_ptr: u64) -> libc::flock {
 pub fn mac_flock_to_linux(mac: &libc::flock, linux_ptr: u64) {
     unsafe {
         let p = linux_ptr as *mut u8;
-        (p as *mut i16).write_unaligned(mac.l_type);
+        (p as *mut i16).write_unaligned(flock_type_mac_to_linux(mac.l_type));
         (p.add(2) as *mut i16).write_unaligned(mac.l_whence);
         // padding at offset 4-7 (zero it)
         std::ptr::write_bytes(p.add(4), 0, 4);
@@ -486,4 +506,67 @@ pub fn translate_mmap_prot(linux_prot: u64) -> i32 {
     if linux_prot & 2 != 0 { p |= libc::PROT_WRITE; }
     if linux_prot & 4 != 0 { p |= libc::PROT_EXEC; }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Linux aarch64 struct flock buffer.
+    fn linux_flock_buf(l_type: i16, l_whence: i16, l_start: i64, l_len: i64) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..2].copy_from_slice(&l_type.to_le_bytes());
+        buf[2..4].copy_from_slice(&l_whence.to_le_bytes());
+        buf[8..16].copy_from_slice(&l_start.to_le_bytes());
+        buf[16..24].copy_from_slice(&l_len.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_flock_l_type_linux_to_mac() {
+        // Linux: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2
+        // macOS: F_RDLCK=1, F_UNLCK=2, F_WRLCK=3
+        // groupadd's lckpwdf() write-lock (Linux F_WRLCK=1) must become macOS
+        // F_WRLCK=3 — passing 1 through means F_RDLCK on an O_WRONLY fd → EBADF.
+        let cases: &[(i16, i16)] = &[
+            (0, libc::F_RDLCK),
+            (1, libc::F_WRLCK),
+            (2, libc::F_UNLCK),
+        ];
+        for &(linux_ty, mac_ty) in cases {
+            let buf = linux_flock_buf(linux_ty, 0, 0, 0);
+            let mac = linux_flock_to_mac(buf.as_ptr() as u64);
+            assert_eq!(mac.l_type, mac_ty,
+                "Linux l_type {} must map to macOS {}", linux_ty, mac_ty);
+        }
+    }
+
+    #[test]
+    fn test_flock_l_type_mac_to_linux() {
+        let cases: &[(i16, i16)] = &[
+            (libc::F_RDLCK, 0),
+            (libc::F_WRLCK, 1),
+            (libc::F_UNLCK, 2),
+        ];
+        for &(mac_ty, linux_ty) in cases {
+            let mac = libc::flock { l_start: 5, l_len: 10, l_pid: 42, l_type: mac_ty, l_whence: 0 };
+            let mut buf = [0u8; 32];
+            mac_flock_to_linux(&mac, buf.as_mut_ptr() as u64);
+            let got = i16::from_le_bytes([buf[0], buf[1]]);
+            assert_eq!(got, linux_ty,
+                "macOS l_type {} must map back to Linux {}", mac_ty, linux_ty);
+            assert_eq!(i64::from_le_bytes(buf[8..16].try_into().unwrap()), 5);
+            assert_eq!(i64::from_le_bytes(buf[16..24].try_into().unwrap()), 10);
+            assert_eq!(i32::from_le_bytes(buf[24..28].try_into().unwrap()), 42);
+        }
+    }
+
+    #[test]
+    fn test_flock_fields_roundtrip() {
+        let buf = linux_flock_buf(1, 0, 1234, 5678);
+        let mac = linux_flock_to_mac(buf.as_ptr() as u64);
+        assert_eq!(mac.l_start, 1234);
+        assert_eq!(mac.l_len, 5678);
+        assert_eq!(mac.l_whence, 0);
+    }
 }
