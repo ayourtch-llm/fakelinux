@@ -784,9 +784,12 @@ extern "C" fn fork_trampoline_entry() -> ! {
             do_set_tid_address(child_tid_ptr);
         }
 
-        // Enable SVC tracing for first SVCs in the fork child
-        crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
-        crate::trap::FORK_TRAP_COUNT.store(50, std::sync::atomic::Ordering::Relaxed);
+        // Enable SVC tracing for first SVCs in the fork child — diagnostic
+        // for the (fixed) nested-fork race; only under FAKELINUX_TRACE.
+        if crate::syscall::trace_enabled() {
+            crate::trap::FORK_SVC_COUNT.store(10, std::sync::atomic::Ordering::Relaxed);
+            crate::trap::FORK_TRAP_COUNT.store(50, std::sync::atomic::Ordering::Relaxed);
+        }
         // Store canary address/value for verification during FORK_TRAP logging
         crate::trap::FORK_CANARY_ADDR.store(canary_addr, std::sync::atomic::Ordering::Relaxed);
         crate::trap::FORK_CANARY_SAVED.store(saved_canary, std::sync::atomic::Ordering::Relaxed);
@@ -920,7 +923,7 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
     let rusage = if rusage_ptr != 0 { rusage_ptr as *mut libc::rusage } else { std::ptr::null_mut() };
 
     let ret = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
-    if ret > 0 && wstatus_ptr != 0 {
+    if crate::syscall::trace_enabled() && ret > 0 && wstatus_ptr != 0 {
         unsafe {
             let s = status;
             let msg = format!("fakelinux: wait4 pid={} status={:#x} signaled={} sig={}\n",

@@ -2020,7 +2020,7 @@ unsafe extern "C" fn trap_handler(
         LAST_SVC_PC.store(pc, Ordering::Relaxed);
 
         // Trace all SVCs from fork children (including worker threads)
-        if crate::thread::is_fork_child() {
+        if crate::syscall::trace_enabled() && crate::thread::is_fork_child() {
             let pid = libc::getpid();
             let tid = libc::pthread_self() as u64;
             let mut buf = [0u8; 160];
