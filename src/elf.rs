@@ -448,10 +448,45 @@ pub fn find_code_ranges_from_eh_frame(data: &[u8], base_addr: u64) -> Vec<(u64, 
         }
     }
 
-    // Strategy 2: find .eh_frame via PT_GNU_EH_FRAME program header
-    // This points to .eh_frame_hdr, which contains a pointer to .eh_frame.
-    // We'd need to parse .eh_frame_hdr to find .eh_frame — more complex.
-    // For now, return empty and let the caller fall back.
+    // Strategy 2: find .eh_frame via PT_GNU_EH_FRAME program header.
+    // Section headers are NOT mapped at runtime (they live at the end of the
+    // file), but .eh_frame_hdr is in a LOAD segment and points to .eh_frame.
+    // This is the path taken for libraries mmap'd by the guest ld.so.
+    const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
+    for i in 0..e_phnum {
+        let off = e_phoff + i * e_phentsize;
+        if off + 56 > data.len() { break; }
+        if read_u32(data, off) != PT_GNU_EH_FRAME { continue; }
+        let p_vaddr = read_u64(data, off + 16);
+        let p_filesz = read_u64(data, off + 32);
+
+        // Offset of .eh_frame_hdr within `data` (mapping starts at first LOAD)
+        let hdr_off = p_vaddr.wrapping_sub(first_load_vaddr) as usize;
+        if p_filesz < 8 || hdr_off + 8 > data.len() { break; }
+
+        // .eh_frame_hdr: version(u8), eh_frame_ptr_enc(u8), fde_count_enc(u8),
+        // table_enc(u8), eh_frame_ptr(encoded), fde_count(encoded), table...
+        if data[hdr_off] != 1 { break; } // unknown version
+        let eh_frame_ptr_enc = data[hdr_off + 1];
+
+        // The eh_frame_ptr field starts at hdr_off+4; pcrel encodings are
+        // relative to the field's absolute mapped address.
+        let field_abs = base_addr + (hdr_off as u64 + 4);
+        if let Some((eh_frame_abs, _)) =
+            read_encoded_ptr(data, hdr_off + 4, eh_frame_ptr_enc, field_abs)
+        {
+            let eh_off = eh_frame_abs.wrapping_sub(base_addr) as usize;
+            if eh_off < data.len() {
+                // No length available — parse_eh_frame_ranges stops at the
+                // zero-length terminator entry (or end of slice).
+                let eh_data = &data[eh_off..];
+                let eh_vaddr = first_load_vaddr + eh_off as u64;
+                return parse_eh_frame_ranges(eh_data, eh_vaddr, load_base);
+            }
+        }
+        break;
+    }
+
     Vec::new()
 }
 
@@ -571,5 +606,45 @@ mod tests {
         });
         assert!(!in_range,
             "SHA-256 K table at 0x{:x} should be in a gap (not covered by any FDE)", sha_k_addr);
+    }
+
+    #[test]
+    fn test_eh_frame_from_runtime_memory_view_libnettle() {
+        // When ld.so mmaps a library, only the LOAD segments are mapped —
+        // section headers (at end of file) are NOT available. patch_new_code
+        // sees just the R-X LOAD. find_code_ranges_from_eh_frame must then
+        // locate .eh_frame via PT_GNU_EH_FRAME (.eh_frame_hdr), which IS mapped.
+        //
+        // Regression: without this, code ranges fell back to "whole exec
+        // segment", and x18 false-positive patches corrupted nettle's
+        // SHA-256/512 K constant tables in .rodata (same R-X LOAD) —
+        // breaking every gnutls TLS handshake ("Decryption has failed").
+        let path = "ubuntu-rootfs/usr/lib/aarch64-linux-gnu/libnettle.so.8.8";
+        let mut data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => { eprintln!("skipping test: {} not found", path); return; }
+        };
+        // Simulate the runtime view: truncate at the R-X LOAD's filesz
+        // (0x4f978) so section headers are absent.
+        data.truncate(0x4f978);
+
+        let ranges = find_code_ranges_from_eh_frame(&data, 0);
+        assert!(!ranges.is_empty(),
+            "PT_GNU_EH_FRAME fallback should find FDE ranges without section headers");
+
+        // _nettle_sha256_compress's K table lives at 0x40518 (.rodata).
+        // It must be in a gap — never inside a patchable code range.
+        let k_table = 0x40518u64;
+        let in_range = ranges.iter().any(|&(start, len)| {
+            k_table >= start && k_table < start + len
+        });
+        assert!(!in_range,
+            "nettle SHA-256 K table at {:#x} must not be covered by code ranges", k_table);
+
+        // Sanity: ranges should match the file-based (section header) parse.
+        let full = std::fs::read(path).unwrap();
+        let ranges_full = find_code_ranges_from_eh_frame(&full, 0);
+        assert_eq!(ranges, ranges_full,
+            "memory-view ranges should equal section-header-view ranges");
     }
 }
