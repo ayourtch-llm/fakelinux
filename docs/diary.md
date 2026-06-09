@@ -1532,3 +1532,86 @@ install` which fork+exec's dpkg subprocesses that use libcrypto.
 **Ubuntu vs Debian**: Ubuntu 24.04 is all PIE (ET_DYN) — no ET_EXEC
 relocation issues. Debian sid Python 3.13 is ET_EXEC (non-PIE) and
 hits the fundamental PAGEZERO limitation. Focus on Ubuntu for now.
+
+## 2026-06-09 (session 6) — apt-get install vim FIXED: four root causes
+
+**Goal achieved**: `apt-get install vim` and `apt-get install less` now
+complete end-to-end on ubuntu-rootfs — download, unpack, postinst
+(addgroup/adduser/useradd), configure — zero crashes.
+
+### Root cause #1: macOS kernel zeroes hw x18 mid-trampoline
+
+The handoff's x18=0 crash (`STR W3,[X18]` faulting with hw x18=0 while
+TSD held the correct pointer) was NOT a TSD propagation bug. New crash
+diagnostics (island lookup: decode the trampoline's trailing `B` to
+recover guest_orig_pc) located the faulting instruction inside
+trampoline #810, belonging to liblzma's match finder (offset 0x1397c).
+gcc on aarch64-linux uses x18 (and x30!) as ordinary scratch registers —
+this also explains the X30_BECAME_HEAP red herring.
+
+The old trampoline loaded guest x18 into the HARDWARE x18 register
+(slot 3) and executed the original instruction (slot 6). The macOS
+kernel zeroes x18 on every interrupt/context switch — a preemption in
+that 3-instruction window silently zeroed it. The hot match-finder loop
+ran the trampoline millions of times, so the window eventually got hit
+(always the hottest trampoline → looked deterministic).
+
+**Fix**: rewrite the original instruction's x18 register fields to x17
+(`decoder::substitute_gpr`, driven by the XML-generated gpr_lsbs table)
+and carry the guest value in x17, which the kernel preserves. Hardware
+x18 never holds the guest value. Trampoline shrank 13→10 instructions.
+
+Also added an instruction-class filter: PC-relative (ADR/ADRP, load
+literal), branches (CBZ/TBZ, BR/BLR/RET) and exclusives now fall back
+to UDF emulation — previously they would have been miscompiled if
+executed in an island (latent bug, found by inspection).
+
+### Root cause #2: guest x18 not saved across guest signal delivery
+
+build_sigframe_and_redirect saved mctx x[18] (macOS hw x18 = junk), not
+the guest TSD x18; sigreturn never restored TSD. A guest handler using
+x18 clobbered the interrupted code's x18. Fixed: sigframe x18 slot now
+carries get_thread_x18(), and rt_sigreturn does set_thread_x18().
+
+### Root cause #3: fcntl POSIX lock l_type not translated
+
+`apt-get install vim` then failed in uuid-runtime's postinst: addgroup
+exit 82. groupadd's lckpwdf() → fcntl(F_SETLKW) returned EBADF: Linux
+F_WRLCK=1 was passed through as macOS F_RDLCK=1 — a READ lock on an
+O_WRONLY fd. Fixed l_type mapping both directions (Linux 0/1/2 ↔ macOS
+F_RDLCK=1/F_WRLCK=3/F_UNLCK=2) with TDD tests.
+
+### Root cause #4: sockaddr mutated in place → infinite fault loop
+
+useradd then hung at 100% CPU "inside connect(/dev/log)". The SIGSEGV
+self-dump trick (kill -SEGV) produced nothing → all signals blocked →
+spin inside the trap handler. Raw-write bisection: the spin was BEFORE
+libc::connect — in linux_sockaddr_to_mac, which rewrites the first two
+bytes of the guest's sockaddr IN PLACE. glibc syslog passes a static
+const sockaddr_un in RODATA; the store faulted, SIGSEGV was blocked
+(trap context = sigfillset), and macOS re-executed the faulting store
+forever. Fixed: connect/bind/sendto/sendmsg/sendmmsg now copy the guest
+sockaddr into a local sockaddr_storage (linux_sockaddr_to_mac_copy);
+guest memory is never written for inbound addresses.
+
+### Debugging-process notes
+
+- Stale CURRENT_X18_INSTR ("emulating x18 instr=...") in crash dumps
+  was a red herring (never cleared after successful emulation). Now
+  cleared. The crash dump also prints trampoline island/idx/orig_pc.
+- FAKELINUX_TRACE_MMAP now also logs file-backed mmaps (with fd path
+  via F_GETPATH) and mprotect calls.
+- Stale /etc/group.lock files (leaked by SIGKILLed runs, containing
+  vpid "1") can never be reclaimed by shadow's liveness check, since
+  vpid 1 always exists. Same semantics as real Linux pid 1 — clean
+  the rootfs locks when a run is killed mid-postinst.
+- itimerval note: macOS tv_usec is i32 (Linux i64) — identical bytes
+  for usec=0; could matter someday for nonzero usec values.
+
+### Validation
+
+- cargo test: 311 passed, 0 failed (new: substitute_gpr ×6,
+  trampoline structural/functional ×4, flock l_type ×3)
+- `apt-get install -y vim` → vim ii, runs (was: SIGSEGV in dpkg child)
+- `dpkg --configure -a` → uuid-runtime ii (group/user created)
+- fresh `apt-get install -y less` → exit 0, zero SIGSEGV/SIGBUS, runs

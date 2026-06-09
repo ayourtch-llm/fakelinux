@@ -1934,6 +1934,20 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
         // Set final permissions (anonymous pages — mprotect is safe)
         unsafe { libc::mprotect(result_addr as *mut _, length as usize, mac_prot); }
 
+        if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
+            let pid = unsafe { libc::getpid() };
+            let mut pathbuf = [0u8; 1024];
+            let path = if unsafe { libc::fcntl(fd, libc::F_GETPATH, pathbuf.as_mut_ptr()) } == 0 {
+                let len = pathbuf.iter().position(|&b| b == 0).unwrap_or(0);
+                std::str::from_utf8(&pathbuf[..len]).unwrap_or("?").to_string()
+            } else {
+                String::from("?")
+            };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] MMAP file fd={} addr={:#x} len={:#x} prot={} flags={:#x} off={:#x} → {:#x}..{:#x} path={}\n",
+                pid, fd, addr, length, prot, flags, offset, result_addr, result_addr + length, path));
+        }
+
         return result_addr;
     }
 
@@ -2005,6 +2019,13 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
     let has_exec = prot & 4 != 0; // PROT_EXEC
+
+    if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] MPROTECT addr={:#x} len={:#x} prot={}\n",
+            pid, addr, len, prot));
+    }
 
     // macOS requires 16KB page alignment; Linux guests use 4KB.
     // Only protect fully-covered 16KB pages to avoid making adjacent
