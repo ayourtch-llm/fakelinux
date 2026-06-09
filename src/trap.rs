@@ -180,17 +180,22 @@ static X18_KEY: AtomicU64 = AtomicU64::new(0);
 /// Whether init_x18_key() has been called.
 static X18_KEY_INIT: AtomicBool = AtomicBool::new(false);
 
-/// Initialize the pthread key for per-thread x18. Call once at startup.
+/// Initialize the pthread key for per-thread x18. Idempotent; called once at
+/// startup (and freely from tests).
 pub fn init_x18_key() {
-    let mut key: libc::pthread_key_t = 0;
-    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
-    if ret != 0 {
-        panic!("pthread_key_create for x18 failed: {}", ret);
-    }
-    X18_KEY.store(key as u64, Ordering::SeqCst);
-    X18_KEY_INIT.store(true, Ordering::SeqCst);
-    // Tell the trampoline system the TSD byte offset
-    crate::x18_trampoline::set_tsd_offset(key as u32 * 8);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut key: libc::pthread_key_t = 0;
+        let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+        if ret != 0 {
+            panic!("pthread_key_create for x18 failed: {}", ret);
+        }
+        X18_KEY.store(key as u64, Ordering::SeqCst);
+        // Tell the trampoline system the TSD byte offset BEFORE marking
+        // initialized, so concurrent readers never see a half-initialized state.
+        crate::x18_trampoline::set_tsd_offset(key as u32 * 8);
+        X18_KEY_INIT.store(true, Ordering::SeqCst);
+    });
 }
 
 /// Set the per-thread guest x18 value.
@@ -1928,6 +1933,10 @@ unsafe extern "C" fn trap_handler(
                     }
                     // Only advance PC if the emulator didn't set it (e.g. CBZ/CBNZ set PC directly)
                     if mctx.ss.pc == pc { mctx.ss.pc = pc + 4; }
+                    // Clear the crash-diagnostic marker: emulation completed, so a
+                    // later crash dump must not report this instruction as
+                    // "currently being emulated" (stale values misled debugging).
+                    unsafe { CURRENT_X18_INSTR = 0; CURRENT_X18_PC = 0; }
                     IN_TRAP.store(false, Ordering::SeqCst);
                     crate::signal::deliver_pending_to_guest(mctx);
                     return;
@@ -2309,6 +2318,22 @@ unsafe extern "C" fn crash_handler(
         regs.fp, regs.sp, regs.lr, guest_tpidr
     ));
     libc::write(2, buf.as_ptr() as *const _, n);
+    // If the faulting PC is inside an x18 trampoline island, identify which
+    // guest instruction the trampoline belongs to.
+    if let Some((island, idx, off, orig_pc)) = crate::x18_trampoline::find_trampoline_for_pc(regs.pc) {
+        // Read the guest instructions around orig_pc for context (safe read).
+        let mut around = [0u32; 4]; // orig_pc-8 .. orig_pc+4
+        let mut out_size: libc::vm_size_t = 0;
+        let _ = mach_vm_read_overwrite(
+            mach_task_self(), orig_pc.wrapping_sub(8), 16,
+            around.as_mut_ptr() as u64, &mut out_size);
+        let mut buf3 = [0u8; 256];
+        let n3 = raw_fmt(&mut buf3, format_args!(
+            "  pc in trampoline island={:#x} idx={} off={} guest_orig_pc={:#x}\n  guest code around: {:#010x} {:#010x} [{:#010x}] {:#010x}\n",
+            island, idx, off, orig_pc, around[0], around[1], around[2], around[3]
+        ));
+        libc::write(2, buf3.as_ptr() as *const _, n3);
+    }
     // If we were emulating an x18 instruction, print it
     let x18_instr = CURRENT_X18_INSTR;
     let x18_pc = CURRENT_X18_PC;

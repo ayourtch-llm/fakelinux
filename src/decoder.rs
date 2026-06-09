@@ -114,6 +114,33 @@ pub fn references_x18(instr: u32) -> bool {
     false
 }
 
+/// Rewrite every GPR register field equal to `from` to `to`.
+///
+/// Uses the same generated table as `references_x18()`, so only fields that
+/// are actual GPR operands are touched — immediates and SIMD register fields
+/// that happen to contain the same bit pattern are left alone.
+///
+/// Returns `None` if the instruction is not in the table (unknown encoding —
+/// caller must fall back to UDF emulation rather than guessing).
+pub fn substitute_gpr(instr: u32, from: u32, to: u32) -> Option<u32> {
+    debug_assert!(from < 32 && to < 32);
+    for entry in GEN_TABLE {
+        if (instr & entry.mask) == entry.value {
+            let mut out = instr;
+            for &lsb in &entry.gpr_lsbs {
+                if lsb == 0xFF {
+                    break;
+                }
+                if ((out >> lsb) & 0x1F) == from {
+                    out = (out & !(0x1F << lsb)) | (to << lsb);
+                }
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// Decode an instruction's emulation class.
 ///
 /// Returns the `EmulClass` for dispatch to the appropriate emulation handler.
@@ -151,6 +178,69 @@ mod tests {
     fn test_references_x18_skeleton_exists() {
         let result = references_x18(0xD503201F);
         assert!(matches!(result, true | false));
+    }
+
+    // ─── substitute_gpr tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_substitute_gpr_str_base() {
+        // STR W3, [X18] → STR W3, [X17]  (the liblzma apt-get crash instruction)
+        let out = substitute_gpr(0xb9000243, 18, 17).unwrap();
+        assert_eq!(out, 0xb9000223, "Rn 18→17");
+        assert!(!references_x18(out));
+    }
+
+    #[test]
+    fn test_substitute_gpr_multiple_fields() {
+        // ADD x18, x18, x21, LSL #2 — both Rd and Rn are x18
+        let out = substitute_gpr(0x8b354252, 18, 17).unwrap();
+        assert!(!references_x18(out), "all x18 fields must be rewritten: {:#010x}", out);
+        // Rd and Rn now 17, Rm still 21
+        assert_eq!(out & 0x1F, 17);
+        assert_eq!((out >> 5) & 0x1F, 17);
+        assert_eq!((out >> 16) & 0x1F, 21);
+    }
+
+    #[test]
+    fn test_substitute_gpr_mov_rm_field() {
+        // MOV x30, x18 = ORR x30, xzr, x18 (Rm=18)
+        let out = substitute_gpr(0xaa1203fe, 18, 17).unwrap();
+        assert_eq!(out, 0xaa1103fe);
+    }
+
+    #[test]
+    fn test_substitute_gpr_leaves_immediates_alone() {
+        // CBZ w18: imm19 bits must not be touched, only Rt
+        let instr = 0x34005372;
+        let out = substitute_gpr(instr, 18, 17).unwrap();
+        assert_eq!(out & 0x1F, 17, "Rt rewritten");
+        assert_eq!(out >> 5, instr >> 5, "imm19/opcode untouched");
+    }
+
+    #[test]
+    fn test_substitute_gpr_simd_vt_not_touched() {
+        // SIMD Vt=18 is not a GPR — must not be rewritten
+        let instr = 0x0c402032;
+        if let Some(out) = substitute_gpr(instr, 18, 17) {
+            assert_eq!(out, instr, "SIMD Vt field must not be substituted");
+        }
+    }
+
+    #[test]
+    fn test_substitute_gpr_removes_x18_from_corpus() {
+        // Every x18-referencing instruction in the libpython corpus must come
+        // back x18-free after substitution (or be unknown → None).
+        let corpus: &[u32] = &[
+            0x8b354252, 0xb9000243, 0xaa1203fe, 0x91001252, 0x8b1200b2,
+            0xf9400252, 0xd2800012, 0x9a810240, 0x927df252, 0xa9124bf2,
+        ];
+        for &instr in corpus {
+            assert!(references_x18(instr), "corpus precondition: {:#010x}", instr);
+            let out = substitute_gpr(instr, 18, 17)
+                .unwrap_or_else(|| panic!("substitute_gpr unknown encoding {:#010x}", instr));
+            assert!(!references_x18(out),
+                "x18 must be gone after substitution: {:#010x} → {:#010x}", instr, out);
+        }
     }
 
     // ─── EmulClass decode tests ──────────────────────────────────────────

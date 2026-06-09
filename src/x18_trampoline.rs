@@ -2,8 +2,13 @@
 //! for ~100x speedup on x18-touching instructions.
 //!
 //! Each x18 instruction is replaced with `B <trampoline>`. The trampoline
-//! swaps the guest x18 value in, runs the original instruction natively,
-//! swaps back, and branches to the next instruction.
+//! loads the guest x18 value into x17, runs the original instruction with
+//! its x18 fields rewritten to x17, stores x17 back, and branches to the
+//! next instruction.
+//!
+//! The guest value is carried in x17 (NOT hardware x18) because the macOS
+//! kernel zeroes x18 on interrupts/context switches — a value held in hw
+//! x18 across even a couple of instructions can silently become 0.
 //!
 //! Guest x18 is stored per-thread using macOS's thread-specific data (TSD)
 //! accessed via `MRS TPIDRRO_EL0` + a fixed offset. This is correct for
@@ -69,6 +74,9 @@ fn encode_adrp(rd: u32, pc: u64, target_page: u64) -> Option<u32> {
 
 const PAGE_SIZE: usize = 16384;
 
+/// Number of instructions per trampoline (fixed-size slots in the island).
+const TRAMP_INSTRS: usize = 10;
+
 struct CodeIsland {
     base: u64,
     capacity: usize,
@@ -102,28 +110,38 @@ impl CodeIsland {
     }
 
     /// Emit one trampoline. Returns trampoline address or None if full/out-of-range.
+    ///
+    /// CRITICAL: the guest x18 value must NEVER be held in the hardware x18
+    /// register. The macOS kernel zeroes/clobbers x18 on any interrupt or
+    /// context switch, so a value placed in hw x18 can silently become 0
+    /// between two instructions (this caused the apt-get install SIGSEGV in
+    /// liblzma's match finder: `str w3, [x18]` faulted with x18=0 while the
+    /// TSD slot still held the correct pointer). Instead, the original
+    /// instruction is rewritten to use x17 in place of x18.
     fn emit(&mut self, orig_pc: u64, orig_instr: u32) -> Option<u64> {
-        // 13 instructions x 4 bytes = 52 bytes per trampoline
+        // Rewrite all x18 register fields to x17. Instructions that already
+        // use x16/x17 are rejected by the caller, so x17 is free here.
+        let subst_instr = crate::decoder::substitute_gpr(orig_instr, 18, 17)?;
+
+        // TRAMP_INSTRS instructions x 4 bytes per trampoline
         //
         // Saves/restores x16 and x17 via the stack so hand-written assembly
         // (like libgcrypt's crypto routines) that uses x16/x17 as temporaries
-        // is not corrupted. SP is restored before the original instruction.
+        // is not corrupted. SP is restored before the rewritten instruction
+        // executes, in case it references SP.
         //
         // Per-thread x18 is accessed via MRS TPIDRRO_EL0 + TSD offset:
         //  0: stp x16, x17, [sp, #-32]! ; push frame: [sp]=x16, [sp+8]=x17
-        //  1: str x18, [sp, #16]         ; [sp+16] = macOS x18
-        //  2: mrs x16, tpidrro_el0       ; get thread-local base
-        //  3: ldr x18, [x16, #(key*8)]   ; x18 = per-thread guest x18
-        //  4: ldp x16, x17, [sp]         ; restore x16/x17
-        //  5: add sp, sp, #32            ; restore SP for the original instruction
-        //  6: <original instruction>      ; x16/x17/SP all correct, x18 = guest
-        //  7: sub sp, sp, #32            ; re-lower SP to access our frame
-        //  8: mrs x16, tpidrro_el0       ; get thread-local base again
-        //  9: str x18, [x16, #(key*8)]   ; save per-thread guest x18
-        // 10: ldr x18, [sp, #16]         ; restore macOS x18
-        // 11: ldp x16, x17, [sp], #32    ; restore x16/x17; sp += 32
-        // 12: b <return_pc>
-        let size = 13 * 4;
+        //  1: mrs x16, tpidrro_el0       ; get thread-local base
+        //  2: ldr x17, [x16, #(key*8)]   ; x17 = per-thread guest x18
+        //  3: add sp, sp, #32            ; restore SP for the instruction
+        //  4: <instr with x18→x17>        ; x17 = guest x18, SP correct
+        //  5: sub sp, sp, #32            ; re-lower SP to access our frame
+        //  6: mrs x16, tpidrro_el0       ; get thread-local base again
+        //  7: str x17, [x16, #(key*8)]   ; save per-thread guest x18
+        //  8: ldp x16, x17, [sp], #32    ; restore x16/x17; sp += 32
+        //  9: b <return_pc>
+        let size = TRAMP_INSTRS * 4;
         if self.used + size > self.capacity { return None; }
 
         let tramp_pc = self.base + self.used as u64;
@@ -131,23 +149,20 @@ impl CodeIsland {
         let tsd_off = TSD_BYTE_OFFSET.load(Ordering::Relaxed);
         assert!(tsd_off != 0, "TSD_BYTE_OFFSET not initialized before emitting trampoline");
 
-        let b_back = encode_b(tramp_pc + 12*4, return_pc)?;
+        let b_back = encode_b(tramp_pc + (TRAMP_INSTRS as u64 - 1)*4, return_pc)?;
 
         // MRS x16, TPIDRRO_EL0 = 0xD53BD060 | Rt, Rt=16 → 0xD53BD070
         const MRS_X16_TPIDRRO: u32 = 0xD53BD070;
 
-        let instrs: [u32; 13] = [
+        let instrs: [u32; TRAMP_INSTRS] = [
             0xA9BE_47F0,                               // stp x16, x17, [sp, #-32]!
-            0xF900_0BF2,                               // str x18, [sp, #16]
             MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
-            encode_ldr_unsigned(18, 16, tsd_off),       // ldr x18, [x16, #(key*8)]
-            0xA940_47F0,                               // ldp x16, x17, [sp]
+            encode_ldr_unsigned(17, 16, tsd_off),       // ldr x17, [x16, #(key*8)]
             0x9100_83FF,                               // add sp, sp, #32
-            orig_instr,                                 // original instruction
+            subst_instr,                                // original instr, x18→x17
             0xD100_83FF,                               // sub sp, sp, #32
             MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
-            encode_str_unsigned(18, 16, tsd_off),       // str x18, [x16, #(key*8)]
-            0xF940_0BF2,                               // ldr x18, [sp, #16]
+            encode_str_unsigned(17, 16, tsd_off),       // str x17, [x16, #(key*8)]
             0xA8C2_47F0,                               // ldp x16, x17, [sp], #32
             b_back,                                     // b <return>
         ];
@@ -192,6 +207,33 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
 
     // Skip if instruction also references x16 or x17 (our scratch regs)
     if uses_x16_or_x17(instr) {
+        FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    // Skip instruction classes that cannot execute at a different PC or
+    // whose control flow would escape the trampoline:
+    //  - PcRelAddr (ADR/ADRP), LoadLiteral: PC-relative, wrong result in island
+    //  - CompareBranch/TestBranch (CBZ/TBZ): branch target relative to island
+    //  - LoadStoreExclusive: trampoline memory accesses clear the monitor → livelock
+    //  - Other: includes BR/BLR/RET x18 (control flow escapes the island)
+    use crate::decoder::EmulClass;
+    match crate::decoder::decode_emul_class(instr) {
+        EmulClass::PcRelAddr
+        | EmulClass::LoadLiteral
+        | EmulClass::CompareBranch
+        | EmulClass::TestBranch
+        | EmulClass::LoadStoreExclusive
+        | EmulClass::Other => {
+            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        _ => {}
+    }
+
+    // Verify the instruction's encoding is known so x18→x17 substitution will
+    // succeed in emit(); unknown encodings fall back to UDF emulation.
+    if crate::decoder::substitute_gpr(instr, 18, 17).is_none() {
         FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -241,6 +283,39 @@ pub fn flush_all_islands() {
     }
 }
 
+/// If `pc` lies inside a trampoline island, return
+/// (island_base, tramp_index, offset_within_trampoline, guest_orig_pc).
+/// guest_orig_pc is recovered from the trailing `B <return_pc>` of the
+/// trampoline: orig_pc = return_pc - 4.
+///
+/// Async-signal-safe-ish: uses try_lock so it can be called from a crash
+/// handler without deadlocking if the lock is held.
+pub fn find_trampoline_for_pc(pc: u64) -> Option<(u64, u64, u64, u64)> {
+    const TRAMP_SIZE: u64 = TRAMP_INSTRS as u64 * 4;
+    const B_SLOT_OFF: u64 = (TRAMP_INSTRS as u64 - 1) * 4;
+    let islands = ISLANDS.try_lock().ok()?;
+    for island in islands.iter() {
+        if pc >= island.base && pc < island.base + island.used as u64 {
+            let delta = pc - island.base;
+            let idx = delta / TRAMP_SIZE;
+            let off = delta % TRAMP_SIZE;
+            let tramp_base = island.base + idx * TRAMP_SIZE;
+            // Trailing B is the last instruction slot
+            let b_instr = unsafe { ((tramp_base + B_SLOT_OFF) as *const u32).read() };
+            let orig_pc = if b_instr & 0xFC00_0000 == 0x1400_0000 {
+                let imm26 = (b_instr & 0x03FF_FFFF) as i64;
+                let imm = (imm26 << 38) >> 38; // sign-extend 26 bits
+                let return_pc = (tramp_base + B_SLOT_OFF).wrapping_add((imm * 4) as u64);
+                return_pc.wrapping_sub(4)
+            } else {
+                0
+            };
+            return Some((island.base, idx, off, orig_pc));
+        }
+    }
+    None
+}
+
 /// Check if instruction references x16 or x17 in any GPR field.
 fn uses_x16_or_x17(instr: u32) -> bool {
     // Check common 5-bit GPR fields: Rd(0), Rn(5), Rm(16), Ra(10)
@@ -251,4 +326,120 @@ fn uses_x16_or_x17(instr: u32) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Allocate a writable page with guest-like code, mirroring how fakelinux
+    /// maps guest text: anonymous RW (patched while writable), then RX.
+    fn alloc_code_page(instrs: &[u32]) -> u64 {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1, 0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        unsafe {
+            let p = ptr as *mut u32;
+            for (i, &ins) in instrs.iter().enumerate() {
+                p.add(i).write(ins);
+            }
+        }
+        ptr as u64
+    }
+
+    /// Flip a code page to RX and flush icache, like the loader does after patching.
+    fn make_executable(addr: u64) {
+        unsafe {
+            libc::mprotect(addr as *mut _, PAGE_SIZE, libc::PROT_READ | libc::PROT_EXEC);
+            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+            sys_icache_invalidate(addr as *mut _, PAGE_SIZE);
+        }
+    }
+
+    /// The emitted trampoline must NEVER reference hardware x18: the macOS
+    /// kernel zeroes x18 on interrupts/context switches, so any guest value
+    /// held in hw x18 can silently become 0 mid-trampoline. This is the
+    /// regression test for the apt-get install SIGSEGV in liblzma.
+    #[test]
+    fn test_trampoline_never_holds_guest_value_in_x18() {
+        crate::trap::init_x18_key();
+        // STR W3, [X18] — the exact crashing instruction
+        let code = alloc_code_page(&[0xb9000243, 0xD65F03C0 /* ret */]);
+        assert!(patch_x18_with_trampoline(code, 0xb9000243), "patch should succeed");
+
+        // Follow the B to the trampoline and inspect every instruction.
+        let b = unsafe { (code as *const u32).read() };
+        assert_eq!(b & 0xFC00_0000, 0x1400_0000, "patched site must be a B");
+        let imm = (((b & 0x03FF_FFFF) as i64) << 38) >> 38;
+        let tramp = code.wrapping_add((imm * 4) as u64);
+        for i in 0..TRAMP_INSTRS {
+            let ins = unsafe { ((tramp + i as u64 * 4) as *const u32).read() };
+            // No instruction in the trampoline may use x18 as a GPR operand
+            // (the trailing B has no GPR fields; MRS targets x16).
+            assert!(!crate::decoder::references_x18(ins),
+                "trampoline slot {} references x18: {:#010x}", i, ins);
+        }
+    }
+
+    /// End-to-end: execute a trampolined `STR W3, [X18]` and verify it stores
+    /// through the guest x18 (TSD) pointer.
+    #[test]
+    fn test_trampoline_str_through_guest_x18() {
+        crate::trap::init_x18_key();
+        let code = alloc_code_page(&[0xb9000243, 0xD65F03C0 /* ret */]);
+        assert!(patch_x18_with_trampoline(code, 0xb9000243));
+        make_executable(code);
+        flush_all_islands();
+
+        let mut target: u32 = 0;
+        crate::trap::set_thread_x18(&mut target as *mut u32 as u64);
+        let f: extern "C" fn(u64, u64, u64, u64) =
+            unsafe { std::mem::transmute(code) };
+        f(0, 0, 0, 0xCAFE_F00D); // x3 = value to store
+        assert_eq!(target, 0xCAFE_F00D, "STR W3,[X18] must store via guest x18");
+        assert_eq!(crate::trap::get_thread_x18(), &mut target as *mut u32 as u64,
+            "guest x18 unchanged by a store");
+    }
+
+    /// End-to-end: a trampolined instruction that WRITES x18 must update TSD.
+    #[test]
+    fn test_trampoline_writes_back_guest_x18() {
+        crate::trap::init_x18_key();
+        // ADD x18, x18, #4 ; RET
+        let code = alloc_code_page(&[0x91001252, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code, 0x91001252));
+        make_executable(code);
+        flush_all_islands();
+
+        crate::trap::set_thread_x18(100);
+        let f: extern "C" fn() = unsafe { std::mem::transmute(code) };
+        f();
+        assert_eq!(crate::trap::get_thread_x18(), 104,
+            "ADD x18, x18, #4 must propagate to TSD");
+    }
+
+    /// PC-relative and branch instructions must NOT be trampolined — they
+    /// cannot execute at the island's different PC.
+    #[test]
+    fn test_unsafe_classes_fall_back_to_udf() {
+        crate::trap::init_x18_key();
+        let cases: &[(u32, &str)] = &[
+            (0xb4000012, "CBZ x18"),
+            (0x34005372, "CBZ w18 (liblzma-style)"),
+            (0x90001cf2, "ADRP x18"),
+            (0xd61f0240, "BR x18"),
+        ];
+        for &(instr, name) in cases {
+            let code = alloc_code_page(&[instr, 0xD65F03C0]);
+            assert!(!patch_x18_with_trampoline(code, instr),
+                "{} must fall back to UDF emulation", name);
+        }
+    }
 }
