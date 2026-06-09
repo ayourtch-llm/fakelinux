@@ -12,6 +12,7 @@ mod rootfs;
 mod signal;
 mod syscall;
 mod thread;
+mod timers;
 mod translate;
 mod trampoline;
 mod trap;

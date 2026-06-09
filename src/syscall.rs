@@ -9,6 +9,7 @@ use crate::procfs;
 use crate::rootfs;
 use crate::signal;
 use crate::thread;
+use crate::timers;
 use crate::translate;
 use crate::trap::MContext64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,6 +161,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_REMOVEXATTR => 0,
         SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
+        SYS_RT_SIGTIMEDWAIT => signal::do_rt_sigtimedwait(args[0], args[1], args[2], args[3]),
+        SYS_TIMER_CREATE => timers::do_timer_create(args[0], args[1], args[2]),
+        SYS_TIMER_GETTIME => timers::do_timer_gettime(args[0], args[1]),
+        SYS_TIMER_SETTIME => timers::do_timer_settime(args[0], args[1], args[2], args[3]),
+        SYS_TIMER_DELETE => timers::do_timer_delete(args[0]),
         SYS_RT_SIGRETURN => {
             // rt_sigreturn restores ALL registers from the sigframe on the stack.
             // It does NOT return a value in x0. We restore directly into _mctx
@@ -2015,6 +2021,38 @@ fn do_munmap(addr: u64, length: u64) -> u64 {
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
+/// Compute the 16KB-aligned range for a guest mprotect request.
+///
+/// Linux guests assume 4KB pages; macOS uses 16KB. A guest range rarely
+/// covers whole 16KB pages, so we must round — but the safe direction
+/// depends on what the mprotect does:
+///
+/// - **Granting write** (prot & PROT_WRITE): round OUTWARD. Making the
+///   partial neighbor pages more permissive is harmless; rounding inward
+///   leaves a sub-page tail unprotected (glibc pthread_create mprotects
+///   the new thread stack RW with an unaligned end — the thread
+///   descriptor lives in the tail → SIGBUS on first write).
+/// - **Reducing** (PROT_NONE guard pages, PROT_READ RELRO): round INWARD.
+///   Rounding outward would revoke access to adjacent live data that
+///   shares the 16KB page.
+///
+/// Returns Some((aligned_addr, aligned_end)) or None if nothing to do.
+fn mprotect_align_range(addr: u64, len: u64, prot: u64) -> Option<(u64, u64)> {
+    let page: u64 = 16384;
+    let (aligned_addr, aligned_end) = if prot & 2 != 0 {
+        // Write grant: round outward
+        (addr & !(page - 1), (addr + len + page - 1) & !(page - 1))
+    } else {
+        // Permission reduction: round inward
+        ((addr + page - 1) & !(page - 1), (addr + len) & !(page - 1))
+    };
+    if aligned_addr >= aligned_end {
+        None
+    } else {
+        Some((aligned_addr, aligned_end))
+    }
+}
+
 fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
@@ -2028,16 +2066,14 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     }
 
     // macOS requires 16KB page alignment; Linux guests use 4KB.
-    // Only protect fully-covered 16KB pages to avoid making adjacent
-    // writable data read-only (e.g., RELRO vs .data sharing a page).
-    let aligned_addr = (addr + page - 1) & !(page - 1); // round UP
-    let aligned_end = (addr + len) & !(page - 1);        // round DOWN
-
-    if aligned_addr >= aligned_end {
-        // No full 16KB pages covered — silently succeed.
-        // This commonly happens for RELRO regions smaller than 16KB.
-        return 0;
-    }
+    // Direction of rounding depends on grant vs reduction — see
+    // mprotect_align_range.
+    let (aligned_addr, aligned_end) = match mprotect_align_range(addr, len, prot) {
+        Some(r) => r,
+        // No coverage after rounding — silently succeed.
+        // (Common for RELRO regions smaller than 16KB.)
+        None => return 0,
+    };
 
     let aligned_len = aligned_end - aligned_addr;
 
@@ -2057,7 +2093,20 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     }
 
     // Non-exec mprotect: safe to do inline (no patching needed)
-    let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot) };
+    let mut ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_len as usize, mac_prot) };
+    if ret < 0 && prot & 2 != 0 {
+        // Outward-rounded range may extend past the mapping (ENOMEM on
+        // macOS). Retry with inward rounding rather than failing outright.
+        let inward_addr = (addr + page - 1) & !(page - 1);
+        let inward_end = (addr + len) & !(page - 1);
+        if inward_addr < inward_end {
+            ret = unsafe {
+                libc::mprotect(inward_addr as *mut _, (inward_end - inward_addr) as usize, mac_prot)
+            };
+        } else {
+            return 0;
+        }
+    }
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
@@ -3027,6 +3076,45 @@ pub fn merge_envp(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    // ── mprotect_align_range ─────────────────────────────────────────────
+
+    #[test]
+    fn mprotect_rw_grant_rounds_outward() {
+        // Repro of the vim SIGBUS: glibc pthread_create mprotects the new
+        // thread stack RW: addr=0x106358000 len=0x21a60 (end=0x106379a60).
+        // Inward rounding left the top 0x1a60 bytes (thread descriptor!)
+        // PROT_NONE → SIGBUS on first write. RW grants must round OUTWARD.
+        let r = mprotect_align_range(0x106358000, 0x21a60, 3);
+        assert_eq!(r, Some((0x106358000, 0x10637c000)));
+    }
+
+    #[test]
+    fn mprotect_rw_grant_unaligned_start_rounds_down() {
+        let r = mprotect_align_range(0x100001000, 0x1000, 3);
+        assert_eq!(r, Some((0x100000000, 0x100004000)));
+    }
+
+    #[test]
+    fn mprotect_none_rounds_inward() {
+        // Guard pages (PROT_NONE) must NOT swallow adjacent live data.
+        let r = mprotect_align_range(0x100001000, 0x8000, 0);
+        assert_eq!(r, Some((0x100004000, 0x100008000)));
+    }
+
+    #[test]
+    fn mprotect_readonly_relro_rounds_inward() {
+        // RELRO: mprotect(PROT_READ) over a region sharing a 16K page with
+        // writable .data — must not make .data read-only.
+        let r = mprotect_align_range(0x100001000, 0x2000, 1);
+        assert_eq!(r, None); // no fully-covered page → skip
+    }
+
+    #[test]
+    fn mprotect_none_subpage_returns_none() {
+        let r = mprotect_align_range(0x100001000, 0x1000, 0);
+        assert_eq!(r, None);
+    }
 
     fn c(s: &[u8]) -> Box<CStr> {
         std::ffi::CString::new(s).unwrap().into_boxed_c_str()

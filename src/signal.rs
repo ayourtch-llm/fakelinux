@@ -401,6 +401,25 @@ unsafe extern "C" fn signal_forwarder(
     let uctx = &mut *(ctx as *mut crate::trap::UContext);
     let mctx = &mut *uctx.uc_mcontext;
 
+    // Fault signals (SIGSEGV/SIGBUS) forwarded to a guest handler are almost
+    // always OUR bug, but the guest handler hides the crash dump. Log the
+    // fault details (async-signal-safe raw write) before forwarding.
+    if sig == libc::SIGSEGV || sig == libc::SIGBUS {
+        static FAULT_FWD_COUNT: AtomicU64 = AtomicU64::new(0);
+        if FAULT_FWD_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+            let pc = mctx.ss.pc;
+            let far = mctx.es.far;
+            let instr = if pc >= 0x1000 { (pc as *const u32).read_volatile() } else { 0 };
+            let mut buf = [0u8; 256];
+            let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                "fakelinux: [{}] forwarding {} to guest handler: pc={:#x} far={:#x} instr={:#x} lr={:#x} sp={:#x}\n",
+                libc::getpid(), if sig == libc::SIGBUS { "SIGBUS" } else { "SIGSEGV" },
+                pc, far, instr, mctx.ss.lr, mctx.ss.sp
+            ));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
+    }
+
     build_sigframe_and_redirect(mctx, linux_sig, handler, handler_mask);
 }
 
@@ -523,6 +542,104 @@ pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
             }
             break; // deliver one at a time
         }
+    }
+}
+
+/// Pick the lowest-numbered pending signal that is in the waited-for set.
+/// Returns the Linux signal number (1-based), or None.
+pub fn sigtimedwait_pick(pending: u64, set: u64) -> Option<u32> {
+    let hit = pending & set;
+    if hit == 0 {
+        None
+    } else {
+        Some(hit.trailing_zeros() + 1)
+    }
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Handle the guest's rt_sigtimedwait syscall.
+///
+/// glibc's POSIX-timer helper thread loops on rt_sigtimedwait(SIGTIMER);
+/// returning ENOSYS made it busy-spin at 100% CPU (vim hang on first
+/// keypress). We wait by polling PENDING_SIGNALS: other guest threads
+/// (and the signal forwarder, when the signal is blocked or arrives in
+/// trap context) set bits there. NULL timeout waits forever.
+pub fn do_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, _sigsetsize: u64) -> u64 {
+    if set_ptr == 0 {
+        return (-22_i64) as u64; // -EINVAL
+    }
+    let set = unsafe { *(set_ptr as *const u64) };
+
+    let deadline: Option<u64> = if timeout_ptr != 0 {
+        let sec = unsafe { *(timeout_ptr as *const i64) };
+        let nsec = unsafe { *((timeout_ptr + 8) as *const i64) };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return (-22_i64) as u64; // -EINVAL
+        }
+        Some(monotonic_ns().saturating_add(sec as u64 * 1_000_000_000 + nsec as u64))
+    } else {
+        None
+    };
+
+    loop {
+        // Queued siginfo payloads (POSIX timer expirations) take priority —
+        // they carry si_code/si_value that glibc's timer helper dispatches on.
+        if let Some(si) = crate::timers::pop_queued_siginfo(set) {
+            let bit = 1u64 << (si.signo - 1);
+            PENDING_SIGNALS.fetch_and(!bit, Ordering::SeqCst);
+            if info_ptr != 0 {
+                unsafe {
+                    std::ptr::write_bytes(info_ptr as *mut u8, 0, 128);
+                    let p = info_ptr as *mut i32;
+                    *p = si.signo;          // si_signo @0
+                    *p.add(2) = si.code;    // si_code @8
+                    // SI_TIMER union layout: si_tid @16, si_overrun @20, si_value @24
+                    *p.add(4) = si.tid;
+                    *p.add(5) = si.overrun;
+                    *((info_ptr + 24) as *mut u64) = si.sival;
+                }
+            }
+            return si.signo as u64;
+        }
+
+        let pending = PENDING_SIGNALS.load(Ordering::SeqCst);
+        if let Some(sig) = sigtimedwait_pick(pending, set) {
+            let bit = 1u64 << (sig - 1);
+            let prev = PENDING_SIGNALS.fetch_and(!bit, Ordering::SeqCst);
+            if prev & bit != 0 {
+                // We won the race for this signal — report it.
+                if info_ptr != 0 {
+                    unsafe {
+                        std::ptr::write_bytes(info_ptr as *mut u8, 0, 128);
+                        *(info_ptr as *mut i32) = sig as i32; // si_signo
+                    }
+                }
+                return sig as u64;
+            }
+            continue; // another consumer took it; re-check
+        }
+
+        if let Some(d) = deadline {
+            if monotonic_ns() >= d {
+                return (-11_i64) as u64; // -EAGAIN
+            }
+        }
+
+        // Sleep 10ms (clamped to remaining time) and re-poll.
+        let mut sleep_ns: u64 = 10_000_000;
+        if let Some(d) = deadline {
+            sleep_ns = sleep_ns.min(d.saturating_sub(monotonic_ns()).max(1));
+        }
+        let ts = libc::timespec {
+            tv_sec: (sleep_ns / 1_000_000_000) as libc::time_t,
+            tv_nsec: (sleep_ns % 1_000_000_000) as libc::c_long,
+        };
+        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
     }
 }
 
@@ -654,5 +771,36 @@ fn install_forwarder(mac_sig: i32, handler: u64) {
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(mac_sig, &sa, std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigtimedwait_pick_lowest_in_set() {
+        // SIGTIMER (Linux RT signal 34) pending, waited for → picked.
+        let set = 1u64 << (34 - 1);
+        assert_eq!(sigtimedwait_pick(set, set), Some(34));
+    }
+
+    #[test]
+    fn sigtimedwait_pick_ignores_signals_outside_set() {
+        let pending = 1u64 << (17 - 1); // SIGCHLD pending
+        let set = 1u64 << (34 - 1);     // waiting only for 34
+        assert_eq!(sigtimedwait_pick(pending, set), None);
+    }
+
+    #[test]
+    fn sigtimedwait_pick_prefers_lowest() {
+        let pending = (1u64 << (34 - 1)) | (1u64 << (10 - 1));
+        let set = u64::MAX;
+        assert_eq!(sigtimedwait_pick(pending, set), Some(10));
+    }
+
+    #[test]
+    fn sigtimedwait_pick_empty_pending() {
+        assert_eq!(sigtimedwait_pick(0, u64::MAX), None);
     }
 }

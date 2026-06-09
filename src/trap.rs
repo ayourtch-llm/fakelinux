@@ -80,7 +80,7 @@ static mut CURRENT_X18_PC: u64 = 0;
 pub static LAST_SVC_PC: AtomicU64 = AtomicU64::new(0);
 
 /// Format into a stack buffer using raw write — no Mutex, safe after fork.
-fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
+pub fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
     use std::io::Write;
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
     let _ = cursor.write_fmt(args);
