@@ -546,7 +546,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
     let lr_before_macos_fork = unsafe { (lr_addr as *const u64).read() };
 
     // Log the pre-fork LR value and surrounding stack frame
-    {
+    if crate::syscall::trace_enabled() {
         let pid_val = unsafe { libc::getpid() };
         let libc_fork_sp = guest_sp + 0x10;
         let saved_fp = unsafe { ((libc_fork_sp + 0xE0) as *const u64).read() };
@@ -667,7 +667,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Also check and restore __libc_fork's saved LR.
         // Something corrupts [__libc_fork_sp+0xE8] to a heap address before fork.
         let lr_after_macos_fork = unsafe { (lr_addr as *const u64).read() };
-        {
+        if crate::syscall::trace_enabled() {
             let pid_val = unsafe { libc::getpid() };
             let mut buf = [0u8; 250];
             let n = {
@@ -1148,7 +1148,7 @@ fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
     *waiters = remaining;
 
     // Log wake results when there were waiters or when waking the deadlock addr
-    if num_waiters > 0 || woken > 0 {
+    if crate::syscall::trace_enabled() && (num_waiters > 0 || woken > 0) {
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 160];
         let n = {

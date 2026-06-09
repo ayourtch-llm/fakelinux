@@ -314,7 +314,7 @@ fn read_gpr_sp(regs: &ThreadState64, n: usize) -> u64 {
 
 /// Write a GPR value, but register 31 writes to SP instead of being ignored.
 fn write_gpr_sp(regs: &mut ThreadState64, n: usize, val: u64) {
-    if n == 30 {
+    if n == 30 && crate::syscall::trace_enabled() {
         let pc = regs.pc;
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 160];
@@ -330,7 +330,7 @@ fn write_gpr_sp(regs: &mut ThreadState64, n: usize, val: u64) {
 /// Write a GPR value, storing x18 to per-thread storage instead of mcontext.
 fn write_gpr(regs: &mut ThreadState64, n: usize, val: u64) {
     // DEBUG: log any write to x30 (LR) — this catches corruption of the return address
-    if n == 30 {
+    if n == 30 && crate::syscall::trace_enabled() {
         let pc = regs.pc;
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 160];
@@ -1738,6 +1738,7 @@ unsafe extern "C" fn trap_handler(
         // Check if x30 just changed to a heap address (0x50000xxxx range)
         if x30 >= 0x5_0000_0000 && x30 < 0x6_0000_0000
             && !(x30_last >= 0x5_0000_0000 && x30_last < 0x6_0000_0000)
+            && crate::syscall::trace_enabled()
             && !X30_REPORTED.swap(true, Ordering::Relaxed)
         {
             let pid = libc::getpid();
@@ -1891,13 +1892,15 @@ unsafe extern "C" fn trap_handler(
             if lw_cur != lw_exp {
                 // LR was corrupted! Restore it.
                 (lw_addr as *mut u64).write(lw_exp);
-                let mut buf = [0u8; 240];
-                let n = raw_fmt(&mut buf, format_args!(
-                    "fakelinux: [{}] FORK_RETURN_PROBE FIX_LR! x19={:#x} corrupted_lr={:#x} restored_lr={:#x}\n",
-                    pid, w19, lw_cur, lw_exp
-                ));
-                libc::write(2, buf.as_ptr() as *const _, n);
-            } else {
+                if crate::syscall::trace_enabled() {
+                    let mut buf = [0u8; 240];
+                    let n = raw_fmt(&mut buf, format_args!(
+                        "fakelinux: [{}] FORK_RETURN_PROBE FIX_LR! x19={:#x} corrupted_lr={:#x} restored_lr={:#x}\n",
+                        pid, w19, lw_cur, lw_exp
+                    ));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
+            } else if crate::syscall::trace_enabled() {
                 let mut buf = [0u8; 200];
                 let n = raw_fmt(&mut buf, format_args!(
                     "fakelinux: [{}] FORK_RETURN_PROBE x19={:#x} x0={:#x} sp={:#x} lr={:#x}\n",
@@ -2102,7 +2105,7 @@ unsafe extern "C" fn trap_handler(
         // Debug: check DEBUG_RESTORED_X0 — the actual x0 loaded by the asm
         if is_set_robust {
             let asm_x0 = crate::trampoline::DEBUG_RESTORED_X0.swap(-1, Ordering::SeqCst);
-            if asm_x0 != -1 {
+            if asm_x0 != -1 && crate::syscall::trace_enabled() {
                 let pid = libc::getpid();
                 let mctx_x0 = mctx.ss.x[0];
                 let mut buf = [0u8; 160];
