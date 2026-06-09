@@ -63,7 +63,26 @@ fn main() {
         sysroot
     };
 
-    let data = std::fs::read(elf_path).unwrap_or_else(|e| {
+    // Initialize subsystems (rootfs first: the ELF path may traverse
+    // absolute symlinks that must resolve inside the rootfs, not host /).
+    if std::env::var("FAKELINUX_TRACE").is_ok() {
+        syscall::set_trace(true);
+    }
+    rootfs::init(&rootfs, &sysroot);
+    syscall::init_sysroot(&sysroot);
+
+    // Absolutize the ELF path (rootfs prefix matching needs it), then
+    // resolve symlinks within the rootfs (e.g. usr/bin/vim →
+    // /etc/alternatives/vim → usr/bin/vim.basic).
+    let elf_path_abs = if elf_path.starts_with('/') {
+        elf_path.clone()
+    } else {
+        std::env::current_dir().unwrap().join(elf_path.as_str())
+            .to_str().unwrap().to_string()
+    };
+    let elf_path = rootfs::resolve_host_path(&elf_path_abs);
+
+    let data = std::fs::read(&elf_path).unwrap_or_else(|e| {
         eprintln!("fakelinux: cannot read '{}': {}", elf_path, e);
         std::process::exit(1);
     });
@@ -77,13 +96,6 @@ fn main() {
         "fakelinux: loading {} (type={} entry={:#x} phdrs={})",
         elf_path, elf.header.e_type, elf.header.e_entry, elf.header.e_phnum
     );
-
-    // Initialize subsystems
-    if std::env::var("FAKELINUX_TRACE").is_ok() {
-        syscall::set_trace(true);
-    }
-    rootfs::init(&rootfs, &sysroot);
-    syscall::init_sysroot(&sysroot);
 
     // Strip rootfs prefix from the binary path so the guest sees guest paths
     // (e.g., "/Users/.../ubuntu-rootfs/bin/dash" → "/bin/dash").

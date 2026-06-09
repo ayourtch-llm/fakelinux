@@ -315,6 +315,25 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
     Some(full)
 }
 
+/// Resolve a HOST path that may point inside the rootfs, following absolute
+/// symlinks within the rootfs (e.g. ubuntu-rootfs/usr/bin/vim →
+/// /etc/alternatives/vim → ubuntu-rootfs/usr/bin/vim.basic). Returns the
+/// path unchanged if no rootfs is configured or the path is outside it.
+/// Requires rootfs::init() to have run.
+pub fn resolve_host_path(host_path: &str) -> String {
+    let Some(root) = get_root() else {
+        return host_path.to_string();
+    };
+    if root.is_empty() {
+        return host_path.to_string();
+    }
+    let Some(guest) = strip_root_prefix(host_path.as_bytes()) else {
+        return host_path.to_string();
+    };
+    let resolved = resolve_in_rootfs(root.as_bytes(), &guest);
+    String::from_utf8_lossy(&resolved).to_string()
+}
+
 /// Strip the rootfs prefix from an absolute host path, returning the guest path.
 /// E.g., with root="/home/user/rootfs", "/home/user/rootfs/var/lib" → "/var/lib".
 /// Returns None if the path doesn't start with the rootfs prefix.
@@ -347,6 +366,26 @@ mod tests {
     // Note: These tests use the module-level OnceLock statics, so they can only
     // set ROOT/SYSROOT once across all tests in this module. We test the pure
     // functions (is_library_path, strip_root_prefix logic) independently.
+
+    #[test]
+    fn test_resolve_in_rootfs_absolute_symlink_chain() {
+        // /usr/bin/vim → /etc/alternatives/vim → /usr/bin/vim.basic
+        // Absolute symlink targets must re-root under the rootfs, not host /.
+        let tmp = std::env::temp_dir().join(format!("fakelinux-symlink-test-{}", std::process::id()));
+        let root = tmp.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(tmp.join("etc/alternatives")).unwrap();
+        std::fs::write(tmp.join("usr/bin/vim.basic"), b"ELF!").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/vim.basic", tmp.join("etc/alternatives/vim")).unwrap();
+        std::os::unix::fs::symlink("/etc/alternatives/vim", tmp.join("usr/bin/vim")).unwrap();
+
+        let resolved = resolve_in_rootfs(root.as_bytes(), b"/usr/bin/vim");
+        let expected = format!("{}/usr/bin/vim.basic", root);
+        assert_eq!(String::from_utf8_lossy(&resolved), expected);
+        assert_eq!(std::fs::read(std::str::from_utf8(&resolved).unwrap()).unwrap(), b"ELF!");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn test_is_library_path() {
