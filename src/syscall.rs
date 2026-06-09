@@ -184,12 +184,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_CLONE3 => (-38_i64) as u64, // ENOSYS — force fallback to clone
         SYS_CLOSE_RANGE => do_close_range(args[0] as u32, args[1] as u32, args[2] as u32),
         SYS_FACCESSAT2 => do_faccessat(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
-        SYS_GETTIMEOFDAY => {
-            // gettimeofday(tv, tz) — pass through to macOS
-            // struct timeval is { i64 tv_sec, i64 tv_usec } on both Linux aarch64 and macOS
-            let ret = unsafe { libc::gettimeofday(args[0] as *mut libc::timeval, std::ptr::null_mut()) };
-            if ret < 0 { translate::linux_errno() } else { 0 }
-        }
+        SYS_GETTIMEOFDAY => do_gettimeofday(args[0]),
         SYS_FADVISE64 => 0, // advisory hint, ignore
         SYS_SCHED_SETSCHEDULER => 0, // stub success
         SYS_SCHED_SETAFFINITY => 0, // stub success
@@ -2808,6 +2803,25 @@ fn translate_clock_id(linux_clk: i32) -> libc::clockid_t {
     }
 }
 
+fn do_gettimeofday(tv_ptr: u64) -> u64 {
+    // Linux aarch64 struct timeval is { i64 tv_sec, i64 tv_usec } but macOS
+    // tv_usec is i32 — a raw pass-through writes only 12 bytes and leaves
+    // stale guest memory in the high half of tv_usec. Convert explicitly.
+    let mut host: libc::timeval = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::gettimeofday(&mut host, std::ptr::null_mut()) };
+    if ret < 0 {
+        return translate::linux_errno();
+    }
+    if tv_ptr != 0 {
+        unsafe {
+            let p = tv_ptr as *mut i64;
+            *p = host.tv_sec as i64;
+            *p.add(1) = host.tv_usec as i64;
+        }
+    }
+    0
+}
+
 fn do_setitimer(which: i32, new_value_ptr: u64, old_value_ptr: u64) -> u64 {
     // Linux and macOS itimerval have identical layout on 64-bit:
     // struct itimerval { struct timeval it_interval; struct timeval it_value; }
@@ -3114,6 +3128,38 @@ mod tests {
     fn mprotect_none_subpage_returns_none() {
         let r = mprotect_align_range(0x100001000, 0x1000, 0);
         assert_eq!(r, None);
+    }
+
+    // ── gettimeofday timeval conversion ──────────────────────────────────
+
+    #[test]
+    fn gettimeofday_writes_full_i64_usec() {
+        // macOS tv_usec is i32 (12 bytes written); Linux aarch64 expects
+        // i64. Pass-through left the high 4 bytes of the guest's tv_usec
+        // as stale garbage → vim's termresponse deadline never expired
+        // (observed pselect timeout of 545460s while vim deferred all
+        // screen redraws waiting for it).
+        let mut buf = [0xFFu8; 16]; // simulate stale guest memory
+        let r = do_gettimeofday(buf.as_mut_ptr() as u64);
+        assert_eq!(r, 0);
+        let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+        assert!(sec > 1_700_000_000, "tv_sec={sec}");
+        assert!((0..1_000_000).contains(&usec), "tv_usec={usec:#x}");
+    }
+
+    #[test]
+    fn setitimer_old_value_writes_full_i64_usec() {
+        // Same i32-vs-i64 tv_usec mismatch in struct itimerval: the
+        // old_value written back to the guest must have clean i64 fields.
+        let zero = [0u8; 32]; // disarmed timer, all fields 0
+        let mut old = [0xFFu8; 32]; // stale guest memory
+        let r = do_setitimer(0, zero.as_ptr() as u64, old.as_mut_ptr() as u64);
+        assert_eq!(r, 0);
+        for (i, chunk) in old.chunks(8).enumerate() {
+            let v = i64::from_le_bytes(chunk.try_into().unwrap());
+            assert!((0..1_000_000_000).contains(&v), "field {i} = {v:#x}");
+        }
     }
 
     fn c(s: &[u8]) -> Box<CStr> {
