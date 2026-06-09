@@ -61,7 +61,24 @@ Goal: make interactive vim work; then python3.
    "forwarding SIGBUS to guest handler: pc=… far=… instr=…" (first 8)
    — guest handlers (like vim's) used to swallow our crash dumps.
 
-### Current state of vim (IN PROGRESS — task #2/#4)
+### vim — DONE (commit aaa62ce, user-confirmed on real terminal)
+
+Final bug: syscall 169 gettimeofday passed the guest ptr straight to
+macOS, whose tv_usec is **i32** (writes 12 bytes); Linux aarch64
+expects i64 → stale garbage in the high half → vim's termresponse
+deadline never expired (pselect timeouts of 545460s!) → ALL redraws
+deferred: blank startup screen, insert-mode typing invisible until
+ESC, Ctrl-C looked broken. Diagnostic that cracked it: trace showed
+read(0) of typed keys but ZERO write(1) calls. Fix: do_gettimeofday
+converts explicitly; tests gettimeofday_writes_full_i64_usec +
+setitimer regression. NOT timers, NOT pselect sigmask.
+**Bug class to sweep later: macOS suseconds_t i32 — check getrusage
+(timeval pairs ~src/syscall.rs:2455).**
+
+Note: ../mcp-pty-server now supports [ESC] (alias of [ESCAPE],
+commit 247e02b there); the tttt server may need the same treatment.
+
+### Old vim notes (kept for reference)
 
 `vim.basic` now: starts, edits, no crash, no E1286, timer helper
 parked at 0% CPU. **Remaining bug (user-confirmed on real terminal):
@@ -142,7 +159,8 @@ up and work continues. (This file you're reading IS that handoff.)
 
 ## Suggested order next
 
-1. Finish vim initial-redraw bug (timer trace is in place — run it).
+1. ~~vim initial-redraw~~ DONE (gettimeofday i32/i64 tv_usec, aaa62ce).
 2. python3 lazy-reloc instruction decoder (TDD).
 3. Symlink resolution through rootfs.
 4. apt-get install python3 (it's apt — should work) + run python3.
+5. Sweep for more macOS-i32-vs-Linux-i64 timeval bugs (getrusage).
