@@ -227,9 +227,14 @@ pub unsafe fn build_sigframe_and_redirect(
     (p.add(0) as *mut u32).write_unaligned(0xD280_1168); // mov x8, #139
     (p.add(4) as *mut u32).write_unaligned(0xD43E_0000); // brk #0xf000
 
-    // Save x0..x28
+    // Save x0..x28. For x18, save the GUEST x18 (per-thread TSD), not the
+    // hardware register: macOS reserves hw x18 (the kernel zeroes it), so the
+    // guest's x18 lives in TSD. Without this, a handler that uses x18 as a
+    // scratch register would clobber the interrupted code's x18 — the TSD
+    // value is not otherwise restored at sigreturn.
     for i in 0..29usize {
-        (p.add(8 + i * 8) as *mut u64).write_unaligned(regs.x[i]);
+        let val = if i == 18 { crate::trap::get_thread_x18() } else { regs.x[i] };
+        (p.add(8 + i * 8) as *mut u64).write_unaligned(val);
     }
     // Save fp, lr, sp, pc
     (p.add(240) as *mut u64).write_unaligned(regs.fp);
@@ -289,9 +294,14 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         return false;
     }
 
-    // Restore x0..x28
+    // Restore x0..x28. x18 goes back to the per-thread TSD slot (guest x18),
+    // undoing any clobbering by the handler's own x18 usage.
     for i in 0..29usize {
-        regs.x[i] = (p.add(8 + i * 8) as *const u64).read_unaligned();
+        let val = (p.add(8 + i * 8) as *const u64).read_unaligned();
+        if i == 18 {
+            crate::trap::set_thread_x18(val);
+        }
+        regs.x[i] = val;
     }
     // Restore fp, lr, sp, pc
     regs.fp = (p.add(240) as *const u64).read_unaligned();
