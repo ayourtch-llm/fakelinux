@@ -1,8 +1,54 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-09 late (session 7, refresh #2). Narrative in `history.md` (NEW — keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~00:45 (session 7, refresh #4). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #3 STATUS — read this first (supersedes #2 below)
+## REFRESH #4 STATUS — read this first (supersedes #3 below)
+
+ALL COMMITTED through "fix(rusage)…", 350 tests green. Today's fixes:
+1. **TLS WORKS.** Two bugs: (a) `ins v0.b[7], w18` (AdvSIMD copy) panicked
+   trap_handler → new emul_simd_copy in trap.rs (0b1192b); (b) nettle
+   SHA-256/512 K tables corrupted by x18 false-positive patches —
+   runtime-mapped libs have no section headers, eh_frame strategy failed,
+   fell back to whole-R-X-segment patching incl. .rodata. Fixed:
+   PT_GNU_EH_FRAME → .eh_frame_hdr → FDE parser in elf.rs.
+   python ssl → TLSv1.3; gnutls-cli stdio.be (USER'S OWN SERVER, good for
+   https tests) → handshake completed.
+2. Debug spam gated behind FAKELINUX_TRACE (PRE/POST_FORK_LR, STACK_DUMP,
+   WRITE_X30, X30_BECAME_HEAP, FORK_RETURN_PROBE, ASM_X0, FUTEX_WAKE_RESULT).
+3. rusage converted properly (getrusage + wait4): i32→i64 usec,
+   maxrss bytes→KB. Helper linux_rusage_bytes + 2 tests.
+
+**vpp CLONE SUCCEEDED** (task #1): /root/vpp inside ubuntu-rootfs, 94MB,
+working tree checked out (`git clone --depth 1 https://gerrit.fd.io/r/vpp`).
+A `git fsck` was running in background task b5u15w73b (output:
+/private/tmp/claude-501/.../tasks/b5u15w73b.output) — check/rerun:
+`export HOME=/root && cd /root/vpp && git fsck` in container.
+Container git needs: `export HOME=/root` + safe.directory exception
+(host HOME leaks in otherwise). User has a HOST clone of vpp in pty-3
+for comparison (compare git log SHAs etc.).
+
+**PERF NOTE:** git index-pack ran at 99% CPU in trap_handler —
+Ubuntu's git block_sha1 uses w18 as scratch (179 refs!); UDF-fallback
+x18 instrs cost a SIGILL each. Clone finished anyway. If guest gets
+slow, check `sample <pid> 2` for emulate_x18_instruction; possible
+follow-up: figure out why some DataProc x18 instrs fall back instead of
+trampolining (x16/x17 conflict? encode_b range?) — x18_trampoline.rs.
+
+NEXT (TaskList): #2 build VPP (apt install make gcc cmake ninja-build
+etc., then `make build` or vpp's `make install-dep` — may need universe,
+which IS NOW ENABLED in container sources). #5 install Rust in container
+(user: "Rust uses a lot of funky CPU opcodes, great test!").
+#6 install Claude Code in container (needs nodejs; user gives API key).
+
+Apt universe enabled in /etc/apt/sources.list.d/ubuntu.sources;
+gnutls-bin + nettle-bin installed (good crypto canaries:
+`printf abc | nettle-hash -a sha256` must start ba7816bf).
+
+CONTEXT RESET PROTOCOL (user-approved, in memory feedback_clear_hang.md):
+watch pty-1 for context warning → finish activity → update this file →
+wire heartbeat → self-inject /clear + continuation prompt via tttt.
+
+## REFRESH #3 STATUS (older)
 
 DONE since #2 (committed unless noted): #3 dpkg repaired+git reinstalled
 (apt exit 0); #4 symlinks fixed (85f630a, rootfs::resolve_host_path in
