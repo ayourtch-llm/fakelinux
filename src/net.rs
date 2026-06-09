@@ -69,6 +69,17 @@ fn translate_msg_flags(linux_flags: i32) -> i32 {
 /// Use this for inbound addresses (connect/bind/sendto/sendmsg). Outbound
 /// buffers (accept/recvfrom/getsockname/...) are guest-writable by contract
 /// and may be converted in place.
+/// Linux AF_INET6 is 10; macOS AF_INET6 is 30. (AF_UNIX=1 and AF_INET=2
+/// match.) Linux sockaddr_in6 and macOS sockaddr_in6 otherwise share field
+/// offsets, so only the family value needs mapping.
+fn linux_af_to_mac(af: u8) -> u8 {
+    if af == 10 { 30 } else { af }
+}
+
+fn mac_af_to_linux(af: u8) -> u8 {
+    if af == 30 { 10 } else { af }
+}
+
 fn linux_sockaddr_to_mac_copy(addr_ptr: u64, addrlen: u32) -> libc::sockaddr_storage {
     let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     if addr_ptr == 0 || addrlen < 2 {
@@ -82,7 +93,7 @@ fn linux_sockaddr_to_mac_copy(addr_ptr: u64, addrlen: u32) -> libc::sockaddr_sto
         let family = *p;
         // macOS: offset 0 = sa_len, offset 1 = sa_family (u8)
         *p = addrlen as u8;
-        *p.add(1) = family;
+        *p.add(1) = linux_af_to_mac(family);
     }
     ss
 }
@@ -96,8 +107,8 @@ fn linux_sockaddr_to_mac(addr_ptr: u64, addrlen: u32) -> u8 {
         // Linux: offset 0 = sa_family as u16 LE → low byte is the family
         let family = *p;
         // macOS: offset 0 = sa_len, offset 1 = sa_family (u8)
-        *p = addrlen as u8;     // sin_len
-        *p.add(1) = family;     // sin_family
+        *p = addrlen as u8;                     // sin_len
+        *p.add(1) = linux_af_to_mac(family);    // sin_family
         family
     }
 }
@@ -112,7 +123,7 @@ fn mac_sockaddr_to_linux(addr_ptr: u64, addrlen: u32) {
         // macOS: offset 0 = sa_len, offset 1 = sa_family
         let family = *p.add(1);
         // Linux: offset 0 = sa_family as u16 LE
-        *p = family;
+        *p = mac_af_to_linux(family);
         *p.add(1) = 0;
     }
 }
@@ -149,7 +160,8 @@ fn apply_sock_flags(fd: i32, nonblock: bool, cloexec: bool) {
 
 pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
     let (base_type, nonblock, cloexec) = extract_sock_flags(type_);
-    let fd = unsafe { libc::socket(domain, base_type, protocol) };
+    let mac_domain = if domain == 10 { 30 } else { domain }; // Linux AF_INET6=10, macOS=30
+    let fd = unsafe { libc::socket(mac_domain, base_type, protocol) };
     if fd < 0 {
         return translate::linux_errno();
     }
@@ -532,4 +544,41 @@ pub fn do_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> u64 {
     }
 
     sent as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn af_inet6_domain_translated() {
+        // Linux AF_INET6=10 must become macOS AF_INET6=30, or socket()
+        // fails with EAFNOSUPPORT (python: "[Errno 97] Address family not
+        // supported" on any dual-stack host).
+        let r = do_socket(10, libc::SOCK_STREAM, 0);
+        assert!((r as i64) >= 0, "AF_INET6 socket failed: {}", r as i64);
+        unsafe { libc::close(r as i32); }
+    }
+
+    #[test]
+    fn sockaddr_in6_family_mapped_both_ways() {
+        // Linux sockaddr_in6: u16 family=10, then port/flowinfo/addr/scope.
+        let mut sa = [0u8; 28];
+        sa[0] = 10; // AF_INET6 (LE u16)
+        sa[2] = 0x01; sa[3] = 0xbb; // port 443 BE
+        let mac = linux_sockaddr_to_mac_copy(sa.as_ptr() as u64, 28);
+        let p = &mac as *const _ as *const u8;
+        unsafe {
+            assert_eq!(*p, 28); // sin6_len
+            assert_eq!(*p.add(1), 30); // macOS AF_INET6
+            assert_eq!(*p.add(2), 0x01); // port preserved
+            assert_eq!(*p.add(3), 0xbb);
+        }
+        // Reverse: macOS (len=28, family=30) → Linux (family u16 = 10)
+        let mut back = [0u8; 28];
+        back[0] = 28; back[1] = 30;
+        mac_sockaddr_to_linux(back.as_mut_ptr() as u64, 28);
+        assert_eq!(back[0], 10);
+        assert_eq!(back[1], 0);
+    }
 }

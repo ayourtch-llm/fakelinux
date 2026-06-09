@@ -2,7 +2,38 @@
 
 _Last update: 2026-06-09 late (session 7, refresh #2). Narrative in `history.md` (NEW — keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #2 STATUS — read this first
+## REFRESH #3 STATUS — read this first (supersedes #2 below)
+
+DONE since #2 (committed unless noted): #3 dpkg repaired+git reinstalled
+(apt exit 0); #4 symlinks fixed (85f630a, rootfs::resolve_host_path in
+main.rs); AF_INET6 support added in src/net.rs (Linux AF 10 ↔ macOS 30:
+do_socket domain + sockaddr family both ways, 2 tests) — **UNCOMMITTED,
+test+commit first!**
+
+CURRENT BUG (task #5 git clone vpp): TLS from guest crashes —
+**Rust panic inside trap_handler → panic_cannot_unwind → abort (exit
+134)** during python ssl wrap_socket after connect. Repro:
+`timeout 60 env FAKELINUX_ROOT=ubuntu-rootfs ./target/release/fakelinux
+--container ubuntu-rootfs/usr/bin/python3.12 -c 'import socket, ssl;
+ctx=ssl.create_default_context();
+s=socket.create_connection(("example.com",443),timeout=15);
+t=ctx.wrap_socket(s,server_hostname="example.com"); print(t.version())'`
+Likely a panicking Rust path in a syscall emulation reached via signal
+handler (panic in extern "C" = cannot unwind = abort). Find the panic
+message: run with RUST_BACKTRACE=full, look ABOVE the backtrace for
+"panicked at" line (got cut in my capture). gnutls git clone failed
+similarly ("TLS connection non-properly terminated" = our process died?
+No—git's child). NOTE: user's firewall was blocking 443 earlier — OFF
+now; earlier "Empty reply"/gnutls failures may have been partly firewall!
+RETRY git clone http://gerrit.fd.io/r/vpp after the panic fix.
+
+Also: more ungated debug spam seen during git: POST_FORK_LR, ASM_X0,
+FORK_RETURN_PROBE, X30_BECAME_HEAP, FUTEX_WAKE_RESULT, crash [sp+..]
+dumps — gate behind trace like 49cee40 did.
+
+User is around (turned firewall off). Keep history.md updated.
+
+## REFRESH #2 STATUS (older)
 
 DONE since refresh #1 (all committed, 338 tests green):
 - **vim FULLY WORKS** (aaa62ce): gettimeofday wrote i32 tv_usec via
