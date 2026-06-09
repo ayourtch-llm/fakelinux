@@ -385,6 +385,12 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
         EmulClass::Extract => emul_extract(orig_instr, mctx),
         EmulClass::DataProc1Src => emul_dp1_src(orig_instr, mctx),
         other => {
+            // AdvSIMD copy (DUP/INS/SMOV/UMOV) — not in the XML GPR table but
+            // can reference x18 as GPR operand (or v18, which the patcher
+            // also matches). Pattern: 0_Q_op_01110000_imm5_0_imm4_1_Rn_Rd.
+            if orig_instr & 0x9FE0_8400 == 0x0E00_0400 {
+                return emul_simd_copy(orig_instr, mctx);
+            }
             let pc = mctx.ss.pc;
             panic!(
                 "fakelinux: UNHANDLED EmulClass::{:?} for instr={:#010x} at pc={:#x}",
@@ -1462,6 +1468,89 @@ fn emul_dp1_src(orig_instr: u32, mctx: &mut MContext64) -> bool {
     let result = if sf == 0 { result & 0xFFFF_FFFF } else { result };
     if rd != 31 { write_gpr(regs, rd, result); }
     true
+}
+
+/// AdvSIMD copy: DUP (element/general), INS (general/element), SMOV, UMOV.
+/// Encoding: 0_Q_op_01110000_imm5_0_imm4_1_Rn_Rd.
+/// x18 can be the GPR operand (DUP general / INS general source, SMOV/UMOV
+/// dest); v18 in the Rn field also gets patched, so the pure-vector forms
+/// (DUP element, INS element) must be emulated here too.
+fn emul_simd_copy(orig_instr: u32, mctx: &mut MContext64) -> bool {
+    let q = (orig_instr >> 30) & 1;
+    let op = (orig_instr >> 29) & 1;
+    let imm5 = (orig_instr >> 16) & 0x1F;
+    let imm4 = (orig_instr >> 11) & 0xF;
+    let rn = ((orig_instr >> 5) & 0x1F) as usize;
+    let rd = (orig_instr & 0x1F) as usize;
+
+    if imm5 & 0xF == 0 { return false; } // unallocated (no element size bit)
+    let size = imm5.trailing_zeros(); // 0=B 1=H 2=S 3=D
+    let esize = 8u32 << size; // 8/16/32/64
+    let emask: u128 = if esize == 64 { u64::MAX as u128 } else { (1u128 << esize) - 1 };
+    let idx = (imm5 >> (size + 1)) as u32;
+
+    let get_elem = |v: u128, i: u32| -> u64 { ((v >> (i * esize)) & emask) as u64 };
+    let replicate = |elem: u64| -> u128 {
+        let datasize = if q == 1 { 128 } else { 64 };
+        let mut acc: u128 = 0;
+        let mut i = 0;
+        while i < datasize / esize {
+            acc |= ((elem as u128) & emask) << (i * esize);
+            i += 1;
+        }
+        acc // upper 64 bits zero when Q=0, as architected
+    };
+
+    if op == 1 {
+        // INS (element): Vd.Ts[idx] = Vn.Ts[src_idx]; requires Q=1
+        if q != 1 { return false; }
+        let src_idx = imm4 >> size;
+        let elem = get_elem(mctx.ns.v[rn], src_idx);
+        let shift = idx * esize;
+        mctx.ns.v[rd] = (mctx.ns.v[rd] & !(emask << shift))
+            | (((elem as u128) & emask) << shift);
+        return true;
+    }
+
+    match imm4 {
+        0b0000 => { // DUP (element): Vd = replicate Vn.Ts[idx]
+            if size == 3 && q == 0 { return false; } // no 1D form
+            let elem = get_elem(mctx.ns.v[rn], idx);
+            mctx.ns.v[rd] = replicate(elem);
+            true
+        }
+        0b0001 => { // DUP (general): Vd = replicate GPR
+            if size == 3 && q == 0 { return false; }
+            let elem = read_gpr(&mctx.ss, rn);
+            mctx.ns.v[rd] = replicate(elem);
+            true
+        }
+        0b0011 => { // INS (general): Vd.Ts[idx] = GPR low bits; requires Q=1
+            if q != 1 { return false; }
+            let elem = read_gpr(&mctx.ss, rn);
+            let shift = idx * esize;
+            mctx.ns.v[rd] = (mctx.ns.v[rd] & !(emask << shift))
+                | (((elem as u128) & emask) << shift);
+            true
+        }
+        0b0101 => { // SMOV Wd/Xd, Vn.Ts[idx] — sign-extend element
+            // W form: B/H only; X form: B/H/S only
+            if (q == 0 && size > 1) || (q == 1 && size > 2) { return false; }
+            let elem = get_elem(mctx.ns.v[rn], idx);
+            let val = sign_extend(elem, esize);
+            let val = if q == 0 { val & 0xFFFF_FFFF } else { val };
+            if rd != 31 { write_gpr(&mut mctx.ss, rd, val); }
+            true
+        }
+        0b0111 => { // UMOV Wd/Xd, Vn.Ts[idx] — zero-extend element
+            // W form: B/H/S; X form: D only
+            if (q == 0 && size > 2) || (q == 1 && size != 3) { return false; }
+            let val = get_elem(mctx.ns.v[rn], idx);
+            if rd != 31 { write_gpr(&mut mctx.ss, rd, val); }
+            true
+        }
+        _ => false,
+    }
 }
 
 // ─── Emulation helpers ───────────────────────────────────────────────────────
@@ -3154,5 +3243,87 @@ mod tests {
         assert_eq!(mctx.ss.x[0], expected,
             "SMULH(2, 0x7FFF...F) should give {:#x}, got {:#x}",
             expected, mctx.ss.x[0]);
+    }
+
+    // ─── AdvSIMD copy (DUP/INS/SMOV/UMOV) referencing x18 ─────────────
+    // Found via openssl: `ins v0.b[7], w18` panicked trap_handler
+    // ("UNHANDLED EmulClass::Other") during python ssl wrap_socket.
+
+    #[test]
+    fn test_ins_general_from_w18() {
+        // INS v0.b[7], w18 — the exact instruction that crashed openssl.
+        // 0 Q=1 op=0 01110000 imm5=01111 0 imm4=0011 1 Rn=18 Rd=0
+        let mut mctx = make_mctx();
+        set_thread_x18(0xAB);
+        mctx.ns.v[0] = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+
+        let instr: u32 = 0x4E0F_1E40; // ins v0.b[7], w18
+        assert!(emul_simd_copy(instr, &mut mctx), "INS (general) handled");
+
+        // byte 7 replaced with 0xAB, everything else preserved
+        assert_eq!(mctx.ns.v[0], 0x1111_2222_3333_4444_AB55_6666_7777_8888);
+    }
+
+    #[test]
+    fn test_dup_general_from_w18() {
+        // DUP v2.4s, w18 — imm5=00100 (S), imm4=0001, Q=1
+        let mut mctx = make_mctx();
+        set_thread_x18(0xDEAD_BEEF_CAFE_F00D); // only low 32 bits used
+
+        let instr: u32 = 0x4E04_0E42; // dup v2.4s, w18
+        assert!(emul_simd_copy(instr, &mut mctx), "DUP (general) handled");
+        assert_eq!(mctx.ns.v[2],
+            0xCAFE_F00D_CAFE_F00D_CAFE_F00D_CAFE_F00D);
+    }
+
+    #[test]
+    fn test_umov_to_w18() {
+        // UMOV w18, v3.s[1] — imm5=01100, imm4=0111, Q=0
+        let mut mctx = make_mctx();
+        set_thread_x18(0);
+        mctx.ns.v[3] = 0xAAAA_BBBB_CCCC_DDDD_1234_5678_9ABC_DEF0;
+
+        let instr: u32 = 0x0E0C_3C72; // umov w18, v3.s[1]
+        assert!(emul_simd_copy(instr, &mut mctx), "UMOV handled");
+        assert_eq!(get_thread_x18(), 0x1234_5678, "element s[1], zero-extended");
+    }
+
+    #[test]
+    fn test_smov_to_x18() {
+        // SMOV x18, v1.h[2] — imm5=01010, imm4=0101, Q=1
+        let mut mctx = make_mctx();
+        set_thread_x18(0);
+        mctx.ns.v[1] = 0x0000_8001_0000_0000u128; // h[2] (bits 47:32) = 0x8001, negative i16
+
+        let instr: u32 = 0x4E0A_2C32; // smov x18, v1.h[2]
+        assert!(emul_simd_copy(instr, &mut mctx), "SMOV handled");
+        assert_eq!(get_thread_x18(), 0xFFFF_FFFF_FFFF_8001, "sign-extended");
+    }
+
+    #[test]
+    fn test_ins_element_v18_source() {
+        // INS v0.d[1], v18.d[0] — op=1; patcher may match Rn=18 even though
+        // it's a vector reg, so the emulator must handle vector→vector too.
+        // 0 1 1 01110000 imm5=11000 0 imm4(src idx)=0000 1 Rn=18 Rd=0
+        let mut mctx = make_mctx();
+        mctx.ns.v[18] = 0x9999_8888_7777_6666_0123_4567_89AB_CDEF;
+        mctx.ns.v[0] = 0x1111_1111_1111_1111_2222_2222_2222_2222;
+
+        let instr: u32 = 0x6E18_0640; // ins v0.d[1], v18.d[0]
+        assert!(emul_simd_copy(instr, &mut mctx), "INS (element) handled");
+        assert_eq!(mctx.ns.v[0], 0x0123_4567_89AB_CDEF_2222_2222_2222_2222);
+    }
+
+    #[test]
+    fn test_dup_element_v18_source() {
+        // DUP v1.2d, v18.d[1] — imm5=11000? no: d[1] → imm5=11000, Q=1
+        // 0 1 0 01110000 imm5=11000 0 imm4=0000 1 Rn=18 Rd=1
+        let mut mctx = make_mctx();
+        mctx.ns.v[18] = 0xFEED_FACE_DEAD_BEEF_0000_0000_0000_0001;
+
+        let instr: u32 = 0x4E18_0641; // dup v1.2d, v18.d[1]
+        assert!(emul_simd_copy(instr, &mut mctx), "DUP (element) handled");
+        assert_eq!(mctx.ns.v[1],
+            0xFEED_FACE_DEAD_BEEF_FEED_FACE_DEAD_BEEF);
     }
 }
