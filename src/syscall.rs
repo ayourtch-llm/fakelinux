@@ -1847,6 +1847,37 @@ fn do_brk(addr: u64) -> u64 {
 }
 
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
+    // Diagnostic: a length near the ET_EXEC relocation offset (0x700000000)
+    // means someone computed size = relocated_ptr - unrelocated_ptr. Catch
+    // the caller in the act (first few occurrences).
+    if length >= 0x1_0000_0000 {
+        static HUGE_MMAP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = HUGE_MMAP_COUNT.fetch_add(1, Ordering::SeqCst);
+        if n < 3 {
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: HUGE MMAP len={:#x} from pc={:#x} lr={:#x}\n",
+                length, crate::trap::LAST_SVC_PC.load(Ordering::Relaxed),
+                crate::trap::LAST_SVC_LR.load(Ordering::Relaxed)));
+            // Walk the fp chain to find the guest call stack (fault-safe reads).
+            let mut fp = crate::trap::LAST_SVC_FP.load(Ordering::Relaxed);
+            for depth in 0..12 {
+                if fp == 0 || fp & 0x7 != 0 || fp >= 0x8000_0000_0000 {
+                    break;
+                }
+                let (Some(next_fp), Some(lr)) =
+                    (crate::trap::safe_read_u64(fp), crate::trap::safe_read_u64(fp + 8))
+                else {
+                    break;
+                };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux:   frame[{}] fp={:#x} lr={:#x}\n", depth, fp, lr));
+                if next_fp <= fp {
+                    break; // stacks grow down; chain must ascend
+                }
+                fp = next_fp;
+            }
+        }
+    }
     let mac_prot = translate::translate_mmap_prot(prot);
     let page: u64 = 16384;
     let has_exec = prot & 4 != 0; // PROT_EXEC

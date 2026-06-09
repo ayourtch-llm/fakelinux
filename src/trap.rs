@@ -78,6 +78,19 @@ static mut CURRENT_X18_PC: u64 = 0;
 
 /// Last guest PC that issued a SVC — used by futex deadlock diagnostics.
 pub static LAST_SVC_PC: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SVC_FP: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SVC_LR: AtomicU64 = AtomicU64::new(0);
+
+/// Fault-safe read of a u64 from possibly-unmapped memory (Mach read,
+/// no recursive SIGSEGV).
+pub fn safe_read_u64(addr: u64) -> Option<u64> {
+    let mut val: u64 = 0;
+    let mut out_size: libc::vm_size_t = 0;
+    let kr = unsafe {
+        mach_vm_read_overwrite(mach_task_self(), addr, 8, &mut val as *mut u64 as u64, &mut out_size)
+    };
+    if kr == 0 && out_size == 8 { Some(val) } else { None }
+}
 
 /// Format into a stack buffer using raw write — no Mutex, safe after fork.
 pub fn raw_fmt(buf: &mut [u8], args: std::fmt::Arguments) -> usize {
@@ -2018,6 +2031,8 @@ unsafe extern "C" fn trap_handler(
 
         // Store guest PC for futex deadlock diagnostics
         LAST_SVC_PC.store(pc, Ordering::Relaxed);
+        LAST_SVC_FP.store(mctx.ss.fp, Ordering::Relaxed);
+        LAST_SVC_LR.store(mctx.ss.lr, Ordering::Relaxed);
 
         // Trace all SVCs from fork children (including worker threads)
         if crate::syscall::trace_enabled() && crate::thread::is_fork_child() {
@@ -2217,6 +2232,102 @@ pub fn install_handler() {
     }
 }
 
+/// Decode a faulting load/store and pick the register to relocate.
+///
+/// The whole-register scan can patch an innocent register: in python3.12
+/// (ET_EXEC) a strcpy loop faulted on `LDR x3, [x0, x10]` where x0 was a
+/// valid host pointer and x10 a wrapped difference — their SUM was the
+/// unrelocated address, but neither register was in [orig_lo, orig_hi).
+/// Decoding the instruction lets us fix the register actually involved.
+///
+/// Returns Some(reg index 0..=30) if the instruction is a load/store whose
+/// computed effective address equals `fault_addr` (which must lie in the
+/// unrelocated range), preferring Rn when it is itself unrelocated.
+fn lazy_reloc_pick_register(
+    instr: u32,
+    regs: &[u64; 31],
+    fault_addr: u64,
+    orig_lo: u64,
+    orig_hi: u64,
+) -> Option<usize> {
+    if fault_addr < orig_lo || fault_addr >= orig_hi {
+        return None;
+    }
+    let in_range = |v: u64| v >= orig_lo && v < orig_hi;
+    let rt_n = ((instr >> 5) & 0x1f) as usize; // Rn field
+    if rt_n == 31 {
+        return None; // SP-based access — not a relocation miss
+    }
+    let rn = regs[rt_n];
+
+    // Load/store register offset: LDR/STR Rt, [Rn, Rm{, ext {#amount}}]
+    if instr & 0x3b20_0c00 == 0x3820_0800 {
+        let rm_idx = ((instr >> 16) & 0x1f) as usize;
+        if rm_idx == 31 {
+            return None;
+        }
+        let rm = regs[rm_idx];
+        let option = (instr >> 13) & 0x7;
+        let s = (instr >> 12) & 1;
+        let size = instr >> 30; // scale for shifted index
+        let shift = if s == 1 { size } else { 0 };
+        let offset = match option {
+            0b010 => rm as u32 as u64,                  // UXTW
+            0b110 => rm as u32 as i32 as i64 as u64,    // SXTW
+            0b011 | 0b111 => rm,                        // LSL / SXTX
+            _ => return None,
+        };
+        let ea = rn.wrapping_add(offset.wrapping_shl(shift));
+        if ea != fault_addr {
+            return None;
+        }
+        // Prefer Rn if it is itself an unrelocated pointer; otherwise the
+        // unrelocated value arrived via the index register.
+        return Some(if in_range(rn) { rt_n } else { rm_idx });
+    }
+
+    // Load/store unsigned immediate: LDR/STR Rt, [Rn, #imm12 << size]
+    if instr & 0x3b00_0000 == 0x3900_0000 {
+        let imm12 = ((instr >> 10) & 0xfff) as u64;
+        let size = instr >> 30;
+        let ea = rn.wrapping_add(imm12 << size);
+        return if ea == fault_addr { Some(rt_n) } else { None };
+    }
+
+    // Load/store imm9: unscaled (LDUR), post-index, pre-index
+    if instr & 0x3b20_0000 == 0x3800_0000 {
+        let variant = (instr >> 10) & 0x3;
+        let imm9 = (((instr >> 12) & 0x1ff) as i32) << 23 >> 23; // sign-extend
+        let ea = if variant == 0b01 {
+            rn // post-index: access at Rn, writeback after
+        } else {
+            rn.wrapping_add(imm9 as i64 as u64)
+        };
+        return if ea == fault_addr { Some(rt_n) } else { None };
+    }
+
+    // AdvSIMD load/store multiple/single structures (LD1/ST1/LD2/…):
+    // address is always plain [Rn] (post-index writeback happens after).
+    if instr & 0xbf00_0000 == 0x0c00_0000 || instr & 0xbf00_0000 == 0x0d00_0000 {
+        return if rn == fault_addr { Some(rt_n) } else { None };
+    }
+
+    // LDP/STP: load/store pair (signed offset, pre/post-index)
+    if instr & 0x3a00_0000 == 0x2800_0000 {
+        let variant = (instr >> 23) & 0x3;
+        let imm7 = (((instr >> 15) & 0x7f) as i32) << 25 >> 25; // sign-extend
+        let scale = 2 + (instr >> 31); // 4-byte pairs vs 8-byte pairs
+        let ea = if variant == 0b01 {
+            rn // post-index
+        } else {
+            rn.wrapping_add(((imm7 as i64) << scale) as u64)
+        };
+        return if ea == fault_addr { Some(rt_n) } else { None };
+    }
+
+    None
+}
+
 /// SIGSEGV handler that tries lazy relocation fixup for relocated ET_EXEC.
 /// If the fault address or PC is in the original (unrelocated) ET_EXEC range,
 /// adjust the register/PC by base_offset and retry the instruction.
@@ -2246,19 +2357,45 @@ unsafe extern "C" fn segv_fixup_handler(
             return; // retry instruction at relocated address
         }
 
-        // Case 2: data access at unrelocated address. Try to fix a register
-        // that contains an unrelocated pointer. Scan ALL GPRs — the unrelocated
-        // value might be in any register (not just the instruction's Rn/Rm),
-        // because address computation can involve intermediate registers.
+        // Case 2: data access at unrelocated address. First decode the
+        // faulting load/store and fix the register actually used in the
+        // address computation — the whole-register scan below can patch an
+        // innocent register when the unrelocated value arrives via
+        // base+index arithmetic (e.g. python3.12 strcpy: LDR x3, [x0, x10]
+        // where only x0+x10 is in range, and a different register
+        // coincidentally held an in-range value).
         if fault_addr >= orig_lo && fault_addr < orig_hi {
+            // pc just executed, so it is mapped — safe to read the instruction.
+            let instr = *(pc as *const u32);
+            let mut regs31 = [0u64; 31];
+            regs31[..29].copy_from_slice(&mctx.ss.x[..29]);
+            regs31[29] = mctx.ss.fp;
+            regs31[30] = mctx.ss.lr;
+            if let Some(i) = lazy_reloc_pick_register(instr, &regs31, fault_addr, orig_lo, orig_hi) {
+                static FIXUP_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = FIXUP_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!("fakelinux: lazy reloc: decoded instr {:#010x} → fix x{} {:#x} → {:#x} (fault_addr={:#x} pc={:#x})",
+                              instr, i, regs31[i], regs31[i].wrapping_add(base_offset), fault_addr, pc);
+                }
+                let fixed = regs31[i].wrapping_add(base_offset);
+                match i {
+                    29 => mctx.ss.fp = fixed,
+                    30 => mctx.ss.lr = fixed,
+                    _ => mctx.ss.x[i] = fixed,
+                }
+                return; // retry with fixed register
+            }
+            // Fallback: scan ALL GPRs — the unrelocated value might be in any
+            // register for instructions the decoder does not understand.
             for i in 0..29 { // x0-x28 (skip x29=fp, x30=lr)
                 let val = mctx.ss.x[i];
                 if val >= orig_lo && val < orig_hi {
                     static FIXUP_REG_COUNT: AtomicU64 = AtomicU64::new(0);
                     let n = FIXUP_REG_COUNT.fetch_add(1, Ordering::Relaxed);
                     if n < 5 {
-                        eprintln!("fakelinux: lazy reloc: x{} {:#x} → {:#x} (fault_addr={:#x} pc={:#x})",
-                                  i, val, val + base_offset, fault_addr, pc);
+                        eprintln!("fakelinux: lazy reloc: x{} {:#x} → {:#x} (fault_addr={:#x} pc={:#x} instr={:#010x})",
+                                  i, val, val + base_offset, fault_addr, pc, instr);
                     }
                     mctx.ss.x[i] = val + base_offset;
                     return; // retry with fixed register
@@ -2351,6 +2488,109 @@ unsafe extern "C" fn crash_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── lazy_reloc_pick_register ─────────────────────────────────────────
+    // ET_EXEC lazy relocation: when a load/store faults on an unrelocated
+    // address, decode the instruction and pick the register to relocate.
+
+    const RELOC_LO: u64 = 0x400000;
+    const RELOC_HI: u64 = 0x900000;
+
+    fn regs_with(pairs: &[(usize, u64)]) -> [u64; 31] {
+        let mut r = [0u64; 31];
+        for &(i, v) in pairs {
+            r[i] = v;
+        }
+        r
+    }
+
+    #[test]
+    fn lazy_reloc_python3_strcpy_crash() {
+        // Real python3.12 crash: LDR x3, [x0, x10] with x0 a valid host
+        // stack pointer and x10 a huge value such that x0+x10 wraps to the
+        // unrelocated 0x701f60. Neither register alone is in range — the
+        // whole-register scan patched innocent x1 and crashed on retry.
+        // The decoder must pick Rm (x10).
+        let regs = regs_with(&[
+            (0, 0x7ff07fed50),
+            (1, 0x700701f60), // already-relocated red herring
+            (10, 0xffffff800ff03210),
+        ]);
+        let r = lazy_reloc_pick_register(0xf86a6803, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(10));
+    }
+
+    #[test]
+    fn lazy_reloc_register_offset_prefers_rn_when_in_range() {
+        // LDR x3, [x0, x10] where x0 itself is the unrelocated pointer.
+        let regs = regs_with(&[(0, 0x701f00), (10, 0x60)]);
+        let r = lazy_reloc_pick_register(0xf86a6803, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(0));
+    }
+
+    #[test]
+    fn lazy_reloc_unsigned_imm_offset() {
+        // LDR x1, [x2, #16] — 0xf9400841. Base register x2 unrelocated.
+        let regs = regs_with(&[(2, 0x701f50)]);
+        let r = lazy_reloc_pick_register(0xf9400841, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(2));
+    }
+
+    #[test]
+    fn lazy_reloc_byte_load_register_offset() {
+        // LDRB w3, [x0, x10] — 0x386a6803 (strcpy-style byte loop).
+        let regs = regs_with(&[(0, 0x7ff07fed50), (10, 0xffffff800ff03210)]);
+        let r = lazy_reloc_pick_register(0x386a6803, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(10));
+    }
+
+    #[test]
+    fn lazy_reloc_ea_mismatch_returns_none() {
+        // Decoded EA does not match fault_addr → do not guess.
+        let regs = regs_with(&[(0, 0x1000), (10, 0x20)]);
+        let r = lazy_reloc_pick_register(0xf86a6803, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn lazy_reloc_non_memory_instruction_returns_none() {
+        // ADD x0, x1, x2 — not a load/store.
+        let regs = regs_with(&[(1, 0x701f00), (2, 0x60)]);
+        let r = lazy_reloc_pick_register(0x8b020020, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn lazy_reloc_pre_post_index() {
+        // LDR x1, [x2], #8 (post-index) — 0xf8408441. Base x2 unrelocated.
+        let regs = regs_with(&[(2, 0x701f60)]);
+        let r = lazy_reloc_pick_register(0xf8408441, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(2));
+    }
+
+    #[test]
+    fn lazy_reloc_simd_multi_structure() {
+        // LD1 {v1.16b, v2.16b}, [x1] — 0x4c40a021 (python3.12 memcpy path).
+        let regs = regs_with(&[(1, 0x715fe0)]);
+        let r = lazy_reloc_pick_register(0x4c40a021, &regs, 0x715fe0, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(1));
+    }
+
+    #[test]
+    fn lazy_reloc_simd_multi_structure_post_index() {
+        // LD1 {v0.16b, v1.16b}, [x1], #32 — 0x4cdfa020.
+        let regs = regs_with(&[(1, 0x715fe0)]);
+        let r = lazy_reloc_pick_register(0x4cdfa020, &regs, 0x715fe0, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(1));
+    }
+
+    #[test]
+    fn lazy_reloc_ldp() {
+        // LDP x0, x1, [x2] — 0xa9400440. Base x2 unrelocated.
+        let regs = regs_with(&[(2, 0x701f60)]);
+        let r = lazy_reloc_pick_register(0xa9400440, &regs, 0x701f60, RELOC_LO, RELOC_HI);
+        assert_eq!(r, Some(2));
+    }
 
     /// Instruction encodings extracted from libpython3.12.so via `objdump -d | grep x18/w18`.
     /// Every one of these MUST be detected by `references_x18()`.

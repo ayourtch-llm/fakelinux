@@ -255,6 +255,9 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
                 if lo < orig_lo { orig_lo = lo; }
                 if hi > orig_hi { orig_hi = hi; }
             }
+            // Const pointer tables in .rodata (non-PIE puts them there) —
+            // python3.12 has ~6000 that the writable-segment scan misses.
+            fixup_exec_rodata_pointers(elf, data, base_offset, orig_lo, orig_hi);
             crate::trap::EXEC_BASE_OFFSET.store(base_offset, std::sync::atomic::Ordering::SeqCst);
             crate::trap::EXEC_ORIG_LO.store(orig_lo, std::sync::atomic::Ordering::SeqCst);
             crate::trap::EXEC_ORIG_HI.store(orig_hi, std::sync::atomic::Ordering::SeqCst);
@@ -1169,6 +1172,92 @@ fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
     if fixed > 0 || skipped_rela > 0 {
         eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data ({} skipped, RELA-covered)",
                   fixed, skipped_rela);
+    }
+}
+
+/// Fix up absolute pointers in the .rodata section of a relocated ET_EXEC.
+/// Non-PIE binaries put const pointer tables (function pointer arrays,
+/// string tables, static PyObject graphs…) in .rodata, which the writable-
+/// segment scan never touches — python3.12 has ~6000 such pointers and
+/// crashes chasing them. .rodata is mapped read-only, so temporarily make
+/// it writable. Section identified by name to avoid touching .dynsym,
+/// .gnu.hash, .eh_frame etc. which ld-linux interprets itself.
+fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo: u64, orig_hi: u64) {
+    let e_shoff = elf::read_u64_pub(data, 40) as usize;
+    let e_shentsize = elf::read_u16_pub(data, 58) as usize;
+    let e_shnum = elf::read_u16_pub(data, 60) as usize;
+    let e_shstrndx = elf::read_u16_pub(data, 62) as usize;
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 || e_shstrndx >= e_shnum {
+        return;
+    }
+    let str_off = e_shoff + e_shstrndx * e_shentsize;
+    if str_off + 64 > data.len() {
+        return;
+    }
+    let shstr_offset = elf::read_u64_pub(data, str_off + 24) as usize;
+
+    let page: u64 = 16384;
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        if off + 64 > data.len() {
+            break;
+        }
+        let sh_name = elf::read_u32_pub(data, off) as usize;
+        let sh_type = elf::read_u32_pub(data, off + 4);
+        let sh_flags = elf::read_u64_pub(data, off + 8);
+        let sh_addr = elf::read_u64_pub(data, off + 16);
+        let sh_size = elf::read_u64_pub(data, off + 32);
+        // SHT_PROGBITS, ALLOC, not WRITE, not EXECINSTR
+        if sh_type != 1 || sh_flags & 0x2 == 0 || sh_flags & 0x1 != 0 || sh_flags & 0x4 != 0 {
+            continue;
+        }
+        let name_pos = shstr_offset + sh_name;
+        if !data[name_pos..].starts_with(b".rodata\0") {
+            continue;
+        }
+        let start = base_offset + sh_addr;
+        let prot_lo = start & !(page - 1);
+        let prot_hi = (start + sh_size + page - 1) & !(page - 1);
+        let r = unsafe {
+            libc::mprotect(prot_lo as *mut _, (prot_hi - prot_lo) as usize,
+                           libc::PROT_READ | libc::PROT_WRITE)
+        };
+        if r != 0 {
+            eprintln!("fakelinux: rodata fixup: mprotect RW failed, skipping");
+            return;
+        }
+        let mut fixed = 0u64;
+        let mut o: u64 = 0;
+        while o + 8 <= sh_size {
+            let p = (start + o) as *mut u64;
+            let val = unsafe { *p };
+            if val >= orig_lo && val < orig_hi {
+                unsafe { *p = val + base_offset; }
+                fixed += 1;
+            }
+            o += 8;
+        }
+        // Restore protections from the covering PT_LOAD per page — an edge
+        // page may be shared with .text (needs EXEC back!) or writable data.
+        let mut pg = prot_lo;
+        while pg < prot_hi {
+            let vaddr = pg - base_offset;
+            let mut prot = libc::PROT_READ;
+            for phdr in &elf.phdrs {
+                if phdr.p_type != PT_LOAD { continue; }
+                if vaddr + page > phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_memsz {
+                    if phdr.p_flags & 1 != 0 { prot |= libc::PROT_EXEC; }
+                    if phdr.p_flags & 2 != 0 { prot |= libc::PROT_WRITE; }
+                }
+            }
+            unsafe {
+                libc::mprotect(pg as *mut _, page as usize, prot);
+            }
+            pg += page;
+        }
+        if fixed > 0 {
+            eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC .rodata", fixed);
+        }
     }
 }
 
