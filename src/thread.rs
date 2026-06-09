@@ -920,7 +920,11 @@ extern "C" fn patch_trampoline_entry() -> ! {
 pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     let mut status: i32 = 0;
     let status_ptr = if wstatus_ptr != 0 { &mut status as *mut i32 } else { std::ptr::null_mut() };
-    let rusage = if rusage_ptr != 0 { rusage_ptr as *mut libc::rusage } else { std::ptr::null_mut() };
+    // NEVER pass the guest pointer through: macOS fills tv_usec as i32
+    // (leaving the upper 4 bytes of the Linux i64 field as garbage) and
+    // ru_maxrss in bytes (Linux: KB). Fill a local struct and convert.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rusage = if rusage_ptr != 0 { &mut usage as *mut libc::rusage } else { std::ptr::null_mut() };
 
     let ret = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
     if crate::syscall::trace_enabled() && ret > 0 && wstatus_ptr != 0 {
@@ -938,6 +942,13 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
     // Write status back to guest memory (Linux and macOS wstatus format is compatible)
     if wstatus_ptr != 0 {
         unsafe { (wstatus_ptr as *mut i32).write(status); }
+    }
+    // Write the converted rusage (only meaningful when a child was reaped)
+    if rusage_ptr != 0 && ret > 0 {
+        let bytes = crate::syscall::linux_rusage_bytes(&usage);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), rusage_ptr as *mut u8, bytes.len());
+        }
     }
 
     ret as u64

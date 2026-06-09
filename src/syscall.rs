@@ -2466,6 +2466,38 @@ fn do_sysinfo(buf: u64) -> u64 {
     0
 }
 
+/// Convert a macOS `struct rusage` to the Linux aarch64 byte layout.
+///
+/// Field order is identical (BSD heritage), but two things differ:
+/// - `tv_usec` is i32 (+ 4 bytes padding) on macOS, i64 on Linux. A raw
+///   copy relies on the padding being zero — and when the KERNEL fills the
+///   struct in guest memory (wait4 passthrough), the upper 4 bytes are
+///   whatever garbage was there before (the vim gettimeofday bug class).
+/// - macOS `ru_maxrss` is in BYTES; Linux is in KILOBYTES.
+pub(crate) fn linux_rusage_bytes(u: &libc::rusage) -> [u8; 144] {
+    let mut out = [0u8; 144];
+    let mut put = |off: usize, v: i64| out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    put(0, u.ru_utime.tv_sec as i64);
+    put(8, u.ru_utime.tv_usec as i64);
+    put(16, u.ru_stime.tv_sec as i64);
+    put(24, u.ru_stime.tv_usec as i64);
+    put(32, (u.ru_maxrss as i64) / 1024); // bytes → KB
+    put(40, u.ru_ixrss as i64);
+    put(48, u.ru_idrss as i64);
+    put(56, u.ru_isrss as i64);
+    put(64, u.ru_minflt as i64);
+    put(72, u.ru_majflt as i64);
+    put(80, u.ru_nswap as i64);
+    put(88, u.ru_inblock as i64);
+    put(96, u.ru_oublock as i64);
+    put(104, u.ru_msgsnd as i64);
+    put(112, u.ru_msgrcv as i64);
+    put(120, u.ru_nsignals as i64);
+    put(128, u.ru_nvcsw as i64);
+    put(136, u.ru_nivcsw as i64);
+    out
+}
+
 fn do_getrusage(who: i32, buf: u64) -> u64 {
     if buf == 0 {
         return (-14_i64) as u64; // -EFAULT
@@ -2478,13 +2510,8 @@ fn do_getrusage(who: i32, buf: u64) -> u64 {
         if ret < 0 {
             return translate::linux_errno();
         }
-        // Linux struct rusage on aarch64: same layout as macOS (timeval pairs + longs)
-        // Both are 144 bytes on 64-bit platforms. Copy directly.
-        std::ptr::copy_nonoverlapping(
-            &usage as *const _ as *const u8,
-            buf as *mut u8,
-            std::mem::size_of::<libc::rusage>(),
-        );
+        let bytes = linux_rusage_bytes(&usage);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
     }
     0
 }
@@ -3121,6 +3148,38 @@ pub fn merge_envp(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    // ── linux_rusage_bytes ───────────────────────────────────────────────
+
+    #[test]
+    fn rusage_usec_widened_to_i64_and_maxrss_in_kb() {
+        let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+        u.ru_utime.tv_sec = 3;
+        u.ru_utime.tv_usec = 999_999; // fits i32; must land in a full i64 field
+        u.ru_stime.tv_sec = 1;
+        u.ru_stime.tv_usec = 250_000;
+        u.ru_maxrss = 5 * 1024 * 1024; // macOS: BYTES
+        u.ru_minflt = 42;
+        u.ru_nivcsw = 7;
+
+        let b = linux_rusage_bytes(&u);
+        let rd = |off: usize| i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        assert_eq!(rd(0), 3, "ru_utime.tv_sec");
+        assert_eq!(rd(8), 999_999, "ru_utime.tv_usec as i64");
+        assert_eq!(rd(16), 1, "ru_stime.tv_sec");
+        assert_eq!(rd(24), 250_000, "ru_stime.tv_usec as i64");
+        assert_eq!(rd(32), 5 * 1024, "ru_maxrss bytes → KB");
+        assert_eq!(rd(64), 42, "ru_minflt");
+        assert_eq!(rd(136), 7, "ru_nivcsw (last field)");
+    }
+
+    #[test]
+    fn rusage_layout_is_144_bytes_zero_safe() {
+        let u: libc::rusage = unsafe { std::mem::zeroed() };
+        let b = linux_rusage_bytes(&u);
+        assert_eq!(b.len(), 144);
+        assert!(b.iter().all(|&x| x == 0), "zeroed input → zeroed output");
+    }
 
     // ── mprotect_align_range ─────────────────────────────────────────────
 
