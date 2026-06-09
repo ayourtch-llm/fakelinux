@@ -4,6 +4,61 @@ A running log of what got fixed, how it was found, and what the bug
 actually was. Newest entries at the top. (Companion to `docs/diary.md`
 and `handoff.md` — this one is the narrative for humans.)
 
+## 2026-06-10 (session 7, part 3) — TLS works: two crypto-adjacent bugs
+
+The road to `git clone https://gerrit.fd.io/r/vpp` went through TLS,
+and TLS was broken in two completely different ways.
+
+### Bug 1: trap_handler Rust panic on `ins v0.b[7], w18` (0b1192b)
+
+python `ssl.wrap_socket()` aborted with exit 134 — a Rust panic
+**inside the SIGILL trap handler** (panic in extern "C" = cannot unwind
+= abort). The panic message said it all once captured with
+RUST_BACKTRACE: `UNHANDLED EmulClass::Other for instr=0x4e0f1e40`.
+
+Decoded: `ins v0.b[7], w18` — OpenSSL's AES asm inserting a byte from
+**w18** into a SIMD register. The patcher correctly flagged it (reads
+guest x18) but the emulator had no handler for the AdvSIMD copy class.
+Wrote `emul_simd_copy`: DUP (element/general), INS (general/element),
+SMOV, UMOV — vector forms included since the patcher also matches v18
+in the Rn field. 6 new tests. Result: `print(t.version())` → TLSv1.3.
+
+### Bug 2: nettle hashed garbage — K tables "patched" (the good one)
+
+git still failed: `gnutls_handshake() failed: Decryption has failed`,
+same for github — systemic. Bisect: every cipher failed, every group
+failed, `GNUTLS_CPUID_OVERRIDE=0x1` (no accel) failed. Then the gold
+nugget: `printf abc | nettle-hash -a sha256` returned **the wrong
+hash**, identical for C and asm paths (`NETTLE_FAT_OVERRIDE`). And
+sha1/md5 were *correct* — only sha256/sha512 wrong. What do those two
+have that the others don't? **Big K constant tables in .rodata.**
+
+(User, half-asleep, from memory: "we had this bug earlier — hash table
+constants got accidentally 'relocated'." Exactly the right instinct.)
+
+`FAKELINUX_NO_X18=1` made hashes correct → x18 false-positive patches
+were corrupting the K tables. Root cause: libnettle has ONE R-X LOAD
+covering .text *and* .rodata. At runtime ld.so doesn't map section
+headers (end of file), so `patch_new_code`'s eh_frame strategy found
+nothing and fell back to "whole exec segment" — including .rodata,
+where K constants decode like x18-touching instructions.
+
+Fix (TDD, new test truncates libnettle at the LOAD boundary to simulate
+the runtime view): implement the long-TODO'd Strategy 2 — locate
+.eh_frame via **PT_GNU_EH_FRAME** (.eh_frame_hdr IS mapped), decode the
+`eh_frame_ptr`, hand off to the existing FDE parser. Memory-view ranges
+now byte-identical to file-view ranges.
+
+After: nettle hashes correct, `gnutls-cli stdio.be:443` (user's server)
+handshake completed, and **git clone over https works**. 348 tests.
+
+### Side notes
+
+- Enabled `universe` in the container's apt sources (gnutls-bin,
+  nettle-bin live there) — handy for future debugging.
+- Remaining ungated debug spam during git/fork: POST_FORK_LR, ASM_X0,
+  STACK_DUMP `[sp+..]`, X30_BECAME_HEAP — still to gate like 49cee40.
+
 ## 2026-06-09 (session 7, part 2) — vim redraw + python3 ET_EXEC
 
 ### python3.12 runs! (f7319ff)
