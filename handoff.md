@@ -1,8 +1,31 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~09:30 (session 7, refresh #8). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~10:15 (session 7, refresh #10). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #9 STATUS — read this first (supersedes #8 below)
+## REFRESH #10 STATUS — read this first (supersedes #9 below)
+
+**ext-deps attempt #1 DONE_RC=2: dpdk extract failed — FIXED (2206b8b).**
+GNU tar uses **fchmodat2 (syscall 452)** w/ AT_SYMLINK_NOFOLLOW; ENOSYS
+→ tar followed dpdk-tarball symlinks (doc/api/dts/custom.css) → ELOOP
+→ tar exit 2. Implemented 452: Linux flag 0x100 → macOS 0x20 + nofollow
+path resolution. TDD (symlink mode test), 364 tests green.
+
+**IN FLIGHT: ext-deps rerun in pty-2** (container relaunched on new
+binary, same command/markers as #9: /tmp/ext-deps.log + ext-deps.done).
+daq stamps survived → resumes at dpdk. Watchers: persistent Monitor
+(done-marker + 15-min stall detector) + bg until-loop for
+.dpdk.extract.ok. Partial src-dpdk was rm'd before rerun.
+- write(1) EAGAIN storm in old log = guest-requested nonblock stdout
+  (F_SETFL IS translated) — noise, not a bug; daq built through it.
+- Perf sampled: short-lived build procs spend most time in _sigtramp
+  (SIGILL storm) + patch_new_code. Known; fix = more x18 trampoline
+  coverage, NOT now (don't swap binary mid-build!).
+- FAKELINUX_QUIET deferred until build finishes (cargo build would
+  swap binary under running build's exec'd children).
+- After DONE_RC=0: `make build` (same UNATTENDED/PKG_VERSION env),
+  then make run.
+
+## REFRESH #9 STATUS (older)
 
 **install-dep DONE_RC=0** (45700ae fchmodat garbage-x3, 0d0981a TMPDIR
 leak — see #8 below). Then install-ext-deps blockers, all fixed:

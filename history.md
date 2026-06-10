@@ -238,3 +238,29 @@ deliverable, and a TIF_RESTORE_SIGMASK-style override so the handler's
 sigreturn restores the pre-ppoll mask. Plus `Defaults !use_pty` in
 sudoers (we have no /dev/ptmx). sudo /bin/echo: instant. 358 tests green.
 install-dep is rerunning now.
+
+## Session 7, refresh #9→#10 (2026-06-10, ~10:00)
+
+**install-ext-deps attempt #1: died at the dpdk extract** — and the
+culprit was a syscall I'd never heard of until today: **fchmodat2
+(452)**, Linux 6.6's "fchmodat but with the flags argument it always
+should have had". Modern GNU tar calls it with AT_SYMLINK_NOFOLLOW for
+every extracted file. fakelinux said ENOSYS, tar fell back to a
+symlink-following chmod, and the dpdk tarball's doc symlinks
+(doc/api/dts/custom.css → ELOOP "Too many levels of symbolic links")
+made tar exit 2. Implemented it properly (2206b8b): translate Linux
+AT_SYMLINK_NOFOLLOW 0x100 → macOS 0x20, resolve the path *without*
+following the final symlink, TDD with a symlink-mode test proving we
+chmod the link and not the target. 364 tests green.
+
+Bonus finding from the same log: a storm of write(1)=EAGAIN on a pipe
+from one pid — but F_SETFL flags ARE translated, so that's a guest that
+*asked* for nonblocking stdout and poll-loops on it. Noise, not a bug
+(daq built fine through it). The diagnostic eprintln is on the
+FAKELINUX_QUIET shortlist though.
+
+daq's stamps all survived (.daq.*.ok), so the rerun resumes straight at
+the dpdk extract. Container relaunched on the fresh binary; ext-deps
+running again with monitors on the done-marker and a 15-min stall
+detector. Expect hours: dpdk + rdma-core + xdp-tools under emulated
+clang.
