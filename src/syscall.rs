@@ -319,9 +319,12 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_FCHMODAT => {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
             let mac_dirfd = translate::translate_dirfd(args[0] as i32);
-            // Linux fchmodat has AT_SYMLINK_NOFOLLOW=0x100 in flags (arg3), but macOS
-            // fchmodat doesn't support this flag and returns EINVAL. Strip it.
-            let mac_flags = (args[3] as i32) & !0x100;
+            // Linux fchmodat (53) takes only (dirfd, path, mode) — there is NO
+            // flags argument (that's fchmodat2, syscall 452). x3 is garbage at
+            // the call site; passing it through gave macOS EINVAL which the
+            // virtual-root fallback masked as success (man-db: .dpkg-new dir
+            // stayed mode 000 → renameat EACCES).
+            let mac_flags = 0;
             let ret = unsafe { libc::fchmodat(mac_dirfd, eff_path, args[2] as libc::mode_t, mac_flags) };
             if ret == 0 { 0 }
             else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
@@ -3378,6 +3381,35 @@ mod tests {
     fn mprotect_none_subpage_returns_none() {
         let r = mprotect_align_range(0x100001000, 0x1000, 0);
         assert_eq!(r, None);
+    }
+
+    // ── fchmodat: Linux syscall 53 has NO flags argument ─────────────────
+
+    #[test]
+    fn fchmodat_ignores_garbage_x3_register() {
+        // Linux fchmodat (53) takes only (dirfd, path, mode) — flags exist
+        // only in fchmodat2 (452). x3 holds garbage at the call site; dpkg
+        // had 0xc there. Passing it to macOS fchmodat gave EINVAL, which the
+        // virtual-root fallback masked as success → man-db's .dpkg-new dir
+        // stayed mode 000 → renameat EACCES ("unable to install new version
+        // of './var/cache/man'").
+        let dir = std::env::temp_dir().join(format!("fakelinux_fchmodat_test_{}", unsafe { libc::getpid() }));
+        let _ = std::fs::remove_dir(&dir);
+        let cpath = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkdir(cpath.as_ptr(), 0) }, 0);
+
+        let mut mctx: MContext64 = unsafe { std::mem::zeroed() };
+        const AT_FDCWD_LINUX: u64 = -100i64 as u64;
+        let r = emulate(
+            SYS_FCHMODAT,
+            &[AT_FDCWD_LINUX, cpath.as_ptr() as u64, 0o755, 0xc /* garbage x3 */, 0, 0],
+            &mut mctx,
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(r, 0);
+        assert_eq!(mode, 0o755, "chmod must actually land, not be faked");
     }
 
     // ── gettimeofday timeval conversion ──────────────────────────────────

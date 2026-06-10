@@ -590,7 +590,7 @@ mod tests {
 
         // .text coverage should be ~89% (libcrypto has many embedded data tables)
         let text_start = 0xb4000u64;
-        let text_size = 2453692u64;
+        let text_size = 2465884u64; // .text of 3.0.13-0ubuntu3.6 (apt upgraded the rootfs lib)
         let covered_in_text: u64 = ranges.iter()
             .filter(|&&(addr, _)| addr >= text_start && addr < text_start + text_size)
             .map(|&(_, len)| len)
@@ -599,8 +599,13 @@ mod tests {
         assert!(coverage > 0.85 && coverage < 0.95,
             "libcrypto coverage should be ~89%, got {:.1}%", coverage * 100.0);
 
-        // The SHA-256 K table at offset 0x25a9c0 should NOT be in any range
-        let sha_k_addr = 0x25a9c0u64;
+        // The SHA-256 K table should NOT be in any range. Locate it by
+        // content (first four K constants) so apt upgrades of the rootfs
+        // lib don't invalidate a hardcoded offset.
+        let k_head: Vec<u8> = [0x428a2f98u32, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5]
+            .iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sha_k_addr = data.windows(16).position(|w| w == &k_head[..])
+            .expect("SHA-256 K table not found in libcrypto") as u64;
         let in_range = ranges.iter().any(|&(start, len)| {
             sha_k_addr >= start && sha_k_addr < start + len
         });
