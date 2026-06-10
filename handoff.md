@@ -1,8 +1,45 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~08:45 (session 7, refresh #7). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~09:30 (session 7, refresh #8). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #7 STATUS — read this first (supersedes #6 below)
+## REFRESH #8 STATUS — read this first (supersedes #7 below)
+
+**install-dep DONE_RC=2 post-mortem — both root causes FIXED, committed:**
+- 45700ae fix(fchmodat): Linux syscall 53 has NO flags arg; we passed
+  garbage x3 → macOS EINVAL → masked as success → dpkg's mkdir(0)+chmod
+  left .dpkg-new dirs mode 000 → renameat EACCES (man-db failure).
+  Also made test_eh_frame_on_libcrypto content-based (apt upgraded the
+  rootfs libcrypto and stale offsets broke it).
+- 0d0981a fix(env): strip host TMPDIR/__CF_USER_TEXT_ENCODING/XPC_*
+  from guest env (dictionaries-common postinst died on mktemp under
+  /var/folders/...). 360 tests green.
+- Perl debs' "not a tar archive": NOT reproducible in isolation
+  (5x clean). Watch the rerun; if it recurs it's load-dependent —
+  suspect pipe/fd under SIGCHLD storm.
+
+**IN FLIGHT: install-dep RERUN in pty-2** (container bash, /root/vpp,
+fresh binary w/ both fixes; dpkg --configure -a was clean, FIX_RC=0).
+Same marker pattern: /tmp/install-dep.log + /tmp/install-dep.done
+(DONE_RC=…). Host watcher + 6-min stall detector running in background.
+- WHEN DONE_RC=0: `UNATTENDED=y DEBIAN_FRONTEND=noninteractive make
+  install-ext-deps` (same log pattern), then `make build`, then
+  `make run`/`make test`.
+- TERMINAL GOTCHA: bash checks isatty(stderr) AT STARTUP for
+  interactivity. To keep fakelinux spam out of the pty, launch:
+  `fakelinux --container ubuntu-rootfs/bin/bash -c 'exec /bin/bash -i
+  2>&1' 2>/tmp/container-stderr.log`. If pty garbles: [CTRL+C] then
+  `stty sane; printf '\033c'`.
+- Possible nicety queued: FAKELINUX_QUIET env to gate the ~24
+  eprintln "fakelinux: …" sites.
+
+Side quests queued: Rust in container, Claude Code in container (needs
+nodejs; user gives API key).
+
+CONTEXT RESET PROTOCOL: watch pty-1 for context warning → finish
+activity → update this file → stop own background tasks/monitors (else
+/clear hangs!) → self-inject /clear + continuation prompt via tttt.
+
+## REFRESH #7 STATUS (older)
 
 **Committed since #6** (all on `testing`, 358 tests green):
 - afd5a6a fix(exec): CLOEXEC re-applied before execve (py3compile deadlock)

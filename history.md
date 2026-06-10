@@ -4,6 +4,47 @@ A running log of what got fixed, how it was found, and what the bug
 actually was. Newest entries at the top. (Companion to `docs/diary.md`
 and `handoff.md` — this one is the narrative for humans.)
 
+## 2026-06-10 (session 7, part 5) — install-dep at 99%: garbage in x3 and a leaky TMPDIR
+
+The big `make install-dep` run finished with DONE_RC=2: 276 of 279
+packages in, three out — man-db plus two perl libs. Two more bugs, both
+again of the "macOS is not Linux" family rather than emulation:
+
+1. **fchmodat has no flags argument.** man-db's unpack died with
+   `unable to install new version of './var/cache/man': Permission
+   denied`. The trace showed the real failure was `renameat(...) →
+   EACCES` renaming `man.dpkg-new` → `man`. Why? dpkg creates dirs as
+   `mkdir(path, 0000)` then `chmod(0755)` — and our chmod never landed.
+   Linux `fchmodat` (syscall 53) takes only `(dirfd, path, mode)`;
+   flags exist only in `fchmodat2` (452). We were forwarding **x3 —
+   call-site garbage** (0xc from dpkg) — as flags to macOS fchmodat,
+   which returned EINVAL… and the virtual-root "fake success on EPERM"
+   fallback swallowed it. So the dir stayed mode 000 and macOS refused
+   to rename a search-denied directory. One-line fix + a regression
+   test that passes garbage x3 and asserts the chmod really lands.
+
+2. **Host TMPDIR leaked into the container.** After the fix,
+   `dpkg --configure -a` still failed in dictionaries-common:
+   ispell-autobuildhash ran `mktemp -d` under
+   `/var/folders/nm/…/T/` — macOS's per-user temp dir, straight from
+   the host environment, nonexistent in the rootfs. `build_guest_env`
+   now strips `TMPDIR`, `__CF_USER_TEXT_ENCODING`, and `XPC_*`.
+
+The two perl debs ("does not look like a tar archive" from
+`dpkg-deb --control`) refused to reproduce — 5× clean in isolation,
+sequential and parallel. Filed as "transient under load, watch the
+rerun". Bonus terminal archaeology: bash decides interactivity by
+`isatty(stderr)` **at startup**, so redirecting the container's stderr
+to a log file silently killed the prompt; the fix is
+`bash -c 'exec /bin/bash -i 2>&1'` so the guest's stderr returns to
+the pty while fakelinux's own host-side spam stays in the log.
+
+`dpkg --configure -a` then ran clean (FIX_RC=0) and install-dep is
+rerunning. 360 tests green (the libcrypto eh_frame test also needed
+its hardcoded offsets refreshed — apt had upgraded the rootfs's
+libcrypto.so.3 out from under it; it now finds the SHA-256 K table by
+content).
+
 ## 2026-06-10 (session 7, part 4) — the road to `make build`: two host-OS impedance mismatches
 
 vpp is cloned (`git fsck` exit 0) and `make` inside the container
