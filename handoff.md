@@ -1,8 +1,44 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~12:15 (session 7, refresh #11). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~13:20 (session 7, refresh #12). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #11 STATUS — read this first (supersedes #10 below)
+## REFRESH #12 STATUS — read this first (supersedes #11 below)
+
+**Two user-reported bugs FIXED + committed this refresh:**
+1. **curl 5s delay (d68fd35)**: curl sets Linux TCP_KEEPIDLE
+   (IPPROTO_TCP, optname 4); we passed TCP optnames through raw and
+   macOS (6,4) is TCP_NOPUSH → socket corked → HTTP request sat ~5s in
+   the send buffer. translate_sockopt now maps TCP_NODELAY/MAXSEG/
+   CORK→NOPUSH/KEEPIDLE→TCP_KEEPALIVE/KEEPINTVL/KEEPCNT; unknown TCP
+   optnames → ENOPROTOOPT (NEVER pass through — value spaces collide).
+   curl stdio.be 5.2s→0.15s. (https still ~3.3s = honest CPU in SIGILL
+   storm during TLS handshake — known x18-coverage perf item, NOT a bug.)
+2. **apt-get staircase output + broken terminal (1dad433)**: apt's
+   StartPtyMagic sets the REAL tty raw and pushes saved termios (ONLCR)
+   onto dpkg's pty via the MASTER fd. Two bugs: (a) our TIOCSPTLCK
+   unlock was a no-op → macOS slave stayed locked → slave open EACCES;
+   (b) termios/winsize ioctls on a pty master = ENOTTY on macOS (Linux
+   targets the slave's ldisc). Fix: real grantpt+unlockpt; on ENOTTY,
+   retry ioctl on transiently-opened slave (pty_master_open_slave in
+   syscall.rs). TCSETS now traced under FAKELINUX_TRACE.
+   Verified live in pty-5 (scratch zsh, can kill): straight columns,
+   onlcr intact after exit. **382 tests green.**
+   NOTE: working pty means dpkg children's loader spam is now VISIBLE
+   in apt output — FAKELINUX_QUIET wishlist item moved up.
+
+**ext-deps attempt #3 PROGRESSING (pty-2, /tmp/fakelinux-dbg binary —
+does NOT have today's two fixes; don't swap mid-build):**
+- daq DONE (.daq.install.ok ~13:13) — got past attempt-#2 wall #1.
+- rdma-core configuring now (cmake, clang detect ~13:15) — THE critical
+  test: its bitmap_test AdvSIMD panic killed attempt #2 (fixed eb867e0).
+- then dpdk (venv/ensurepip was the other crasher, also fixed).
+- Markers: /tmp/ext-deps.log + /tmp/ext-deps.done (DONE_RC=…) in
+  container = ubuntu-rootfs/tmp/. Monitor b3opr8h00 watches done-marker
+  + panic signatures + stall.
+- After DONE_RC=0: `make build` (UNATTENDED=y DEBIAN_FRONTEND=
+  noninteractive PKG_VERSION=26.10 PKG_SUFFIX=0), then make run.
+
+## REFRESH #11 STATUS (older)
 
 **ext-deps attempt #2 DONE_RC=2 — both blockers FIXED (eb867e0):**
 1. clang `ld2 {v0.2d,v1.2d},[x18]` (rdma-core bitmap_test) → trap_handler

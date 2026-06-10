@@ -340,3 +340,55 @@ Real switch tables always have a guard cmp; no cmp now means no
 exclusion. The determinism principle keeps winning.
 
 Attempt #3 running: daq → rdma-core → dpdk, hours on the clock.
+
+## The five-second curl (2026-06-10, while daq configures)
+
+While attempt #3 ground through daq's configure, the user noticed
+`curl stdio.be` took ages under fakelinux. Timing breakdown said it
+all: DNS 0.09s, connect 0.13s, first byte 5.17s — a flat, deterministic
+5 seconds, IPv4 or IPv6, even against a localhost python server. The
+killer experiment: timestamp when the *server* receives the request.
+sendto() returned 71 bytes instantly; the GET arrived server-side five
+seconds later. The data sat in the kernel's send buffer.
+
+The smoking gun was in the trace: curl enables TCP keepalive with
+setsockopt(IPPROTO_TCP, TCP_KEEPIDLE=4, 60). Our sockopt translation
+covered SOL_SOCKET but passed IPPROTO_TCP optnames through raw — and
+on macOS, (IPPROTO_TCP, 4) is TCP_NOPUSH. We were corking every socket
+curl opened, and macOS's infamous NOPUSH behavior holds the data ~5s.
+A one-value namespace collision, invisible because setsockopt happily
+returned 0.
+
+Fix (d68fd35): proper TCP optname table (KEEPIDLE→TCP_KEEPALIVE,
+CORK→NOPUSH, KEEPINTVL/KEEPCNT to their 0x10x values), and unknown TCP
+optnames now return ENOPROTOOPT instead of passing through — colliding
+value spaces mean pass-through is never safe. curl: 5.2s → 0.15s.
+HTTPS still takes ~3s, but that's honest work: 95% CPU in the SIGILL
+storm while emulated openssl does its handshake. Known issue, x18
+trampoline coverage, another day.
+
+## The staircase (2026-06-10, same afternoon)
+
+Second user report: apt-get output loses its carriage returns mid-
+install — classic terminal staircase — and the host terminal needs a
+`reset` afterwards. Reproduced in a scratch pty on the first try: the
+stairs start exactly at "(Reading database ...)" — the moment apt hands
+off to dpkg.
+
+The mechanism is elegant once you see it. apt's StartPtyMagic puts the
+REAL terminal into raw mode (OPOST off) on purpose, and runs dpkg on a
+pty slave carrying a copy of the original termios — the slave's ONLCR
+is what turns dpkg's LF into CRLF. New TCSETS tracing showed our side
+of the deal collapsing: tcsetattr on the pty MASTER returned -1. Linux
+lets you drive the slave's line discipline through the master; macOS
+says ENOTTY. And underneath that, a second bug: our TIOCSPTLCK
+(unlockpt) was a polite no-op, so the macOS slave was never actually
+unlocked — even apt's TIOCSWINSZ-on-master fallback path died with
+EACCES trying to open it.
+
+Fix (1dad433): unlockpt now really runs grantpt+unlockpt, and the
+termios/winsize ioctls retry on a transiently-opened slave when the fd
+turns out to be a master. apt output now comes down in straight
+columns and the terminal survives. Bonus discovery: with the pty
+actually working, dpkg children's stderr now lands on screen — the
+FAKELINUX_QUIET idea moves up the wishlist.
