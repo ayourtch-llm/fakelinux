@@ -720,6 +720,7 @@ fn do_close(fd: i32) -> u64 {
     eventfd::on_close(fd);
     epoll::on_close(fd);
     procfs::on_close(fd);
+    if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -775,6 +776,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
             eventfd::on_close(fd);
             epoll::on_close(fd);
             procfs::on_close(fd);
+            thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);
             unsafe { libc::close(fd); }
         }
     }
@@ -1194,11 +1196,23 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
         } else {
             arg as i32
         };
+        // F_SETFD: the guest takes explicit control of the fd flags — the
+        // host flag is now authoritative, drop any saved pre-fork bit.
+        if mac_cmd == libc::F_SETFD && fd >= 0 {
+            thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);
+        }
         let ret = unsafe { libc::fcntl(fd, mac_cmd, effective_arg) };
         if ret < 0 {
             translate::linux_errno()
         } else if linux_cmd == translate::LINUX_F_GETFL {
             translate::mac_fl_to_linux(ret) as u64
+        } else if mac_cmd == libc::F_GETFD
+            && fd >= 0
+            && thread::FORK_SAVED_CLOEXEC.had_cloexec(fd as usize)
+        {
+            // Linux semantics: CLOEXEC survives fork. We stripped the host
+            // flag before fork; report it as still set to the guest.
+            (ret | libc::FD_CLOEXEC) as u64
         } else {
             ret as u64
         }
@@ -1375,7 +1389,10 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
 
 fn do_dup(fd: i32) -> u64 {
     let ret = unsafe { libc::dup(fd) };
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    if ret < 0 { return translate::linux_errno(); }
+    // Fresh fd object — forget any stale pre-fork CLOEXEC bit for this slot.
+    thread::FORK_SAVED_CLOEXEC.clear_fd(ret as usize);
+    ret as u64
 }
 
 fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
@@ -1391,6 +1408,9 @@ fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
         }
         return err;
     }
+    // newfd is a fresh fd object now — any pre-fork CLOEXEC bit saved for the
+    // old fd at this slot must not be re-applied at exec time.
+    if newfd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(newfd as usize); }
     if flags & 0o2000000 != 0 {
         // O_CLOEXEC
         unsafe { libc::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC); }
@@ -1563,6 +1583,23 @@ fn fakelinux_env_overrides() -> Vec<(&'static str, Option<String>)> {
     v
 }
 
+/// Re-apply FD_CLOEXEC that was stripped before macOS fork (Linux semantics:
+/// CLOEXEC survives fork and fires at exec). We strip the flag pre-fork so
+/// macOS atfork handlers don't close the fds, and only restore it in the
+/// parent. The child must get it back HERE, right before execve — otherwise
+/// CLOEXEC fds survive the exec. Symptom: CPython subprocess's errpipe_write
+/// stayed open in the exec'd child, so the parent's Popen() blocked forever
+/// reading the errpipe (py3compile pipe deadlock in dpkg --configure
+/// python3-minimal).
+fn reapply_saved_cloexec_for_exec() {
+    for fd in thread::FORK_SAVED_CLOEXEC.drain_pending() {
+        let fl = unsafe { libc::fcntl(fd as i32, libc::F_GETFD) };
+        if fl >= 0 {
+            unsafe { libc::fcntl(fd as i32, libc::F_SETFD, fl | libc::FD_CLOEXEC); }
+        }
+    }
+}
+
 fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Re-exec ourselves (fakelinux) with the guest binary as argument.
     // This replaces the current process image entirely.
@@ -1695,6 +1732,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
                         .chain(std::iter::once(std::ptr::null()))
                         .collect();
+                    reapply_saved_cloexec_for_exec();
                     unsafe {
                         libc::execve(
                             self_exe_c.as_ptr(),
@@ -1796,6 +1834,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // This is critical for fork+exec in shells: the child must become the
     // new program directly, inheriting the exact fd table (pipe redirections,
     // dup2'd fds, etc.).
+    reapply_saved_cloexec_for_exec();
     unsafe {
         libc::execve(
             self_exe_c.as_ptr(),

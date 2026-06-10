@@ -39,6 +39,24 @@ impl SavedCloexecMask {
     pub fn clear(&self) {
         *self.bits.lock().unwrap() = [false; 256];
     }
+    /// Forget a single fd's saved bit. Call when the guest closes the fd or
+    /// dup2's over it — the saved bit refers to the old fd object, and
+    /// re-applying CLOEXEC to its replacement at exec would close a live fd.
+    pub fn clear_fd(&self, fd: usize) {
+        let mut m = self.bits.lock().unwrap();
+        if fd < 256 { m[fd] = false; }
+    }
+    /// Drain all still-pending fds (one-shot): fds that had CLOEXEC at fork
+    /// time and were not since closed/replaced. Called at exec time to
+    /// re-apply FD_CLOEXEC so the host execve closes them (Linux semantics).
+    pub fn drain_pending(&self) -> Vec<usize> {
+        let mut m = self.bits.lock().unwrap();
+        let mut v = Vec::new();
+        for fd in 0..256usize {
+            if m[fd] { m[fd] = false; v.push(fd); }
+        }
+        v
+    }
 }
 
 pub static FORK_SAVED_CLOEXEC: SavedCloexecMask = SavedCloexecMask::new();
@@ -1175,4 +1193,44 @@ fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
     }
 
     woken as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Lifecycle of the saved-CLOEXEC mask across fork→(dup2/close)→exec.
+    // Bug: fds with O_CLOEXEC (e.g. CPython subprocess's errpipe_write) had
+    // the flag stripped before macOS fork and never re-applied at exec, so
+    // they survived execve — parent blocked forever reading the errpipe
+    // (py3compile pipe deadlock during dpkg --configure python3-minimal).
+    #[test]
+    fn cloexec_mask_exec_lifecycle() {
+        let m = SavedCloexecMask::new();
+        let mut bits = [false; 256];
+        bits[5] = true;
+        bits[7] = true;
+        bits[13] = true;
+        m.store_mask(&bits);
+        // child dup2's a pipe over fd 7 → the saved bit refers to a dead
+        // fd object and must be forgotten
+        m.clear_fd(7);
+        // child closes fd 13 → forgotten
+        m.clear_fd(13);
+        // at exec time, only fd 5 still needs FD_CLOEXEC re-applied
+        assert_eq!(m.drain_pending(), vec![5]);
+        // drain is one-shot: a second exec re-applies nothing
+        assert!(m.drain_pending().is_empty());
+    }
+
+    #[test]
+    fn cloexec_mask_take_consumes() {
+        let m = SavedCloexecMask::new();
+        let mut bits = [false; 256];
+        bits[9] = true;
+        m.store_mask(&bits);
+        assert!(m.take(9));
+        assert!(!m.take(9));
+        assert!(m.drain_pending().is_empty());
+    }
 }
