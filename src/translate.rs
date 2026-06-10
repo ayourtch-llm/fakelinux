@@ -216,6 +216,17 @@ const LINUX_SO_ACCEPTCONN: i32 = 30;
 const LINUX_IPPROTO_IPV6: i32 = 41;
 const LINUX_IPV6_V6ONLY: i32 = 26;
 
+// Linux IPPROTO_TCP option names. Only TCP_NODELAY(1) and TCP_MAXSEG(2)
+// match macOS; above that the namespaces collide with different meanings
+// (Linux TCP_KEEPIDLE=4 vs macOS TCP_NOPUSH=4 — passing that through
+// corked curl's HTTP request in the send buffer for ~5s).
+const LINUX_TCP_NODELAY: i32 = 1;
+const LINUX_TCP_MAXSEG: i32 = 2;
+const LINUX_TCP_CORK: i32 = 3;
+const LINUX_TCP_KEEPIDLE: i32 = 4;
+const LINUX_TCP_KEEPINTVL: i32 = 5;
+const LINUX_TCP_KEEPCNT: i32 = 6;
+
 /// Translate Linux socket option level+name to macOS equivalents.
 /// Returns (mac_level, mac_optname). Returns None if unknown.
 pub fn translate_sockopt(linux_level: i32, linux_optname: i32) -> Option<(i32, i32)> {
@@ -243,9 +254,24 @@ pub fn translate_sockopt(linux_level: i32, linux_optname: i32) -> Option<(i32, i
             _ => linux_optname, // most IPV6 options have same values
         };
         Some((libc::IPPROTO_IPV6, mac_opt))
+    } else if linux_level == libc::IPPROTO_TCP {
+        let mac_opt = match linux_optname {
+            LINUX_TCP_NODELAY => libc::TCP_NODELAY,
+            LINUX_TCP_MAXSEG => libc::TCP_MAXSEG,
+            LINUX_TCP_CORK => libc::TCP_NOPUSH, // closest macOS equivalent
+            LINUX_TCP_KEEPIDLE => libc::TCP_KEEPALIVE,
+            LINUX_TCP_KEEPINTVL => libc::TCP_KEEPINTVL,
+            LINUX_TCP_KEEPCNT => libc::TCP_KEEPCNT,
+            // Unknown TCP optnames must NOT pass through: the value spaces
+            // collide (e.g. macOS 4 = TCP_NOPUSH). Callers turn None into
+            // ENOPROTOOPT, which guests handle like a kernel without the
+            // feature.
+            _ => return None,
+        };
+        Some((libc::IPPROTO_TCP, mac_opt))
     } else {
-        // IPPROTO_TCP(6), IPPROTO_IP(0), etc. — same on both platforms,
-        // and most option names (TCP_NODELAY=1, etc.) match too
+        // IPPROTO_IP(0), etc. — same on both platforms for the options
+        // guests commonly use
         Some((linux_level, linux_optname))
     }
 }
@@ -561,6 +587,35 @@ mod tests {
             assert_eq!(i64::from_le_bytes(buf[16..24].try_into().unwrap()), 10);
             assert_eq!(i32::from_le_bytes(buf[24..28].try_into().unwrap()), 42);
         }
+    }
+
+    #[test]
+    fn test_tcp_sockopt_translation() {
+        // curl's "GET http://..." took a flat 5s to first byte: it sets
+        // Linux TCP_KEEPIDLE (IPPROTO_TCP, 4), which passed through raw —
+        // but macOS (IPPROTO_TCP, 4) is TCP_NOPUSH, corking the socket.
+        // The HTTP request then sat in the send buffer for macOS's ~5s
+        // NOPUSH flush delay. TCP optnames diverge above TCP_MAXSEG and
+        // MUST be mapped, never passed through.
+        let cases: &[(i32, i32)] = &[
+            (1, libc::TCP_NODELAY),    // same on both
+            (2, libc::TCP_MAXSEG),     // same on both
+            (3, libc::TCP_NOPUSH),     // Linux TCP_CORK ≈ macOS TCP_NOPUSH
+            (4, libc::TCP_KEEPALIVE),  // Linux TCP_KEEPIDLE → macOS 0x10
+            (5, libc::TCP_KEEPINTVL),  // Linux 5 → macOS 0x101
+            (6, libc::TCP_KEEPCNT),    // Linux 6 → macOS 0x102
+        ];
+        for &(linux_opt, mac_opt) in cases {
+            assert_eq!(
+                translate_sockopt(6, linux_opt),
+                Some((libc::IPPROTO_TCP, mac_opt)),
+                "Linux TCP optname {} must map to macOS {}", linux_opt, mac_opt
+            );
+        }
+        // Unknown TCP optnames must NOT pass through (collision danger);
+        // None makes the callers return ENOPROTOOPT like a kernel would.
+        assert_eq!(translate_sockopt(6, 11), None, "TCP_INFO has no macOS equivalent");
+        assert_eq!(translate_sockopt(6, 18), None, "TCP_USER_TIMEOUT has no macOS equivalent");
     }
 
     #[test]

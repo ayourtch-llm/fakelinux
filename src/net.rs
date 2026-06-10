@@ -323,10 +323,9 @@ pub fn do_recvfrom(
 pub fn do_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
     let (mac_level, mac_optname) = match translate::translate_sockopt(level, optname) {
         Some(pair) => pair,
-        None => {
-            // Unknown option — try pass-through, return ENOPROTOOPT on failure
-            (level, optname)
-        }
+        // Unknown option — never pass through (optname values collide across
+        // platforms, e.g. Linux TCP_KEEPIDLE=4 vs macOS TCP_NOPUSH=4).
+        None => return (-92i64) as u64, // Linux ENOPROTOOPT
     };
     let ret = unsafe {
         libc::setsockopt(
@@ -347,7 +346,7 @@ pub fn do_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u32
 pub fn do_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen_ptr: u64) -> u64 {
     let (mac_level, mac_optname) = match translate::translate_sockopt(level, optname) {
         Some(pair) => pair,
-        None => (level, optname),
+        None => return (-92i64) as u64, // Linux ENOPROTOOPT — see do_setsockopt
     };
     let ret = unsafe {
         libc::getsockopt(
