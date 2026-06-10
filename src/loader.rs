@@ -1182,6 +1182,189 @@ fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
 /// crashes chasing them. .rodata is mapped read-only, so temporarily make
 /// it writable. Section identified by name to avoid touching .dynsym,
 /// .gnu.hash, .eh_frame etc. which ld-linux interprets itself.
+/// Scan executable code for switch jump tables located in .rodata, so the
+/// pointer-fixup heuristic can skip them.
+///
+/// The fixup scan patches any aligned u64 in [orig_lo, orig_hi) by adding
+/// base_offset — but a switch jump table is an array of small 16-bit code
+/// offsets, and four consecutive halfwords like [0x0000, 0x0054, 0x0000,
+/// 0x0000] read as u64 0x540000, square in the "unrelocated pointer" range.
+/// The fixup then writes 0x0007 into the third halfword, sending some switch
+/// case into the middle of an unrelated basic block (gcc cc1's
+/// equiv_oracle::find_equiv_block ICE'd exactly this way on hello-world).
+///
+/// Only DISPATCH tables can alias into the pointer range like this; plain
+/// data lookup tables (e.g. gcc's tree_contains_struct byte array) hold
+/// small values whose u64 view is out of range, and excluding them is
+/// actively harmful: their true length is unknowable, and pointer data right
+/// after the table would be left unrelocated (real regression: cc1's
+/// operator tables at 0x16794f0). So a table is excluded only when the full
+/// dispatch idiom is present, which conveniently carries the table BOUND in
+/// the guarding compare:
+///
+///     cmp  wX, #N            ; bound: N+1 entries   (within 8 instrs back)
+///     b.hi default
+///     adrp xA, page          ; table base
+///     add  xA, xA, #lo
+///     ldrh wB, [xA, wI, uxtw #1]   ; sub-word indexed load
+///     adr  xC, anchor
+///     add  xD, xC, wB, sxth #2
+///     br   xD                ; dispatch  (within 8 instrs ahead)
+///
+/// Returns sorted (start, end) ranges in ORIGINAL vaddr space that must not
+/// be pointer-fixed.
+fn scan_rodata_table_exclusions(text: &[u8], text_vaddr: u64, ro_lo: u64, ro_hi: u64) -> Vec<(u64, u64)> {
+    // Fallback table size when the guarding cmp is not found.
+    const MAX_TABLE_SIZE: u64 = 0x1000;
+    // How many instructions an ADRP/ADD-computed address stays "fresh" in our
+    // register state, and how far we look ahead for the dispatch br.
+    const WINDOW: usize = 8;
+    // How far back we search for the guarding cmp on the index register.
+    const CMP_WINDOW: usize = 32;
+
+    let read_instr = |i: usize| -> u32 {
+        u32::from_le_bytes([text[i * 4], text[i * 4 + 1], text[i * 4 + 2], text[i * 4 + 3]])
+    };
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    // reg -> (computed address, instruction index it was set at)
+    let mut state: [Option<(u64, usize)>; 32] = [None; 32];
+
+    let n_instr = text.len() / 4;
+    for i in 0..n_instr {
+        let instr = read_instr(i);
+        let pc = text_vaddr + (i as u64) * 4;
+
+        if instr & 0x9F000000 == 0x90000000 {
+            // ADRP xD, page
+            let rd = (instr & 31) as usize;
+            let immlo = ((instr >> 29) & 3) as u64;
+            let immhi = ((instr >> 5) & 0x7FFFF) as u64;
+            let imm21 = (immhi << 2) | immlo;
+            // sign-extend 21 bits, page-scaled
+            let simm = ((imm21 << 43) as i64 >> 43) << 12;
+            let val = (pc & !0xFFF).wrapping_add(simm as u64);
+            state[rd] = Some((val, i));
+            continue;
+        }
+        if instr & 0x9F000000 == 0x10000000 {
+            // ADR xD, target
+            let rd = (instr & 31) as usize;
+            let immlo = ((instr >> 29) & 3) as u64;
+            let immhi = ((instr >> 5) & 0x7FFFF) as u64;
+            let imm21 = (immhi << 2) | immlo;
+            let simm = (imm21 << 43) as i64 >> 43;
+            state[rd] = Some((pc.wrapping_add(simm as u64), i));
+            continue;
+        }
+        if instr & 0xFF800000 == 0x91000000 {
+            // ADD xD, xN, #imm12 {, LSL #12}
+            let rd = (instr & 31) as usize;
+            let rn = ((instr >> 5) & 31) as usize;
+            let imm12 = ((instr >> 10) & 0xFFF) as u64;
+            let sh = (instr >> 22) & 1;
+            let imm = imm12 << (12 * sh);
+            state[rd] = match state[rn] {
+                Some((v, set_at)) if i - set_at <= WINDOW => Some((v.wrapping_add(imm), i)),
+                _ => None,
+            };
+            continue;
+        }
+        if instr & 0x3F200C00 == 0x38200800 {
+            // Load/store (register offset), V=0:
+            //   size(31:30) 111000 opc(23:22) 1 Rm option S 10 Rn Rt
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            // Sub-word LOADS only: LDRB/LDRSB (size=00), LDRH/LDRSH (size=01),
+            // LDRSW (size=10, opc=10). opc=00 is a store; size=11 is 64-bit.
+            let is_table_load = match (size, opc) {
+                (0, 1) | (0, 2) | (0, 3) => true,
+                (1, 1) | (1, 2) | (1, 3) => true,
+                (2, 2) => true,
+                _ => false,
+            };
+            let rn = ((instr >> 5) & 31) as usize;
+            let base = match (is_table_load, state[rn]) {
+                (true, Some((v, set_at))) if i - set_at <= WINDOW && v >= ro_lo && v < ro_hi => Some(v),
+                _ => None,
+            };
+            // The load writes Rt — drop any tracked state for it.
+            let rt = (instr & 31) as u32;
+            state[rt as usize] = None;
+            let base = match base { Some(b) => b, None => continue };
+
+            // Dispatch idiom check: the LOADED value must feed an
+            // ADD (extended or shifted register, Rm == Rt) and a BR must
+            // follow — i.e. the table entry becomes a branch target. A data
+            // table whose load merely precedes some unrelated BR must NOT
+            // match (over-excluding real pointer data broke the gcc driver).
+            let mut saw_add_of_rt = false;
+            let mut has_dispatch = false;
+            for j in i + 1..(i + 1 + WINDOW).min(n_instr) {
+                let nx = read_instr(j);
+                let is_add_ext = nx & 0xFFE00000 == 0x8B200000; // ADD Xd,Xn,Wm,ext
+                let is_add_shift = nx & 0xFF200000 == 0x8B000000; // ADD Xd,Xn,Xm{,shift}
+                if (is_add_ext || is_add_shift) && (nx >> 16) & 31 == rt {
+                    saw_add_of_rt = true;
+                }
+                if saw_add_of_rt && nx & 0xFFFFFC1F == 0xD61F0000 {
+                    has_dispatch = true;
+                    break;
+                }
+            }
+            if !has_dispatch {
+                continue; // plain data table — safe for pointer fixup
+            }
+            // Bound from the guarding CMP (SUBS WZR form) on the load's
+            // INDEX register — an unrelated nearby cmp must not set the
+            // bound. The guard can sit a few blocks back (e.g. the gcc
+            // driver's `cmp w24, #0x7c; b.ls <dispatch>` is 10 instructions
+            // before the load), hence the wider backward window.
+            let rm = (instr >> 16) & 31;
+            let bound = (i.saturating_sub(CMP_WINDOW)..i).rev().find_map(|j| {
+                let c = read_instr(j);
+                if c & 0xFF80001F == 0x7100001F && (c >> 5) & 31 == rm {
+                    Some((((c >> 10) & 0xFFF) as u64 + 1) << size)
+                } else {
+                    None
+                }
+            });
+            let end = (base + bound.unwrap_or(MAX_TABLE_SIZE)).min(ro_hi);
+            if end > base {
+                ranges.push((base, end));
+            }
+            continue;
+        }
+        // Unknown instruction: conservatively drop tracked state for the
+        // register named in bits 4:0 (Rd/Rt for most encodings). Branches put
+        // immediate bits there — clearing a random register is safe (lossy at
+        // worst), and the freshness window bounds any remaining staleness.
+        state[(instr & 31) as usize] = None;
+    }
+
+    // Sort and merge overlaps.
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
+fn addr_in_sorted_ranges(addr: u64, ranges: &[(u64, u64)]) -> bool {
+    match ranges.binary_search_by(|&(s, _)| s.cmp(&addr)) {
+        Ok(_) => true,
+        Err(0) => false,
+        Err(i) => addr < ranges[i - 1].1,
+    }
+}
+
 fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo: u64, orig_hi: u64) {
     let e_shoff = elf::read_u64_pub(data, 40) as usize;
     let e_shentsize = elf::read_u16_pub(data, 58) as usize;
@@ -1215,6 +1398,30 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
         if !data[name_pos..].starts_with(b".rodata\0") {
             continue;
         }
+        // Find lookup/jump tables inside this .rodata by scanning the
+        // executable sections' code — those must NOT be pointer-fixed
+        // (see scan_rodata_table_exclusions).
+        let mut exclusions: Vec<(u64, u64)> = Vec::new();
+        for j in 0..e_shnum {
+            let xoff = e_shoff + j * e_shentsize;
+            if xoff + 64 > data.len() { break; }
+            let x_type = elf::read_u32_pub(data, xoff + 4);
+            let x_flags = elf::read_u64_pub(data, xoff + 8);
+            if x_type != 1 || x_flags & 0x4 == 0 { continue; } // SHT_PROGBITS + EXECINSTR
+            let x_addr = elf::read_u64_pub(data, xoff + 16);
+            let x_offset = elf::read_u64_pub(data, xoff + 24) as usize;
+            let x_size = elf::read_u64_pub(data, xoff + 32) as usize;
+            if x_offset + x_size > data.len() { continue; }
+            let mut r = scan_rodata_table_exclusions(
+                &data[x_offset..x_offset + x_size], x_addr, sh_addr, sh_addr + sh_size);
+            exclusions.append(&mut r);
+        }
+        exclusions.sort_unstable();
+        if std::env::var("FAKELINUX_TRACE_TABLES").is_ok() {
+            for &(s, e) in &exclusions {
+                eprintln!("fakelinux: table exclusion {:#x}..{:#x} ({} bytes)", s, e, e - s);
+            }
+        }
         let start = base_offset + sh_addr;
         let prot_lo = start & !(page - 1);
         let prot_hi = (start + sh_size + page - 1) & !(page - 1);
@@ -1227,13 +1434,18 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
             return;
         }
         let mut fixed = 0u64;
+        let mut skipped_tables = 0u64;
         let mut o: u64 = 0;
         while o + 8 <= sh_size {
             let p = (start + o) as *mut u64;
             let val = unsafe { *p };
             if val >= orig_lo && val < orig_hi {
-                unsafe { *p = val + base_offset; }
-                fixed += 1;
+                if addr_in_sorted_ranges(sh_addr + o, &exclusions) {
+                    skipped_tables += 1;
+                } else {
+                    unsafe { *p = val + base_offset; }
+                    fixed += 1;
+                }
             }
             o += 8;
         }
@@ -1256,7 +1468,8 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
             pg += page;
         }
         if fixed > 0 {
-            eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC .rodata", fixed);
+            eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC .rodata ({} lookup-table candidates skipped)",
+                      fixed, skipped_tables);
         }
     }
 }
@@ -1610,6 +1823,122 @@ mod tests {
     use std::ffi::CString;
 
     fn c(s: &[u8]) -> CString { CString::new(s).unwrap() }
+
+    // ── scan_rodata_table_exclusions ─────────────────────────────────────
+    // Real gcc-13 cc1 crash: the pointer-fixup heuristic patched a switch
+    // jump table in .rodata (u64 view of halfwords [0,0x54,0,0] = 0x540000
+    // looked like an unrelocated pointer; +0x700000000 wrote 7 into a table
+    // entry → br into the middle of a basic block → ICE on hello-world).
+
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn cc1_switch_dispatch_table_is_excluded() {
+        // The exact instruction words from cc1's equiv_oracle::find_equiv_block
+        // at vaddr 0xfd20ec: sub w8, w21, #0x12; cmp w8, #0x81; b.hi;
+        // adrp x9, 0x17fe000; add x9, x9, #0xda0;
+        // ldrh w9, [x9, w8, uxtw #1]; adr x8; add x9, x8, w9, sxth #2; br x9
+        // — table at 0x17feda0 in .rodata, 0x82 halfword entries (from cmp).
+        let text = words(&[
+            0x51004aa8, 0x7102051f, 0x540000e8,
+            0x90004169, 0x91368129, 0x78685929,
+            0x10000068, 0x8b29a909, 0xd61f0120,
+        ]);
+        let r = scan_rodata_table_exclusions(&text, 0xfd20ec, 0x162f1e0, 0x1af2508);
+        assert_eq!(r, vec![(0x17feda0, 0x17feda0 + 0x82 * 2)],
+                   "table bound must come from the guarding cmp");
+    }
+
+    #[test]
+    fn pointer_array_base_is_not_excluded() {
+        // cc1 fd2120: adrp x0, 0x1679000; add x0, x0, #0x950;
+        // ldr x27, [x0, x2, lsl #3] — 64-bit pointer-array load: must NOT
+        // be excluded (these pointers NEED fixing; python3.12 regression).
+        let text = words(&[0xf0003520, 0x91254000, 0xf862781b]);
+        let r = scan_rodata_table_exclusions(&text, 0xfd2120, 0x162f1e0, 0x1af2508);
+        assert!(r.is_empty(), "pointer arrays must stay fixable, got {:?}", r);
+    }
+
+    #[test]
+    fn data_byte_table_without_dispatch_is_not_excluded() {
+        // cc1's tree_contains_struct at 0x1679300 is a plain byte lookup
+        // table (ldrb, no br) — its content can't alias into the pointer
+        // range, its length is unknowable, and pointer data sits right after
+        // it (0x16794f0). Excluding it left those pointers unrelocated → the
+        // second hello-world ICE. Must NOT be excluded.
+        let adrp = |rd: u32, pc: u64, target_page: u64| -> u32 {
+            let delta = ((target_page as i64 - (pc & !0xFFF) as i64) >> 12) as u64;
+            let immlo = (delta & 3) as u32;
+            let immhi = ((delta >> 2) & 0x7FFFF) as u32;
+            0x90000000 | (immlo << 29) | (immhi << 5) | rd
+        };
+        let add = |rd: u32, rn: u32, imm: u32| 0x91000000 | (imm << 10) | (rn << 5) | rd;
+        // LDRB (register) w2, [x1, w3, uxtw]: size=00 opc=01 option=UXTW(010)
+        let ldrb = 0x38600800 | (3 << 16) | (0b010 << 13) | (1 << 5) | 2;
+        let text_vaddr = 0x1000u64;
+        let page = 0x10000u64;
+        let text = words(&[adrp(1, text_vaddr, page), add(1, 1, 0x300), ldrb]);
+        let r = scan_rodata_table_exclusions(&text, text_vaddr, page, page + 0x1000);
+        assert!(r.is_empty(), "data tables without br must stay fixable, got {:?}", r);
+    }
+
+    #[test]
+    fn data_table_with_unrelated_br_is_not_excluded() {
+        // A byte-table load followed by some BR that does NOT consume the
+        // loaded value (e.g. an indirect tail call) is not a dispatch —
+        // this over-match left the gcc driver's pointer arrays unrelocated.
+        let adrp = |rd: u32, pc: u64, target_page: u64| -> u32 {
+            let delta = ((target_page as i64 - (pc & !0xFFF) as i64) >> 12) as u64;
+            let immlo = (delta & 3) as u32;
+            let immhi = ((delta >> 2) & 0x7FFFF) as u32;
+            0x90000000 | (immlo << 29) | (immhi << 5) | rd
+        };
+        let add = |rd: u32, rn: u32, imm: u32| 0x91000000 | (imm << 10) | (rn << 5) | rd;
+        let ldrb = 0x38600800 | (3 << 16) | (0b010 << 13) | (1 << 5) | 2; // ldrb w2,[x1,w3,uxtw]
+        let br_x16 = 0xD61F0200u32; // br x16 — unrelated to w2
+        let text_vaddr = 0x1000u64;
+        let page = 0x10000u64;
+        let text = words(&[adrp(1, text_vaddr, page), add(1, 1, 0x300), ldrb, br_x16]);
+        let r = scan_rodata_table_exclusions(&text, text_vaddr, page, page + 0x1000);
+        assert!(r.is_empty(), "stray br must not make a data table a dispatch, got {:?}", r);
+    }
+
+    #[test]
+    fn dispatch_without_cmp_uses_fallback_bound() {
+        // Jump-table load + br but no guarding cmp in the window → still
+        // excluded, with the conservative fallback size.
+        let adrp = |rd: u32, pc: u64, target_page: u64| -> u32 {
+            let delta = ((target_page as i64 - (pc & !0xFFF) as i64) >> 12) as u64;
+            let immlo = (delta & 3) as u32;
+            let immhi = ((delta >> 2) & 0x7FFFF) as u32;
+            0x90000000 | (immlo << 29) | (immhi << 5) | rd
+        };
+        let add = |rd: u32, rn: u32, imm: u32| 0x91000000 | (imm << 10) | (rn << 5) | rd;
+        let ldrh = 0x78600800 | (3 << 16) | (0b010 << 13) | (1 << 13) | (1 << 5) | 2; // ldrh w2,[x1,w3,uxtw#1]
+        // add x9, x8, w2, sxth #2 — consumes the loaded value
+        let add_disp = 0x8B200000u32 | (2 << 16) | (0b101 << 13) | (2 << 10) | (8 << 5) | 9;
+        let br_x9 = 0xD61F0120u32;
+        let text_vaddr = 0x1000u64;
+        let page = 0x10000u64;
+        let text = words(&[adrp(1, text_vaddr, page), add(1, 1, 0x100), ldrh, add_disp, br_x9]);
+        let r = scan_rodata_table_exclusions(&text, text_vaddr, page, page + 0x4000);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, page + 0x100);
+        assert!(r[0].1 - r[0].0 >= 0x200, "fallback bound must be generous");
+    }
+
+    #[test]
+    fn addr_in_sorted_ranges_works() {
+        let ranges = [(0x100u64, 0x200u64), (0x300, 0x400)];
+        assert!(!addr_in_sorted_ranges(0xFF, &ranges));
+        assert!(addr_in_sorted_ranges(0x100, &ranges));
+        assert!(addr_in_sorted_ranges(0x1F8, &ranges));
+        assert!(!addr_in_sorted_ranges(0x200, &ranges));
+        assert!(addr_in_sorted_ranges(0x3FF, &ranges));
+        assert!(!addr_in_sorted_ranges(0x400, &ranges));
+    }
 
     #[test]
     fn build_guest_env_passes_through_debian_has_frontend() {

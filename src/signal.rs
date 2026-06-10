@@ -498,6 +498,16 @@ unsafe extern "C" fn signal_forwarder(
     let uctx = &mut *(ctx as *mut crate::trap::UContext);
     let mctx = &mut *uctx.uc_mcontext;
 
+    // Fault signals: FIRST try the ET_EXEC lazy-relocation fixup. Once a
+    // guest installs its own SIGSEGV handler (gcc's ICE handler), this
+    // forwarder replaces segv_fixup_handler — without this hook lazy reloc
+    // silently stops working and every fixable fault becomes a guest crash.
+    if (sig == libc::SIGSEGV || sig == libc::SIGBUS)
+        && crate::trap::try_lazy_exec_fixup(mctx)
+    {
+        return; // fixed — retry the faulting instruction
+    }
+
     // Fault signals (SIGSEGV/SIGBUS) forwarded to a guest handler are almost
     // always OUR bug, but the guest handler hides the crash dump. Log the
     // fault details (async-signal-safe raw write) before forwarding.
@@ -514,6 +524,18 @@ unsafe extern "C" fn signal_forwarder(
                 pc, far, instr, mctx.ss.lr, mctx.ss.sp
             ));
             libc::write(2, buf.as_ptr() as *const _, n);
+            // Full GPR dump — the forwarded fault is usually OUR bug and the
+            // guest handler (e.g. gcc's ICE handler) hides the crash dump.
+            let mut buf2 = [0u8; 640];
+            let r = &mctx.ss;
+            let n2 = crate::trap::raw_fmt(&mut buf2, format_args!(
+                "  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n  x8={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x13={:#x} x14={:#x} x15={:#x}\n  x16={:#x} x17={:#x} x18={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x23={:#x}\n  x24={:#x} x25={:#x} x26={:#x} x27={:#x} x28={:#x} fp={:#x}\n",
+                r.x[0], r.x[1], r.x[2], r.x[3], r.x[4], r.x[5], r.x[6], r.x[7],
+                r.x[8], r.x[9], r.x[10], r.x[11], r.x[12], r.x[13], r.x[14], r.x[15],
+                r.x[16], r.x[17], r.x[18], r.x[19], r.x[20], r.x[21], r.x[22], r.x[23],
+                r.x[24], r.x[25], r.x[26], r.x[27], r.x[28], r.fp
+            ));
+            libc::write(2, buf2.as_ptr() as *const _, n2);
         }
     }
 

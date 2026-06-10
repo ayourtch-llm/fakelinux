@@ -2423,17 +2423,20 @@ fn lazy_reloc_pick_register(
 /// SIGSEGV handler that tries lazy relocation fixup for relocated ET_EXEC.
 /// If the fault address or PC is in the original (unrelocated) ET_EXEC range,
 /// adjust the register/PC by base_offset and retry the instruction.
-unsafe extern "C" fn segv_fixup_handler(
-    sig: libc::c_int,
-    info: *mut libc::siginfo_t,
-    ctx: *mut c_void,
-) {
+/// Try the ET_EXEC lazy-relocation fixups (case 1: PC at unrelocated
+/// address; case 2: data access through an unrelocated register) against a
+/// fault context. Returns true if something was fixed and the faulting
+/// instruction should simply be retried.
+///
+/// Shared by segv_fixup_handler AND the guest-signal forwarder: once a guest
+/// installs its own SIGSEGV handler (gcc's ICE handler, libjava-style crash
+/// catchers…) the forwarder replaces our fixup handler, and without this
+/// hook lazy relocation would silently stop working for that process.
+pub unsafe fn try_lazy_exec_fixup(mctx: &mut MContext64) -> bool {
     let base_offset = EXEC_BASE_OFFSET.load(Ordering::Relaxed);
     if base_offset != 0 {
         let orig_lo = EXEC_ORIG_LO.load(Ordering::Relaxed);
         let orig_hi = EXEC_ORIG_HI.load(Ordering::Relaxed);
-        let uctx = &mut *(ctx as *mut UContext);
-        let mctx = &mut *uctx.uc_mcontext;
         let pc = mctx.ss.pc;
         let fault_addr = mctx.es.far;
 
@@ -2446,7 +2449,7 @@ unsafe extern "C" fn segv_fixup_handler(
                 eprintln!("fakelinux: lazy reloc: PC {:#x} → {:#x}", pc, pc + base_offset);
             }
             mctx.ss.pc = pc + base_offset;
-            return; // retry instruction at relocated address
+            return true; // retry instruction at relocated address
         }
 
         // Case 2: data access at unrelocated address. First decode the
@@ -2476,7 +2479,7 @@ unsafe extern "C" fn segv_fixup_handler(
                     30 => mctx.ss.lr = fixed,
                     _ => mctx.ss.x[i] = fixed,
                 }
-                return; // retry with fixed register
+                return true; // retry with fixed register
             }
             // Fallback: scan ALL GPRs — the unrelocated value might be in any
             // register for instructions the decoder does not understand.
@@ -2490,12 +2493,24 @@ unsafe extern "C" fn segv_fixup_handler(
                                   i, val, val + base_offset, fault_addr, pc, instr);
                     }
                     mctx.ss.x[i] = val + base_offset;
-                    return; // retry with fixed register
+                    return true; // retry with fixed register
                 }
             }
         }
     }
+    false
+}
 
+unsafe extern "C" fn segv_fixup_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut c_void,
+) {
+    let uctx = &mut *(ctx as *mut UContext);
+    let mctx = &mut *uctx.uc_mcontext;
+    if try_lazy_exec_fixup(mctx) {
+        return; // fixed — retry the faulting instruction
+    }
     // Fixup failed — fall through to crash diagnostics
     crash_handler(sig, info, ctx);
 }
