@@ -2,7 +2,42 @@
 
 _Last update: 2026-06-10 ~09:30 (session 7, refresh #8). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #8 STATUS — read this first (supersedes #7 below)
+## REFRESH #9 STATUS — read this first (supersedes #8 below)
+
+**install-dep DONE_RC=0** (45700ae fchmodat garbage-x3, 0d0981a TMPDIR
+leak — see #8 below). Then install-ext-deps blockers, all fixed:
+1. Shallow clone has no tags → empty version. Fixed two consumers:
+   `src/scripts/.version` file (v26.10-rc0-0-gf373c82) + env overrides
+   `PKG_VERSION=26.10 PKG_SUFFIX=0` (build_common.mk uses ?=).
+2. STALE deb/debian/changelog with empty version survived the failed
+   run (rule only regenerates when older than Makefile; git clean only
+   on success). Deleted it once; regenerated fine as (26.10-0).
+3. **splice(76) implemented** (097470c): GNU grep splices stdin→stdout,
+   ENOSYS broke autom4te's m4 check → daq configure failed. Also
+   sync_file_range(84) = success no-op. 362 tests green.
+
+**IN FLIGHT: install-ext-deps running in pty-2** (container bash
+/root/vpp, binary w/ splice). Command pattern:
+`UNATTENDED=y DEBIAN_FRONTEND=noninteractive PKG_VERSION=26.10
+PKG_SUFFIX=0 make install-ext-deps > /tmp/ext-deps.log 2>&1; echo
+DONE_RC=$? > /tmp/ext-deps.done` — daq configure was at check ~151/?
+at 09:42, each conftest = slow emulated clang (~15s). EXPECT HOURS for
+daq→rdma-core→xdp-tools→DPDK. Watch _build tree mtime, NOT just
+ext-deps.log (configure writes daq.config.log etc.).
+- After DONE_RC=0: `make build` (same UNATTENDED env), then make run.
+- PERF side quest: sample slow clang conftests — is it x18 UDF SIGILL
+  storm? (git block_sha1 precedent.) A FAKELINUX_QUIET would also
+  help logs.
+- Container relaunch incantation (bash checks isatty(stderr) AT
+  STARTUP): `FAKELINUX_ROOT=ubuntu-rootfs ./target/release/fakelinux
+  --container ubuntu-rootfs/bin/bash -c 'exec /bin/bash -i 2>&1'
+  2>/tmp/container-stderr.log`; then in container
+  `cd /root/vpp && export HOME=/root`. Terminal garbled → [CTRL+C],
+  `stty sane; printf '\033c'`.
+
+Side quests queued: Rust in container, Claude Code in container.
+
+## REFRESH #8 STATUS (older)
 
 **install-dep DONE_RC=2 post-mortem — both root causes FIXED, committed:**
 - 45700ae fix(fchmodat): Linux syscall 53 has NO flags arg; we passed
