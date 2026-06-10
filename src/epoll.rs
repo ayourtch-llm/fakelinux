@@ -128,7 +128,13 @@ pub fn do_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> u64 {
 }
 
 /// epoll_pwait(epfd, events_ptr, maxevents, timeout_ms, sigmask, sigsetsize) → count or -errno
-pub fn do_epoll_pwait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i32) -> u64 {
+pub fn do_epoll_pwait(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    timeout_ms: i32,
+    sigmask_ptr: u64,
+) -> u64 {
     // Look up the kqueue fd and registrations
     let (kq, registrations) = {
         let guard = EPOLL_STATE.lock().unwrap();
@@ -140,30 +146,62 @@ pub fn do_epoll_pwait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i3
         }
     };
 
-    // Build the timeout
-    let timeout = if timeout_ms < 0 {
-        std::ptr::null()
+    // Same wait discipline as do_ppoll (see there): swap GUEST_SIGMASK for
+    // the wait, unblock host signals (we're inside the trap handler whose
+    // sa_mask blocks everything), wait in chunks, EINTR when a pending
+    // signal with a real handler becomes deliverable.
+    let old_mask = if sigmask_ptr != 0 {
+        let new_mask = unsafe { (sigmask_ptr as *const u64).read_unaligned() };
+        Some(crate::signal::ppoll_mask_begin(new_mask))
     } else {
-        &libc::timespec {
-            tv_sec: (timeout_ms / 1000) as i64,
-            tv_nsec: ((timeout_ms % 1000) as i64) * 1_000_000,
-        } as *const _
+        None
     };
+    let _unblock = crate::signal::HostSigUnblock::new();
 
     let mut kevents: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; maxevents as usize];
 
-    let n = unsafe {
-        libc::kevent(
-            kq,
-            std::ptr::null(),
-            0,
-            kevents.as_mut_ptr(),
-            maxevents,
-            timeout,
-        )
+    const CHUNK_MS: i64 = 100;
+    let mut remaining: i64 = timeout_ms as i64;
+    let infinite = timeout_ms < 0;
+    let n: i64 = loop {
+        if crate::signal::deliverable_pending() != 0 {
+            break -1000; // sentinel: EINTR via pending guest signal
+        }
+        let chunk_ms = if infinite { CHUNK_MS } else { remaining.min(CHUNK_MS).max(0) };
+        let chunk_ts = libc::timespec {
+            tv_sec: chunk_ms / 1000,
+            tv_nsec: (chunk_ms % 1000) * 1_000_000,
+        };
+        let r = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                kevents.as_mut_ptr(),
+                maxevents,
+                &chunk_ts,
+            )
+        };
+        if r < 0 {
+            let host_errno = unsafe { *libc::__error() };
+            if host_errno == libc::EINTR { continue; }
+            break -2000; // sentinel: host error, errno still set
+        }
+        if r > 0 { break r as i64; }
+        if !infinite {
+            remaining -= chunk_ms;
+            if remaining <= 0 { break 0; } // timed out
+        }
     };
 
-    if n < 0 {
+    drop(_unblock);
+    if let Some(old) = old_mask {
+        crate::signal::ppoll_mask_end(old);
+    }
+    if n == -1000 {
+        return (-4_i64) as u64; // -EINTR
+    }
+    if n == -2000 {
         return translate::linux_errno();
     }
 

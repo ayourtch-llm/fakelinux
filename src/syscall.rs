@@ -220,7 +220,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_EVENTFD2 => eventfd::do_eventfd2(args[0] as u32, args[1] as i32),
         SYS_EPOLL_CREATE1 => epoll::do_epoll_create1(args[0] as i32),
         SYS_EPOLL_CTL => epoll::do_epoll_ctl(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
-        SYS_EPOLL_PWAIT => epoll::do_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32),
+        SYS_EPOLL_PWAIT => epoll::do_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32, args[4]),
         SYS_SOCKET => net::do_socket(args[0] as i32, args[1] as i32, args[2] as i32),
         SYS_SOCKETPAIR => net::do_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
         SYS_BIND => net::do_bind(args[0] as i32, args[1], args[2] as u32),
@@ -1281,12 +1281,7 @@ fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigset
     // sleep forever (sudo's event loop after its child exits). Unblock host
     // signals for the duration of the wait: the forwarder sees IN_TRAP set
     // and only queues to PENDING_SIGNALS, which is async-safe.
-    let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    let mut saved_set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut empty_set);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &empty_set, &mut saved_set);
-    }
+    let _unblock = signal::HostSigUnblock::new();
 
     const CHUNK_MS: i64 = 100;
     let mut remaining = total_ms;
@@ -1314,9 +1309,7 @@ fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigset
         }
     };
 
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_SETMASK, &saved_set, std::ptr::null_mut());
-    }
+    drop(_unblock);
     if let Some(old) = old_mask {
         signal::ppoll_mask_end(old);
     }
@@ -2353,31 +2346,94 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
         timeout as *const libc::timespec
     };
 
-    // Extract sigmask from the Linux pselect6 wrapper struct
-    let sigmask_ptr: *const libc::sigset_t = if sig != 0 {
+    // Extract the GUEST sigmask (u64 Linux sigset) from the pselect6 wrapper
+    // struct. Like ppoll, the mask must swap GUEST_SIGMASK (guest signal
+    // blocking is virtual — passing the pointer to host pselect did nothing
+    // for guest semantics and read the wrong layout anyway).
+    let old_mask = if sig != 0 {
         let sigmask_pp = unsafe { *(sig as *const u64) };
         if sigmask_pp != 0 {
-            sigmask_pp as *const libc::sigset_t
+            let new_mask = unsafe { (sigmask_pp as *const u64).read_unaligned() };
+            Some(signal::ppoll_mask_begin(new_mask))
         } else {
-            std::ptr::null()
+            None
         }
     } else {
-        std::ptr::null()
+        None
     };
 
     let rdbits_before = if readfds != 0 { unsafe { *(readfds as *const u64) } } else { 0 };
     let wrbits_before = if writefds != 0 { unsafe { *(writefds as *const u64) } } else { 0 };
 
-    let ret = unsafe {
-        libc::pselect(
-            nfds,
-            if readfds == 0 { std::ptr::null_mut() } else { readfds as *mut libc::fd_set },
-            if writefds == 0 { std::ptr::null_mut() } else { writefds as *mut libc::fd_set },
-            if exceptfds == 0 { std::ptr::null_mut() } else { exceptfds as *mut libc::fd_set },
-            timeout_ptr,
-            sigmask_ptr,
-        )
+    // Save input fd_sets — select() mutates them in place, and the chunked
+    // loop below must re-arm them on every iteration.
+    let saved_rd: Option<libc::fd_set> =
+        if readfds != 0 { Some(unsafe { *(readfds as *const libc::fd_set) }) } else { None };
+    let saved_wr: Option<libc::fd_set> =
+        if writefds != 0 { Some(unsafe { *(writefds as *const libc::fd_set) }) } else { None };
+    let saved_ex: Option<libc::fd_set> =
+        if exceptfds != 0 { Some(unsafe { *(exceptfds as *const libc::fd_set) }) } else { None };
+
+    let total_ms: i64 = if timeout_ptr.is_null() {
+        -1
+    } else {
+        let ts = unsafe { &*timeout_ptr };
+        ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
     };
+
+    // Same wait discipline as do_ppoll: unblock host signals (we're inside
+    // the trap handler whose sa_mask blocks everything), wait in chunks, and
+    // EINTR when a pending signal with a real handler becomes deliverable.
+    let _unblock = signal::HostSigUnblock::new();
+    const CHUNK_MS: i64 = 100;
+    let mut remaining = total_ms;
+    let mut first = true;
+    let ret: i32 = loop {
+        if signal::deliverable_pending() != 0 {
+            break -1000; // sentinel: EINTR via pending guest signal
+        }
+        if !first {
+            // Re-arm the input sets the previous chunk cleared.
+            unsafe {
+                if let Some(s) = saved_rd { *(readfds as *mut libc::fd_set) = s; }
+                if let Some(s) = saved_wr { *(writefds as *mut libc::fd_set) = s; }
+                if let Some(s) = saved_ex { *(exceptfds as *mut libc::fd_set) = s; }
+            }
+        }
+        first = false;
+        let chunk_ms = if remaining < 0 { CHUNK_MS } else { remaining.min(CHUNK_MS).max(0) };
+        let chunk_ts = libc::timespec {
+            tv_sec: chunk_ms / 1000,
+            tv_nsec: (chunk_ms % 1000) * 1_000_000,
+        };
+        let r = unsafe {
+            libc::pselect(
+                nfds,
+                if readfds == 0 { std::ptr::null_mut() } else { readfds as *mut libc::fd_set },
+                if writefds == 0 { std::ptr::null_mut() } else { writefds as *mut libc::fd_set },
+                if exceptfds == 0 { std::ptr::null_mut() } else { exceptfds as *mut libc::fd_set },
+                &chunk_ts,
+                std::ptr::null(),
+            )
+        };
+        if r < 0 {
+            let host_errno = unsafe { *libc::__error() };
+            if host_errno == libc::EINTR { continue; }
+            break r;
+        }
+        if r > 0 { break r; }
+        if remaining >= 0 {
+            remaining -= chunk_ms;
+            if remaining <= 0 { break 0; } // timed out (sets already cleared)
+        }
+    };
+    drop(_unblock);
+    if let Some(old) = old_mask {
+        signal::ppoll_mask_end(old);
+    }
+    if ret == -1000 {
+        return (-4_i64) as u64; // -EINTR
+    }
 
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && (ret > 0 || nfds > 3) {
         let rdbits_after = if readfds != 0 { unsafe { *(readfds as *const u64) } } else { 0 };

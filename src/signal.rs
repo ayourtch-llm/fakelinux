@@ -146,6 +146,34 @@ pub fn deliverable_pending() -> u64 {
     )
 }
 
+/// Unblock all host signals for the duration of a blocking wait emulated
+/// inside the SIGILL trap handler (whose sa_mask blocks everything — a
+/// signal arriving mid-wait could otherwise never reach the forwarder to be
+/// queued as pending). Restores the previous host mask on drop.
+pub struct HostSigUnblock {
+    saved: libc::sigset_t,
+}
+
+impl HostSigUnblock {
+    pub fn new() -> Self {
+        let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut saved: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut empty);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &empty, &mut saved);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for HostSigUnblock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Install a temporary guest sigmask for the duration of a ppoll/pselect
 /// wait. Returns the previous mask (pass it to ppoll_mask_end).
 pub fn ppoll_mask_begin(new_mask: u64) -> u64 {
