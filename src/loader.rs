@@ -1569,9 +1569,16 @@ pub fn build_guest_env(host_env: &[&std::ffi::CStr]) -> Vec<std::ffi::CString> {
     use std::collections::HashSet;
     let mut out: Vec<std::ffi::CString> = Vec::new();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    // Host-macOS-specific vars that must not leak into the guest: TMPDIR
+    // points at /var/folders/... which doesn't exist in the rootfs (broke
+    // ispell-autobuildhash / dictionaries-common postinst); the others are
+    // Darwin runtime noise.
+    const HOST_ONLY_PREFIXES: &[&[u8]] =
+        &[b"TMPDIR=", b"__CF_USER_TEXT_ENCODING=", b"XPC_SERVICE_NAME=", b"XPC_FLAGS="];
     for e in host_env {
         let bytes = e.to_bytes();
         if bytes.starts_with(b"FAKELINUX_") { continue; }
+        if HOST_ONLY_PREFIXES.iter().any(|p| bytes.starts_with(p)) { continue; }
         let eq = bytes.iter().position(|&b| b == b'=').unwrap_or(bytes.len());
         let key = bytes[..eq].to_vec();
         if !seen.insert(key) { continue; }
@@ -1634,6 +1641,29 @@ mod tests {
         let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
         assert!(!strs.iter().any(|s| s.starts_with("FAKELINUX_")),
                 "FAKELINUX_* must not leak into guest; got {:?}", strs);
+    }
+
+    #[test]
+    fn build_guest_env_strips_host_macos_vars() {
+        // Host TMPDIR (/var/folders/...) leaked into the container and
+        // ispell-autobuildhash's mktemp failed: "Cannot make temporary
+        // directory under /var/folders/nm/.../T/" → dictionaries-common
+        // postinst exit 25 during make install-dep.
+        let vars = [
+            c(b"TMPDIR=/var/folders/nm/1smjjw5j/T/"),
+            c(b"__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0"),
+            c(b"XPC_SERVICE_NAME=0"),
+            c(b"XPC_FLAGS=0x0"),
+            c(b"PATH=/usr/bin"),
+        ];
+        let refs: Vec<&std::ffi::CStr> = vars.iter().map(|c| c.as_c_str()).collect();
+        let out = build_guest_env(&refs);
+        let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
+        for bad in ["TMPDIR=", "__CF_USER_TEXT_ENCODING=", "XPC_"] {
+            assert!(!strs.iter().any(|s| s.starts_with(bad)),
+                    "host macOS var {bad} must not leak into guest; got {strs:?}");
+        }
+        assert!(strs.contains(&"PATH=/usr/bin"));
     }
 
     #[test]
