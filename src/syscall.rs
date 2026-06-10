@@ -911,6 +911,26 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
     translate::linux_errno()
 }
 
+/// If `fd` is a pty master, open its slave transiently and return the fd.
+///
+/// Linux lets guests issue termios/winsize ioctls on a pty MASTER — they
+/// operate on the slave's line discipline. macOS returns ENOTTY there.
+/// apt-get relies on the Linux semantics: it puts the real terminal in raw
+/// mode and pushes the saved (ONLCR) termios onto dpkg's pty via the master
+/// fd; without this, dpkg output loses its CRs (stair-stepped apt output,
+/// terminal needing `reset` afterwards).
+fn pty_master_open_slave(fd: i32) -> Option<i32> {
+    extern "C" {
+        fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+    let p = unsafe { ptsname(fd) }; // non-null only for pty masters
+    if p.is_null() {
+        return None;
+    }
+    let slave = unsafe { libc::open(p, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if slave < 0 { None } else { Some(slave) }
+}
+
 fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
     const LINUX_TCGETS: u64 = 0x5401;
     const LINUX_TCSETS: u64 = 0x5402;
@@ -931,7 +951,14 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
     match request {
         LINUX_TCGETS | LINUX_TCGETS2 => {
             let mut mac_t: libc::termios = unsafe { std::mem::zeroed() };
-            let ret = unsafe { libc::tcgetattr(fd, &mut mac_t) };
+            let mut ret = unsafe { libc::tcgetattr(fd, &mut mac_t) };
+            if ret < 0 {
+                // Linux supports termios ioctls on pty masters; macOS doesn't.
+                if let Some(slave) = pty_master_open_slave(fd) {
+                    ret = unsafe { libc::tcgetattr(slave, &mut mac_t) };
+                    unsafe { libc::close(slave) };
+                }
+            }
             if ret < 0 {
                 let err = translate::linux_errno();
                 if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -956,7 +983,23 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
                 LINUX_TCSETSW => libc::TCSADRAIN,
                 _ => libc::TCSAFLUSH,
             };
-            let ret = unsafe { libc::tcsetattr(fd, action, &mac_t) };
+            let mut ret = unsafe { libc::tcsetattr(fd, action, &mac_t) };
+            if ret < 0 {
+                // Linux supports termios ioctls on pty masters; macOS doesn't.
+                if let Some(slave) = pty_master_open_slave(fd) {
+                    ret = unsafe { libc::tcsetattr(slave, action, &mac_t) };
+                    unsafe { libc::close(slave) };
+                }
+            }
+            if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                let pid = unsafe { libc::getpid() };
+                let linux_oflag = unsafe { ((arg as *const u8).add(4) as *const u32).read_unaligned() };
+                let linux_lflag = unsafe { ((arg as *const u8).add(12) as *const u32).read_unaligned() };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] ioctl({}, TCSETS{:x}) guest oflag={:#x} lflag={:#x} → mac oflag={:#x} lflag={:#x} ispeed={} ospeed={} ret={}\n",
+                    pid, fd, request, linux_oflag, linux_lflag,
+                    mac_t.c_oflag, mac_t.c_lflag, mac_t.c_ispeed, mac_t.c_ospeed, ret));
+            }
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         LINUX_TIOCGPGRP => {
@@ -989,11 +1032,23 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         LINUX_TIOCGWINSZ => {
-            let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, arg as *mut libc::winsize) };
+            let mut ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, arg as *mut libc::winsize) };
+            if ret < 0 {
+                if let Some(slave) = pty_master_open_slave(fd) {
+                    ret = unsafe { libc::ioctl(slave, libc::TIOCGWINSZ, arg as *mut libc::winsize) };
+                    unsafe { libc::close(slave) };
+                }
+            }
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         LINUX_TIOCSWINSZ => {
-            let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, arg as *const libc::winsize) };
+            let mut ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, arg as *const libc::winsize) };
+            if ret < 0 {
+                if let Some(slave) = pty_master_open_slave(fd) {
+                    ret = unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, arg as *const libc::winsize) };
+                    unsafe { libc::close(slave) };
+                }
+            }
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         LINUX_FIONREAD => {
@@ -1009,12 +1064,20 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
         // ── PTY ioctls (Linux uses these; macOS has equivalents but different API) ──
-        // TIOCSPTLCK (_IOW('T',0x31,int)) — set/clear pty lock. macOS pts are not
-        // locked by default, so unlock (val=0) is a no-op success. lock (val=1) is
-        // unsupported but rare.
+        // TIOCSPTLCK (_IOW('T',0x31,int)) — set/clear pty lock. Linux unlockpt()
+        // is this ioctl with val=0; the macOS equivalent is grantpt()+unlockpt().
+        // These MUST actually run — a no-op left the macOS slave locked, so
+        // opening it later failed EACCES (apt-get couldn't push its termios
+        // onto dpkg's pty → stair-stepped output). lock (val=1) is unsupported.
         0x4004_5431 => {
             let val = unsafe { (arg as *const i32).read_unaligned() };
-            if val == 0 { 0 } else { (-25_i64) as u64 } // unlock=ok, lock=ENOTTY
+            if val == 0 {
+                let r1 = unsafe { libc::grantpt(fd) };
+                let r2 = unsafe { libc::unlockpt(fd) };
+                if r1 < 0 || r2 < 0 { translate::linux_errno() } else { 0 }
+            } else {
+                (-25_i64) as u64 // lock = ENOTTY
+            }
         }
         // TIOCGPTN (_IOR('T',0x30,uint)) — get pty number. Use ptsname() to extract.
         0x8004_5430 => {
@@ -3440,6 +3503,72 @@ pub fn merge_envp(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    extern "C" {
+        fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    // ── pty master termios ioctls (Linux semantics) ──────────────────────
+
+    /// On Linux, termios/winsize ioctls on a pty MASTER operate on the
+    /// slave's line discipline. apt relies on this: it pushes the saved
+    /// (sane, ONLCR) termios onto dpkg's pty via the master fd while the
+    /// real terminal is in raw mode — the slave does the LF→CRLF
+    /// translation. On macOS tcsetattr on a master is ENOTTY, so the
+    /// slave stayed CR-less and apt-get output stair-cased.
+    #[test]
+    fn tcsets_on_pty_master_reaches_slave() {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "posix_openpt failed");
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+
+            // Linux termios (36 bytes): oflag = OPOST|ONLCR, sane-ish rest.
+            let mut linux_t = [0u8; 36];
+            linux_t[0..4].copy_from_slice(&0x500u32.to_le_bytes());  // iflag ICRNL|IXON
+            linux_t[4..8].copy_from_slice(&0x5u32.to_le_bytes());    // oflag OPOST|ONLCR
+            linux_t[8..12].copy_from_slice(&0xbfu32.to_le_bytes());  // cflag B38400|CS8|CREAD
+            linux_t[12..16].copy_from_slice(&0x8a3bu32.to_le_bytes()); // lflag sane
+            const LINUX_TCSETS: u64 = 0x5402;
+            let ret = do_ioctl(master, LINUX_TCSETS, linux_t.as_ptr() as u64);
+            assert_eq!(ret, 0, "TCSETS on pty master must succeed (Linux semantics)");
+
+            // Verify via TCGETS on the master too (also Linux-supported).
+            let mut out = [0u8; 36];
+            const LINUX_TCGETS: u64 = 0x5401;
+            let ret = do_ioctl(master, LINUX_TCGETS, out.as_mut_ptr() as u64);
+            assert_eq!(ret, 0, "TCGETS on pty master must succeed");
+            let oflag = u32::from_le_bytes(out[4..8].try_into().unwrap());
+            assert_eq!(oflag & 0x5, 0x5, "ONLCR|OPOST must have reached the slave");
+
+            // And the slave itself must agree.
+            let name = ptsname(master);
+            assert!(!name.is_null());
+            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0);
+            let mut mac_t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut mac_t), 0);
+            assert_eq!(mac_t.c_oflag & 0x3, 0x3, "slave must have macOS OPOST|ONLCR");
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    #[test]
+    fn tiocswinsz_on_pty_master_succeeds() {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+            const LINUX_TIOCSWINSZ: u64 = 0x5414;
+            let ret = do_ioctl(master, LINUX_TIOCSWINSZ, &ws as *const _ as u64);
+            assert_eq!(ret, 0, "TIOCSWINSZ on pty master must succeed (apt sets dpkg's window size this way)");
+            libc::close(master);
+        }
+    }
 
     // ── linux_rusage_bytes ───────────────────────────────────────────────
 
