@@ -398,6 +398,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_SETFSGID => creds::do_setfsgid(args[0] as u32),
         SYS_SETGROUPS => creds::do_setgroups(args[0] as u32, args[1]),
         SYS_SENDFILE => do_sendfile(args[0] as i32, args[1] as i32, args[2], args[3]),
+        SYS_SPLICE => do_splice(args[0] as i32, args[1], args[2] as i32, args[3], args[4], args[5] as u32),
+        // Advisory writeback hint — fsync semantics not required; success no-op.
+        SYS_SYNC_FILE_RANGE => 0,
         SYS_SYMLINKAT => do_symlinkat(args[0], args[1] as i32, args[2]),
         SYS_LINKAT => do_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as i32),
         SYS_FLOCK => do_flock(args[0] as i32, args[1] as i32),
@@ -2852,6 +2855,61 @@ fn do_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: u64) -> u64 {
     total as u64
 }
 
+fn do_splice(fd_in: i32, off_in_ptr: u64, fd_out: i32, off_out_ptr: u64, len: u64, _flags: u32) -> u64 {
+    // splice(fd_in, off_in, fd_out, off_out, len, flags) — emulated with a
+    // single read/write chunk. Returning less than len is valid splice
+    // semantics (callers loop); doing one chunk avoids blocking on a pipe
+    // that already yielded data. GNU grep uses this for stdin→stdout.
+    let mut buf = [0u8; 65536];
+    let to_read = (len as usize).min(buf.len());
+
+    let mut off_in: i64 = 0;
+    let has_off_in = off_in_ptr != 0;
+    if has_off_in {
+        off_in = unsafe { (off_in_ptr as *const i64).read_unaligned() };
+    }
+
+    let nread = if has_off_in {
+        unsafe { libc::pread(fd_in, buf.as_mut_ptr() as *mut _, to_read, off_in) }
+    } else {
+        unsafe { libc::read(fd_in, buf.as_mut_ptr() as *mut _, to_read) }
+    };
+    if nread < 0 {
+        return crate::translate::linux_errno();
+    }
+    if nread == 0 {
+        return 0; // EOF
+    }
+
+    let mut off_out: i64 = 0;
+    let has_off_out = off_out_ptr != 0;
+    if has_off_out {
+        off_out = unsafe { (off_out_ptr as *const i64).read_unaligned() };
+    }
+
+    let mut written = 0usize;
+    while written < nread as usize {
+        let nw = if has_off_out {
+            unsafe { libc::pwrite(fd_out, buf[written..].as_ptr() as *const _, nread as usize - written, off_out + written as i64) }
+        } else {
+            unsafe { libc::write(fd_out, buf[written..].as_ptr() as *const _, nread as usize - written) }
+        };
+        if nw < 0 {
+            if written > 0 { break; }
+            return crate::translate::linux_errno();
+        }
+        written += nw as usize;
+    }
+
+    if has_off_in {
+        unsafe { (off_in_ptr as *mut i64).write_unaligned(off_in + written as i64) };
+    }
+    if has_off_out {
+        unsafe { (off_out_ptr as *mut i64).write_unaligned(off_out + written as i64) };
+    }
+    written as u64
+}
+
 fn do_symlinkat(target: u64, newdirfd: i32, linkpath: u64) -> u64 {
     let target_ptr = target as *const libc::c_char;
     let (eff_path, _hold) = effective_path_ptr(linkpath);
@@ -3381,6 +3439,54 @@ mod tests {
     fn mprotect_none_subpage_returns_none() {
         let r = mprotect_align_range(0x100001000, 0x1000, 0);
         assert_eq!(r, None);
+    }
+
+    // ── splice ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn splice_pipe_to_pipe_moves_bytes() {
+        // GNU grep splices stdin→stdout; ENOSYS surfaced as
+        // "grep: (standard input): Function not implemented" and broke
+        // autom4te's m4 version check during VPP's daq configure.
+        let mut p_in = [0i32; 2];
+        let mut p_out = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(p_in.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(p_out.as_mut_ptr()) }, 0);
+        let msg = b"hello splice";
+        assert_eq!(
+            unsafe { libc::write(p_in[1], msg.as_ptr() as *const _, msg.len()) },
+            msg.len() as isize
+        );
+
+        let r = do_splice(p_in[0], 0, p_out[1], 0, 4096, 0);
+        assert_eq!(r, msg.len() as u64, "should move all buffered bytes");
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(p_out[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        assert_eq!(&buf[..n as usize], msg);
+        for fd in p_in.iter().chain(p_out.iter()) { unsafe { libc::close(*fd) }; }
+    }
+
+    #[test]
+    fn splice_file_offset_in_honored_and_updated() {
+        let path = std::env::temp_dir().join(format!("fakelinux_splice_{}", unsafe { libc::getpid() }));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let f = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+        assert!(f >= 0);
+        let mut p = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+
+        let mut off: i64 = 4;
+        let r = do_splice(f, &mut off as *mut i64 as u64, p[1], 0, 3, 0);
+        assert_eq!(r, 3);
+        assert_eq!(off, 7, "off_in must be advanced");
+
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(p[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        assert_eq!(&buf[..n as usize], b"456");
+        unsafe { libc::close(f); libc::close(p[0]); libc::close(p[1]); }
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── fchmodat: Linux syscall 53 has NO flags argument ─────────────────
