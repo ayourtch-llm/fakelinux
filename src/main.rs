@@ -108,6 +108,17 @@ fn main() {
 
     procfs::init(&args[guest_arg_start]);
 
+    // The previous fakelinux process (execve) may carry the guest's original
+    // argv[0] — e.g. a venv's bin/python3.12 symlink path that must NOT be
+    // replaced by the resolved /usr/bin/python3.12 (CPython finds pyvenv.cfg
+    // relative to argv[0]). /proc/self/exe keeps the resolved path above.
+    if let Ok(argv0) = std::env::var("FAKELINUX_ARGV0") {
+        if !argv0.is_empty() {
+            args[guest_arg_start] = argv0;
+        }
+        std::env::remove_var("FAKELINUX_ARGV0");
+    }
+
     // Initialize per-thread pthread keys before anything else
     trap::init_tpidr_key();
     trap::init_x18_key();

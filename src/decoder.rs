@@ -141,6 +141,26 @@ pub fn substitute_gpr(instr: u32, from: u32, to: u32) -> Option<u32> {
     None
 }
 
+/// AdvSIMD load/store STRUCTURE instructions (LD1-LD4/ST1-ST4, multiple or
+/// single structures, optionally post-indexed). Their only GPR fields are
+/// Rn (bits 9:5) and — in the post-index register form — Rm (bits 20:16);
+/// Rt names a VECTOR register. They are safe to run from a trampoline
+/// island (no PC-relative semantics, no control flow, no exclusivity), but
+/// their psname maps to EmulClass::Other, which the trampoline used to
+/// reject blanket — clang's `ld2 {v0.2d, v1.2d}, [x18]` then hit the
+/// UNHANDLED-EmulClass panic in trap_handler (rdma-core build).
+pub fn is_simd_ldst_struct(instr: u32) -> bool {
+    // multiple structures, no writeback: 0Q0011000L000000…
+    if instr & 0xBFBF0000 == 0x0C000000 { return true; }
+    // multiple structures, post-index:  0Q0011001L0 Rm …
+    if instr & 0xBFA00000 == 0x0C800000 { return true; }
+    // single structure, no writeback:   0Q0011010LR00000…
+    if instr & 0xBF9F0000 == 0x0D000000 { return true; }
+    // single structure, post-index:     0Q0011011LR Rm …
+    if instr & 0xBF800000 == 0x0D800000 { return true; }
+    false
+}
+
 /// Decode an instruction's emulation class.
 ///
 /// Returns the `EmulClass` for dispatch to the appropriate emulation handler.
@@ -161,6 +181,32 @@ pub fn decode_emul_class(instr: u32) -> EmulClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AdvSIMD load/store structure detection (is_simd_ldst_struct) ─────
+
+    #[test]
+    fn simd_ldst_struct_detection() {
+        // ld2 {v0.2d, v1.2d}, [x18] — the clang/rdma-core crasher
+        assert!(is_simd_ldst_struct(0x4C408E40));
+        // st1 {v0.2d, v1.2d}, [x0]
+        assert!(is_simd_ldst_struct(0x4C00AC00));
+        // ld1 {v0.16b}, [x1], #16 (post-index immediate, Rm=31)
+        assert!(is_simd_ldst_struct(0x4CDF7020));
+        // NOT structure ld/st:
+        assert!(!is_simd_ldst_struct(0xF9400240)); // ldr x0, [x18]
+        assert!(!is_simd_ldst_struct(0xD61F0240)); // br x18
+        assert!(!is_simd_ldst_struct(0x91001252)); // add x18, x18, #4
+    }
+
+    #[test]
+    fn simd_ldst_struct_substitute_swaps_base_not_vector() {
+        // ld2 {v18.2d, v19.2d}, [x18]: Rt=18 is a VECTOR register and must
+        // NOT be rewritten; Rn=18 is the GPR base and must become x17.
+        let instr = 0x4C408E40 | 18; // Rt=v18, Rn=x18
+        let out = substitute_gpr(instr, 18, 17).expect("must know the encoding");
+        assert_eq!((out >> 5) & 0x1F, 17, "Rn x18 must become x17");
+        assert_eq!(out & 0x1F, 18, "vector Rt=v18 must stay untouched");
+    }
 
     // Auto-generated spot-check tests from ARM XML spec
     include!(concat!(env!("OUT_DIR"), "/generated_x18_tests.rs"));

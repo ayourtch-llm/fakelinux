@@ -205,8 +205,22 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
         if v == 1 { return false; }
     } else if d == 1 { return false; }
 
+    // AdvSIMD structure ld/st (e.g. clang's `ld2 {v0.2d, v1.2d}, [x18]`):
+    // EmulClass::Other, but perfectly trampolinable — only Rn/Rm are GPRs
+    // (Rt is a vector register, so the generic x16/x17 field check would
+    // misfire on v16/v17 operands).
+    let simd_struct = crate::decoder::is_simd_ldst_struct(instr);
+
     // Skip if instruction also references x16 or x17 (our scratch regs)
-    if uses_x16_or_x17(instr) {
+    if simd_struct {
+        let rn = (instr >> 5) & 0x1F;
+        let rm = (instr >> 16) & 0x1F; // only a GPR in the post-index form
+        let post_index = instr & 0x00800000 != 0;
+        if rn == 16 || rn == 17 || (post_index && (rm == 16 || rm == 17)) {
+            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    } else if uses_x16_or_x17(instr) {
         FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -219,6 +233,7 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
     //  - Other: includes BR/BLR/RET x18 (control flow escapes the island)
     use crate::decoder::EmulClass;
     match crate::decoder::decode_emul_class(instr) {
+        EmulClass::Other if simd_struct => {} // safe in an island, see above
         EmulClass::PcRelAddr
         | EmulClass::LoadLiteral
         | EmulClass::CompareBranch
@@ -406,6 +421,31 @@ mod tests {
         assert_eq!(target, 0xCAFE_F00D, "STR W3,[X18] must store via guest x18");
         assert_eq!(crate::trap::get_thread_x18(), &mut target as *mut u32 as u64,
             "guest x18 unchanged by a store");
+    }
+
+    /// End-to-end: AdvSIMD structure load through guest x18. clang's
+    /// `ld2 {v0.2d, v1.2d}, [x18]` used to fall back to UDF (EmulClass::
+    /// Other) and PANIC trap_handler during the rdma-core build.
+    #[test]
+    fn test_trampoline_simd_ld2_through_guest_x18() {
+        crate::trap::init_x18_key();
+        // ld2 {v0.2d, v1.2d}, [x18] ; st1 {v0.2d, v1.2d}, [x0] ; ret
+        let code = alloc_code_page(&[0x4C408E40, 0x4C00AC00, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code, 0x4C408E40),
+            "AdvSIMD structure loads must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        let src: [u64; 4] = [0x1111, 0x2222, 0x3333, 0x4444];
+        let mut dst: [u64; 4] = [0; 4];
+        crate::trap::set_thread_x18(src.as_ptr() as u64);
+        let f: extern "C" fn(u64, u64, u64, u64) =
+            unsafe { std::mem::transmute(code) };
+        f(dst.as_mut_ptr() as u64, 0, 0, 0);
+        // LD2 de-interleaves: v0 = {m0, m2}, v1 = {m1, m3};
+        // ST1 stores v0 then v1 contiguously.
+        assert_eq!(dst, [0x1111, 0x3333, 0x2222, 0x4444],
+            "LD2 must de-interleave through guest x18");
     }
 
     /// End-to-end: a trampolined instruction that WRITES x18 must update TSD.

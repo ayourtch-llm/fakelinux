@@ -161,6 +161,16 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_REMOVEXATTR => 0,
         SYS_RT_SIGACTION => signal::do_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYS_RT_SIGPROCMASK => signal::do_rt_sigprocmask(args[0], args[1], args[2], args[3]),
+        SYS_RT_SIGPENDING => {
+            // rt_sigpending(set, sigsetsize) — report guest-pending signals
+            // (ninja polls this; ENOSYS printed "sigpending: Function not
+            // implemented" for every job).
+            if args[1] != 8 { return (-22_i64) as u64; } // -EINVAL
+            if args[0] == 0 { return (-14_i64) as u64; } // -EFAULT
+            let pending = signal::PENDING_SIGNALS.load(std::sync::atomic::Ordering::SeqCst);
+            unsafe { *(args[0] as *mut u64) = pending; }
+            0
+        }
         SYS_RT_SIGTIMEDWAIT => signal::do_rt_sigtimedwait(args[0], args[1], args[2], args[3]),
         SYS_TIMER_CREATE => timers::do_timer_create(args[0], args[1], args[2]),
         SYS_TIMER_GETTIME => timers::do_timer_gettime(args[0], args[1]),
@@ -1822,6 +1832,10 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                         else { std::env::remove_var("FAKELINUX_SIGMASK"); }
                     }
 
+                    // Shebang: Linux passes the interpreter path as argv[0];
+                    // our default (argv[1] = interp path) already matches.
+                    std::env::remove_var("FAKELINUX_ARGV0");
+
                     // Merge guest env (DEBIAN_HAS_FRONTEND etc.) with FAKELINUX_* host overrides.
                     // fakelinux_env_overrides() walks the host environment and picks up ALL
                     // FAKELINUX_* vars — including FAKELINUX_SIGIGN / _SIGMASK that were just
@@ -1875,6 +1889,27 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
     new_argv.push(resolved_path.as_ptr());
+
+    // Preserve the guest's ORIGINAL argv[0] across the re-exec: fakelinux
+    // uses its argv[1] (the resolved binary path) as guest argv[0], which
+    // breaks programs that interpret argv[0] — CPython invoked via a venv's
+    // bin/python3.12 symlink resolved to /usr/bin/python3.12, never found
+    // pyvenv.cfg, and Debian's ensurepip then refused to run ("disabled for
+    // the system python") during VPP's dpdk meson-venv setup.
+    unsafe {
+        let argv0 = *(argv_ptr as *const *const i8);
+        if !argv0.is_null() {
+            let a0 = std::ffi::CStr::from_ptr(argv0);
+            if !a0.to_bytes().is_empty() {
+                use std::os::unix::ffi::OsStrExt;
+                std::env::set_var("FAKELINUX_ARGV0", std::ffi::OsStr::from_bytes(a0.to_bytes()));
+            } else {
+                std::env::remove_var("FAKELINUX_ARGV0");
+            }
+        } else {
+            std::env::remove_var("FAKELINUX_ARGV0");
+        }
+    }
 
     // Then the guest's original argv (skip argv[0] since resolved_path serves as
     // the binary path argument to fakelinux — fakelinux passes &args[1..] to the

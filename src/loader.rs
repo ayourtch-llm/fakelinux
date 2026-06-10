@@ -1329,7 +1329,14 @@ fn scan_rodata_table_exclusions(text: &[u8], text_vaddr: u64, ro_lo: u64, ro_hi:
                     None
                 }
             });
-            let end = (base + bound.unwrap_or(MAX_TABLE_SIZE)).min(ro_hi);
+            // No guarding cmp on the index register → NOT a switch dispatch.
+            // Real switch tables always carry an immediate bounds check;
+            // the "dispatches" without one were CPython's frozen bytecode in
+            // .rodata (ldrb opcode fetch + computed-goto br) — a 4 KiB
+            // fallback exclusion there swallowed 417 genuine pointers
+            // (opcode_targets etc.) → ensurepip OOM-SIGKILLed.
+            let bound = match bound { Some(b) => b.min(MAX_TABLE_SIZE), None => continue };
+            let end = (base + bound).min(ro_hi);
             if end > base {
                 ranges.push((base, end));
             }
@@ -1906,9 +1913,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_without_cmp_uses_fallback_bound() {
-        // Jump-table load + br but no guarding cmp in the window → still
-        // excluded, with the conservative fallback size.
+    fn dispatch_without_cmp_is_not_excluded() {
+        // Load + add + br but NO guarding cmp on the index register → not a
+        // switch dispatch (CPython's frozen-bytecode ldrb + computed-goto br
+        // matched this shape; a fallback exclusion swallowed 417 genuine
+        // pointers and ensurepip OOM-SIGKILLed). Must not exclude.
         let adrp = |rd: u32, pc: u64, target_page: u64| -> u32 {
             let delta = ((target_page as i64 - (pc & !0xFFF) as i64) >> 12) as u64;
             let immlo = (delta & 3) as u32;
@@ -1924,9 +1933,7 @@ mod tests {
         let page = 0x10000u64;
         let text = words(&[adrp(1, text_vaddr, page), add(1, 1, 0x100), ldrh, add_disp, br_x9]);
         let r = scan_rodata_table_exclusions(&text, text_vaddr, page, page + 0x4000);
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, page + 0x100);
-        assert!(r[0].1 - r[0].0 >= 0x200, "fallback bound must be generous");
+        assert!(r.is_empty(), "no guard cmp → not a dispatch → no exclusion, got {:?}", r);
     }
 
     #[test]

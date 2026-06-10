@@ -34,6 +34,7 @@ pub const SYS_SCHED_YIELD: u64 = 124;
 pub const SYS_CLONE: u64 = 220;
 pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
+pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_TIMER_CREATE: u64 = 107;
 pub const SYS_TIMER_GETTIME: u64 = 108;
 pub const SYS_TIMER_SETTIME: u64 = 110;
