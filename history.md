@@ -264,3 +264,40 @@ the dpdk extract. Container relaunched on the fresh binary; ext-deps
 running again with monitors on the done-marker and a 15-min stall
 detector. Expect hours: dpdk + rdma-core + xdp-tools under emulated
 clang.
+
+## Session 7: the hello-world that broke gcc (2026-06-10, ~11:00)
+
+User side quest: `gcc test.c` — five lines of hello world — ICE'd cc1
+with "internal compiler error: Segmentation fault". The trail was a
+beauty. cc1 is ET_EXEC, so we relocate it to 0x700400000 and our
+heuristic scans .rodata for "things that look like unrelocated
+pointers" to fix up. A switch jump table — an array of little 16-bit
+code offsets — had four consecutive halfwords [0x0000, 0x0054, 0x0000,
+0x0000]. Read as a u64 that's 0x540000: smack in the pointer range.
+The fixup added 0x700000000, which wrote 0x0007 into what was a 0x0000
+table entry. Tree code 28's switch case then `br`'d into the middle of
+an unrelated basic block in equiv_oracle::find_equiv_block, loaded a
+garbage "string pointer", and gcc's own SIGSEGV handler dressed our
+bug up as an ICE.
+
+User asked the right question: "is there a generic way that's less
+fragile?" First answer — kill relocation entirely by shrinking
+fakelinux's own __PAGEZERO (the Wine trick) so guests map at their
+real 0x400000. macOS arm64 SIGKILLs small-pagezero binaries. Dead end.
+
+Second answer, the one that stuck: stop guessing from data shape, read
+the code. Pointer arrays load with `ldr x, [base, idx, lsl #3]`; jump
+tables with `ldrh w, [base, idx, uxtw #1]` feeding add+br; and the
+table's exact length is in the guarding `cmp` on the index register.
+Three iterations, each correcting a real failure: (1) exclude only
+true dispatch tables — over-excluding plain byte tables orphaned the
+pointer data right after them; (2) bound from the cmp ON THE INDEX
+REGISTER — the nearest-any-cmp grabbed a wrong compare, 5256-byte
+exclusion, swallowed real pointers, driver strlen crash; (3) the lazy
+SEGV fixup was silently DEAD in any process that installs its own
+SIGSEGV handler (the forwarder had replaced it) — now the forwarder
+tries the fixup before forwarding. gcc compiles and runs hello world
+and -O2 fib; python3.12 regression intact; 371 tests green (0e44c32).
+
+Meanwhile the fchmodat2 fix proved itself: dpdk extract passed, daq
+built and installed, ext-deps grinding on.
