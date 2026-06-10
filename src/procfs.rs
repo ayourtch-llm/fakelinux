@@ -154,13 +154,22 @@ pub fn try_getdents64(fd: i32, buf: u64, bufsize: u64) -> Option<u64> {
     Some(copied as u64)
 }
 
-/// Clean up virtual directory state on close. Returns true if fd was virtual.
+/// Clean up virtual directory/file state on close. Returns true if fd was virtual.
 pub fn on_close(fd: i32) -> bool {
-    let mut lock = vdir_map().lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        return map.remove(&fd).is_some();
+    let mut hit = false;
+    {
+        let mut lock = vdir_map().lock().unwrap();
+        if let Some(map) = lock.as_mut() {
+            hit |= map.remove(&fd).is_some();
+        }
     }
-    false
+    {
+        let mut lock = vfile_map().lock().unwrap();
+        if let Some(map) = lock.as_mut() {
+            hit |= map.remove(&fd).is_some();
+        }
+    }
+    hit
 }
 
 /// Check if an fd is a virtual directory (for fstat interception).
@@ -209,17 +218,18 @@ fn generate_dir_entries(kind: &VirtualDir) -> Vec<u8> {
             push_dirent64(&mut buf, 1, DT_DIR, b".");
             push_dirent64(&mut buf, 1, DT_DIR, b"..");
 
-            // PID entries: just expose the current process's virtual PID.
-            // In container mode vpid==1 for init, real PID otherwise.
-            let pid = visible_pid();
-            let pid_str = format!("{}", pid);
-            push_dirent64(&mut buf, 100 + pid as u64, DT_DIR, pid_str.as_bytes());
+            // PID entries: all live guest processes (host processes running
+            // this same fakelinux binary). Makes top/ps see the container.
+            for vpid in list_guest_vpids() {
+                let pid_str = format!("{}", vpid);
+                push_dirent64(&mut buf, 100 + vpid as u64, DT_DIR, pid_str.as_bytes());
+            }
 
             // "self" symlink
             push_dirent64(&mut buf, 2, DT_LNK, b"self");
 
             // Pseudo-files in /proc root
-            for name in &[b"cpuinfo" as &[u8], b"meminfo", b"stat", b"uptime", b"mountinfo"] {
+            for name in &[b"cpuinfo" as &[u8], b"meminfo", b"stat", b"uptime", b"mountinfo", b"loadavg"] {
                 push_dirent64(&mut buf, 50, DT_REG, name);
             }
             // Directories in /proc root
@@ -230,7 +240,7 @@ fn generate_dir_entries(kind: &VirtualDir) -> Vec<u8> {
             push_dirent64(&mut buf, 1, DT_DIR, b"..");
 
             // Standard /proc/<pid> entries
-            for name in &[b"stat" as &[u8], b"status", b"cmdline", b"maps", b"mountinfo", b"auxv"] {
+            for name in &[b"stat" as &[u8], b"statm", b"status", b"cmdline", b"maps", b"mountinfo", b"auxv"] {
                 push_dirent64(&mut buf, 201, DT_REG, name);
             }
             // Symlinks
@@ -259,9 +269,77 @@ pub fn try_open(path: &[u8]) -> Option<i32> {
         return Some(fd);
     }
 
-    // Regular file content
+    // Regular file content — served from a tracked virtual fd, NOT a
+    // one-shot pipe: libproc2 (top) keeps /proc/stat open and re-reads it
+    // with fflush+rewind+fread every refresh. A drained pipe gave it an
+    // empty buffer → ERANGE ("library failed cpu statistics"). lseek(0) on
+    // a virtual file fd REGENERATES the content, so top's deltas refresh.
     let content = generate_content(path_str)?;
-    Some(pipe_content(&content))
+    let fd = alloc_virtual_fd()?;
+    let mut lock = vfile_map().lock().unwrap();
+    let map = lock.get_or_insert_with(HashMap::new);
+    map.insert(fd, VirtualFileState { path: path_str.to_string(), content, pos: 0 });
+    Some(fd)
+}
+
+/// State for an open virtual /proc file fd.
+struct VirtualFileState {
+    path: String,
+    content: Vec<u8>,
+    pos: usize,
+}
+
+static VIRTUAL_FILES: Mutex<Option<HashMap<i32, VirtualFileState>>> = Mutex::new(None);
+
+fn vfile_map() -> &'static Mutex<Option<HashMap<i32, VirtualFileState>>> {
+    &VIRTUAL_FILES
+}
+
+/// Serve read() on a virtual /proc file fd. Returns Some(bytes) if handled.
+pub fn try_read(fd: i32, buf: u64, count: u64) -> Option<u64> {
+    let mut lock = vfile_map().lock().unwrap();
+    let map = lock.as_mut()?;
+    let st = map.get_mut(&fd)?;
+    let remaining = st.content.len().saturating_sub(st.pos);
+    let n = remaining.min(count as usize);
+    if n > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(st.content[st.pos..].as_ptr(), buf as *mut u8, n);
+        }
+        st.pos += n;
+    }
+    Some(n as u64)
+}
+
+/// Serve lseek() on a virtual /proc file fd. Seeking to the START
+/// regenerates the content (fresh CPU ticks etc. — real /proc semantics for
+/// the reread-with-rewind pattern). Returns Some(new_pos) if handled.
+pub fn try_lseek(fd: i32, offset: i64, whence: i32) -> Option<u64> {
+    let mut lock = vfile_map().lock().unwrap();
+    let map = lock.as_mut()?;
+    let st = map.get_mut(&fd)?;
+    let new_pos = match whence {
+        libc::SEEK_SET => offset,
+        libc::SEEK_CUR => st.pos as i64 + offset,
+        libc::SEEK_END => st.content.len() as i64 + offset,
+        _ => return Some((-22_i64) as u64), // -EINVAL
+    };
+    if new_pos < 0 {
+        return Some((-22_i64) as u64); // -EINVAL
+    }
+    if new_pos == 0 {
+        if let Some(fresh) = generate_content(&st.path) {
+            st.content = fresh;
+        }
+    }
+    st.pos = new_pos as usize;
+    Some(new_pos as u64)
+}
+
+/// True if fd is a virtual /proc FILE fd.
+pub fn is_virtual_file(fd: i32) -> bool {
+    let lock = vfile_map().lock().unwrap();
+    lock.as_ref().map_or(false, |m| m.contains_key(&fd))
 }
 
 /// Classify a path as a virtual directory, if it is one.
@@ -336,6 +414,10 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/self/auxv" => Some(with(|pfs| pfs.auxv.clone())),
         "/proc/self/status" => Some(generate_status()),
         "/proc/self/stat" => Some(generate_stat()),
+        "/proc/self/statm" => {
+            let s = host_proc_stats(unsafe { libc::getpid() });
+            Some(format!("{rss} {rss} 0 0 0 0 0\n", rss = s.rss_pages).into_bytes())
+        }
         "/proc/self/cmdline" => Some(generate_cmdline()),
         "/proc/cpuinfo" => Some(generate_cpuinfo()),
         "/proc/sys/kernel/osrelease" => Some(b"6.1.0-fakelinux\n".to_vec()),
@@ -343,6 +425,7 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/meminfo" => Some(generate_meminfo()),
         "/proc/uptime" => Some(generate_uptime()),
         "/proc/stat" => Some(generate_proc_stat()),
+        "/proc/loadavg" => Some(generate_loadavg()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         _ => {
             // Check if this is /proc/<vpid>/stat or /proc/<vpid>/status for
@@ -374,11 +457,17 @@ fn generate_for_other_pid(path: &str) -> Option<Vec<u8>> {
 
     match subpath {
         "/stat" => {
+            let s = host_proc_stats(_real_pid);
             Some(format!(
-                "{vpid} (fakelinux-guest) S {vppid} {vpid} {vpid} 0 -1 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 -1 0 0 0 0 0 0 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                vpid = vpid,
-                vppid = vppid,
+                "{vpid} ({comm}) S {vppid} {vpid} {vpid} 0 -1 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start} 0 {rss} 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                vpid = vpid, vppid = vppid, comm = s.comm,
+                utime = s.utime, stime = s.stime,
+                start = s.starttime, rss = s.rss_pages,
             ).into_bytes())
+        }
+        "/statm" => {
+            let s = host_proc_stats(_real_pid);
+            Some(format!("{rss} {rss} 0 0 0 0 0\n", rss = s.rss_pages).into_bytes())
         }
         "/status" => {
             Some(format!(
@@ -502,9 +591,12 @@ fn generate_status() -> Vec<u8> {
 fn generate_stat() -> Vec<u8> {
     let pid = visible_pid();
     let ppid = visible_ppid();
+    let s = host_proc_stats(unsafe { libc::getpid() });
     // /proc/self/stat: 52 fields required by procps/libproc2
     format!(
-        "{pid} (fakelinux-guest) R {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 -1 0 0 0 0 0 0 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{pid} ({comm}) R {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start} 0 {rss} 2147483647 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        comm = s.comm, utime = s.utime, stime = s.stime,
+        start = s.starttime, rss = s.rss_pages,
         pid = pid,
         ppid = ppid,
     )
@@ -601,6 +693,79 @@ fn generate_uptime() -> Vec<u8> {
     format!("{:.2} {:.2}\n", secs, secs * 0.9).into_bytes()
 }
 
+/// Format a Linux /proc/stat from per-CPU [user, nice, system, idle] tick
+/// counts. Pure helper so the layout (which libproc2 parses strictly —
+/// missing per-cpu rows gave top "library failed cpu statistics" ERANGE)
+/// is unit-testable.
+fn format_proc_stat(per_cpu: &[[u64; 4]], btime: i64, processes: u64) -> String {
+    let mut out = String::new();
+    let mut tot = [0u64; 4];
+    for c in per_cpu {
+        for k in 0..4 { tot[k] += c[k]; }
+    }
+    // Linux field order: user nice system idle iowait irq softirq steal guest guest_nice
+    out.push_str(&format!(
+        "cpu  {} {} {} {} 0 0 0 0 0 0\n", tot[0], tot[1], tot[2], tot[3]));
+    for (i, c) in per_cpu.iter().enumerate() {
+        out.push_str(&format!(
+            "cpu{} {} {} {} {} 0 0 0 0 0 0\n", i, c[0], c[1], c[2], c[3]));
+    }
+    out.push_str("intr 0\n");
+    out.push_str("ctxt 0\n");
+    out.push_str(&format!("btime {}\n", btime));
+    out.push_str(&format!("processes {}\n", processes));
+    out.push_str("procs_running 1\n");
+    out.push_str("procs_blocked 0\n");
+    out.push_str("softirq 0 0 0 0 0 0 0 0 0 0 0\n");
+    out
+}
+
+/// Read real per-CPU [user, nice, system, idle] ticks from the host via
+/// host_processor_info(PROCESSOR_CPU_LOAD_INFO). Host ticks are already in
+/// 1/100 s units, matching Linux USER_HZ=100.
+fn host_cpu_ticks() -> Vec<[u64; 4]> {
+    const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+    const CPU_STATE_USER: usize = 0;
+    const CPU_STATE_SYSTEM: usize = 1;
+    const CPU_STATE_IDLE: usize = 2;
+    const CPU_STATE_NICE: usize = 3;
+    const CPU_STATE_MAX: usize = 4;
+    extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_processor_info(
+            host: u32, flavor: i32, out_cpu_count: *mut u32,
+            out_info: *mut *mut i32, out_info_cnt: *mut u32) -> i32;
+        fn mach_task_self() -> u32;
+        fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+    }
+    let mut cpu_count: u32 = 0;
+    let mut info: *mut i32 = std::ptr::null_mut();
+    let mut info_cnt: u32 = 0;
+    let kr = unsafe {
+        host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
+                            &mut cpu_count, &mut info, &mut info_cnt)
+    };
+    if kr != 0 || info.is_null() || cpu_count == 0 {
+        return vec![[0, 0, 0, 0]];
+    }
+    let mut out = Vec::with_capacity(cpu_count as usize);
+    for i in 0..cpu_count as usize {
+        let base = i * CPU_STATE_MAX;
+        let tick = |s: usize| unsafe { *info.add(base + s) } as u32 as u64;
+        out.push([
+            tick(CPU_STATE_USER),
+            tick(CPU_STATE_NICE),
+            tick(CPU_STATE_SYSTEM),
+            tick(CPU_STATE_IDLE),
+        ]);
+    }
+    unsafe {
+        vm_deallocate(mach_task_self(), info as usize,
+                      info_cnt as usize * std::mem::size_of::<i32>());
+    }
+    out
+}
+
 fn generate_proc_stat() -> Vec<u8> {
     let mut real_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut mono_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -609,13 +774,144 @@ fn generate_proc_stat() -> Vec<u8> {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_ts);
     }
     let btime = real_ts.tv_sec - mono_ts.tv_sec;
-    format!(
-        "cpu  0 0 0 0 0 0 0 0 0 0\n\
-         btime {}\n\
-         processes 1\n",
-        btime,
-    )
-    .into_bytes()
+    format_proc_stat(&host_cpu_ticks(), btime, list_guest_vpids().len() as u64).into_bytes()
+}
+
+/// Format /proc/loadavg: three load averages, running/total tasks, last pid.
+fn format_loadavg(loads: [f64; 3], ntasks: usize, last_pid: i32) -> String {
+    format!("{:.2} {:.2} {:.2} 1/{} {}\n", loads[0], loads[1], loads[2], ntasks.max(1), last_pid)
+}
+
+fn generate_loadavg() -> Vec<u8> {
+    let mut loads = [0f64; 3];
+    unsafe { libc::getloadavg(loads.as_mut_ptr(), 3); }
+    let vpids = list_guest_vpids();
+    let last = vpids.iter().copied().max().unwrap_or(1);
+    format_loadavg(loads, vpids.len(), last).into_bytes()
+}
+
+/// Real per-process numbers for /proc/<pid>/stat, pulled from the host.
+/// Times are Linux clock ticks (100 Hz), rss is in (host 16 KiB) pages —
+/// the same page size the guest sees in AT_PAGESZ, so top's RES math works.
+struct HostProcStats {
+    comm: String,
+    utime: u64,
+    stime: u64,
+    rss_pages: u64,
+    starttime: u64, // ticks since boot
+}
+
+fn mach_ticks_to_ns(abs: u64) -> u64 {
+    extern "C" {
+        fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+    }
+    static NUMER_DENOM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+    let mut lock = NUMER_DENOM.lock().unwrap();
+    let (n, d) = *lock.get_or_insert_with(|| {
+        let mut info = [0u32; 2];
+        unsafe { mach_timebase_info(&mut info); }
+        (info[0].max(1), info[1].max(1))
+    });
+    (abs as u128 * n as u128 / d as u128) as u64
+}
+
+/// Best-effort guest command name: argv[1] (the guest binary path) of the
+/// host fakelinux process, via sysctl KERN_PROCARGS2.
+fn guest_comm(real_pid: i32) -> String {
+    let mut buf = vec![0u8; 16384];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, 49 /* KERN_PROCARGS2 */, real_pid];
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut _, &mut len,
+                     std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || len < 8 {
+        return "fakelinux".into();
+    }
+    buf.truncate(len);
+    // Layout: i32 argc, exec_path\0, NUL padding, argv[0]\0, argv[1]\0, ...
+    let argc = i32::from_ne_bytes(buf[0..4].try_into().unwrap()).max(0) as usize;
+    let mut p = 4;
+    while p < buf.len() && buf[p] != 0 { p += 1; } // exec_path
+    while p < buf.len() && buf[p] == 0 { p += 1; } // padding
+    let mut args: Vec<&[u8]> = Vec::new();
+    while p < buf.len() && args.len() < argc {
+        let start = p;
+        while p < buf.len() && buf[p] != 0 { p += 1; }
+        args.push(&buf[start..p]);
+        p += 1;
+    }
+    // argv[0] is the fakelinux binary; skip our own flags (--container …);
+    // the first non-flag arg is the guest binary path.
+    for a in args.iter().skip(1) {
+        if a.starts_with(b"-") || a.is_empty() { continue; }
+        let base = a.rsplit(|&b| b == b'/').next().unwrap_or(a);
+        let name = String::from_utf8_lossy(base);
+        let mut s = name.into_owned();
+        s.truncate(15); // Linux TASK_COMM_LEN
+        return s;
+    }
+    "fakelinux".into()
+}
+
+fn host_proc_stats(real_pid: i32) -> HostProcStats {
+    const RUSAGE_INFO_V2: i32 = 2;
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+        fn mach_absolute_time() -> u64;
+    }
+    // rusage_info_v2 as u64 words: [0..2)=uuid, 2=user_time, 3=system_time,
+    // 4=pkg_idle, 5=interrupt, 6=pageins, 7=wired, 8=resident,
+    // 9=phys_footprint, 10=proc_start_abstime, 11=proc_exit_abstime, …
+    let mut ri = [0u64; 32];
+    let rc = unsafe { proc_pid_rusage(real_pid, RUSAGE_INFO_V2, ri.as_mut_ptr()) };
+    let (utime, stime, rss_pages, starttime) = if rc == 0 {
+        let ut = mach_ticks_to_ns(ri[2]) / 10_000_000; // ns → 100Hz ticks
+        let st = mach_ticks_to_ns(ri[3]) / 10_000_000;
+        let rss = ri[9] / 16384;
+        let start = mach_ticks_to_ns(ri[10]) / 10_000_000; // abs time IS since boot
+        (ut, st, rss, start)
+    } else {
+        (0, 0, 0, 0)
+    };
+    HostProcStats { comm: guest_comm(real_pid), utime, stime, rss_pages, starttime }
+}
+
+/// Enumerate the virtual PIDs of all live guest processes: host processes
+/// running the same fakelinux executable as us. vpid == real host pid,
+/// except the container init which is vpid 1 (see pidns).
+pub fn list_guest_vpids() -> Vec<i32> {
+    extern "C" {
+        fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let mut self_path = [0u8; 4096];
+    let self_len = unsafe { proc_pidpath(libc::getpid(), self_path.as_mut_ptr(), 4096) };
+    if self_len <= 0 {
+        return vec![crate::pidns::current_vpid()];
+    }
+    let me = self_path[..self_len as usize].to_vec();
+
+    let mut pids = vec![0i32; 8192];
+    let n = unsafe { proc_listallpids(pids.as_mut_ptr(), (pids.len() * 4) as i32) };
+    if n <= 0 {
+        return vec![crate::pidns::current_vpid()];
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    for &pid in &pids[..n as usize] {
+        if pid <= 0 { continue; }
+        let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), 4096) };
+        if len > 0 && buf[..len as usize] == me[..] {
+            out.push(crate::pidns::real_to_virtual(pid).unwrap_or(pid));
+        }
+    }
+    if out.is_empty() {
+        out.push(crate::pidns::current_vpid());
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 // ─── stat / readlink ─────────────────────────────────────────────────────────
@@ -775,4 +1071,44 @@ pub fn try_readlink(path: &[u8], buf: u64, bufsiz: u64) -> Option<u64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_stat_has_aggregate_and_per_cpu_rows() {
+        // libproc2 (top) wants "cpu " + per-cpu rows; the old stub with a
+        // single all-zero cpu line failed with ERANGE ("library failed cpu
+        // statistics").
+        let s = format_proc_stat(&[[100, 1, 50, 1000], [200, 2, 60, 2000]], 1700000000, 5);
+        assert!(s.starts_with("cpu  300 3 110 3000 0 0 0 0 0 0\n"), "{s}");
+        assert!(s.contains("\ncpu0 100 1 50 1000 0 0 0 0 0 0\n"), "{s}");
+        assert!(s.contains("\ncpu1 200 2 60 2000 0 0 0 0 0 0\n"), "{s}");
+        assert!(s.contains("\nbtime 1700000000\n"), "{s}");
+        assert!(s.contains("\nprocesses 5\n"), "{s}");
+        assert!(s.contains("\nprocs_running 1\n"), "{s}");
+    }
+
+    #[test]
+    fn host_cpu_ticks_returns_nonzero_real_data() {
+        let t = host_cpu_ticks();
+        assert!(!t.is_empty());
+        // The host has been up for a while — idle ticks can't all be zero.
+        assert!(t.iter().any(|c| c[3] > 0), "{t:?}");
+    }
+
+    #[test]
+    fn loadavg_format_matches_linux() {
+        let s = format_loadavg([1.5, 0.75, 0.25], 12, 4242);
+        assert_eq!(s, "1.50 0.75 0.25 1/12 4242\n");
+    }
+
+    #[test]
+    fn list_guest_vpids_includes_self() {
+        let vpids = list_guest_vpids();
+        let me = crate::pidns::current_vpid();
+        assert!(vpids.contains(&me), "{vpids:?} should contain {me}");
+    }
 }

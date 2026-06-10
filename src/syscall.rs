@@ -631,6 +631,10 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     if eventfd::is_eventfd(fd_i32) {
         return eventfd::do_read(fd_i32, buf, count);
     }
+    // Virtual /proc file fds are served from generated content.
+    if let Some(r) = procfs::try_read(fd_i32, buf, count) {
+        return r;
+    }
     let ret = unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
     // DEBUG: optional per-pid raw-byte dump for read-side pipe tracing.
     // Pair with FAKELINUX_DUMP_WRITE_FD to verify pipe integrity end-to-end.
@@ -817,6 +821,11 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
 }
 
 fn do_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
+    // Virtual /proc file fds: lseek(0) regenerates content (top's
+    // rewind+reread pattern).
+    if let Some(r) = procfs::try_lseek(fd, offset, whence) {
+        return r;
+    }
     let ret = unsafe { libc::lseek(fd, offset, whence) };
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
