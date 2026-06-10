@@ -1,8 +1,99 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~00:45 (session 7, refresh #4). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~08:00 (session 7, refresh #6). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #4 STATUS — read this first (supersedes #3 below)
+## REFRESH #6 STATUS — read this first (supersedes #5 below)
+
+**py3compile pipe deadlock FIXED** (afd5a6a): it was NOT a pipe bug — the
+CLOEXEC errpipe of CPython subprocess survived execve because FD_CLOEXEC
+(stripped before macOS fork) was never re-applied at exec. Parent's Popen()
+read the errpipe forever. Fix: reapply_saved_cloexec_for_exec() before both
+execve sites + FORK_SAVED_CLOEXEC.clear_fd() on close/dup/dup3/F_SETFD.
+`dpkg --configure -a` then ran CLEAN (exit 0).
+
+**sudo ppoll hang FIXED** (4436232): sudo slept forever in poll() with a
+zombie child after apt-get update. Two stacked bugs: (1) do_ppoll ignored
+the sigmask arg (sudo relies on ppoll atomically unblocking SIGCHLD);
+(2) do_ppoll runs inside the SIGILL trap handler whose sa_mask blocks ALL
+host signals, so SIGCHLD couldn't even be queued as pending during the
+wait. Fix: ppoll_mask_begin/end (with TIF_RESTORE_SIGMASK-style sigframe
+override), chunked 100 ms poll loop, pthread_sigmask unblock around the
+wait. NOTE: do_pselect6 and epoll_pwait likely have the SAME bug class —
+fix the same way if something hangs in them (sudo only needed ppoll).
+
+**sudoers drop-in added** (rootfs, uncommitted rootfs change):
+`ubuntu-rootfs/etc/sudoers.d/fakelinux-no-pty` = `Defaults !use_pty`
+(sudo tried to allocate a pty → "Permission denied"; no /dev/ptmx emul).
+
+**358 tests green.** Container shell in pty-2 (fresh binary).
+
+**IN FLIGHT: `UNATTENDED=y make install-dep` rerunning in pty-2**
+(log: container /tmp/install-dep.log; completion marker
+/tmp/install-dep.done with DONE_RC=…; host-side watcher task running).
+When DONE_RC=0 → task #3: `UNATTENDED=y make install-ext-deps`, then
+`make build` (logs long — tail), `make run`/`make test`.
+If it hangs again: sample the stuck pair, check for ppoll/pselect/epoll
+or another CLOEXEC-ish fd leak; old killed-apt state may need another
+`dpkg --configure -a`.
+
+Side quests queued: Rust in container, Claude Code in container (needs
+nodejs; user gives API key).
+
+CONTEXT RESET PROTOCOL (user-approved): watch pty-1 for context warning →
+finish activity → update this file → wire heartbeat → self-inject /clear.
+
+## REFRESH #5 STATUS (older)
+
+**vpp git fsck: OK** (exit 0, FSCK_OK). Task #1 done.
+
+**Task #2 build VPP — in progress.** User directives (sent live):
+`UNATTENDED=y make install-dep`, then `UNATTENDED=y make install-ext-deps`,
+then `make build`, then `make run` (or `make test` "if adventurous").
+
+Done so far (committed 6788b41 + earlier):
+1. **Case-insensitive APFS vs linux-libc-dev**: netfilter headers have 8
+   case-colliding pairs (xt_connmark.h/xt_CONNMARK.h…) → dpkg unpack
+   ENOENT. Fixed via dpkg path-exclude conffile in rootfs:
+   `ubuntu-rootfs/etc/dpkg/dpkg.cfg.d/fakelinux-case-collisions`
+   (excludes the 8 uppercase variants; VPP references none).
+   REAL fix later: case-sensitive APFS volume for rootfs.
+   WATCH OUT: other packages may hit new case collisions — same symptom
+   ("unable to install new version of X: No such file or directory").
+2. **sudo works now**: stat leaked host uid 501; sudo demands root-owned
+   /etc/sudoers. Fix 6788b41: creds::map_host_uid/gid (own host id→0,
+   else 65534) in mac_stat_to_linux + statx. 354 tests green.
+   Also added `127.0.1.1 fakelinux` to rootfs /etc/hosts.
+3. build-essential + sudo installed in container.
+
+**CURRENT BUG — install-dep HUNG (killed, must fix then rerun).**
+`UNATTENDED=y make install-dep` downloaded all 279 pkgs fine, then HUNG
+6h at 0% CPU in `dpkg --configure python3-minimal` →
+postinst → py3compile → `python3.12 -m py_compile -`. PIPE DEADLOCK:
+- parent (py3compile) blocked in do_read (sampled: trap_handler →
+  do_read → read) on fd 12 (pipe B from child fd 13 — multiprocessing
+  response channel);
+- child (py_compile -) blocked in do_read on fd 0 (pipe A from parent
+  fd 11 = its stdin).
+py3compile (/usr/bin/py3compile:156-169) uses Popen(bufsize=0,
+stdin=PIPE, close_fds=True) + a second pipe (STDINS[version].send(fn),
+line 219). Each side waits for data the other side thinks it sent →
+suspect fakelinux pipe read/write bug (lost write? signal-interrupted
+read not restarted? close_fds + fd translation?).
+REPRO (likely): in container `dpkg --configure python3-minimal` or
+just `echo /usr/lib/python3.12/os.py | python3.12 -m py_compile -`
+style two-process pipe feeding; or run py3compile by hand.
+TDD it. The killed apt left dpkg half-configured — after fix:
+`dpkg --configure -a` then rerun install-dep (idempotent).
+THEN: `UNATTENDED=y make install-ext-deps` (user asked),
+then `make build` (logs long — tail), then `make run`/`make test`.
+
+Side quests queued: TaskList #3 Rust in container, #4 Claude Code in
+container (needs nodejs; user gives API key).
+
+CONTEXT RESET PROTOCOL (user-approved): watch pty-1 for context warning →
+finish activity → update this file → wire heartbeat → self-inject /clear.
+
+## REFRESH #4 STATUS (older)
 
 ALL COMMITTED through "fix(rusage)…", 350 tests green. Today's fixes:
 1. **TLS WORKS.** Two bugs: (a) `ins v0.b[7], w18` (AdvSIMD copy) panicked

@@ -182,3 +182,18 @@ re-apply saved CLOEXEC bits right before execve, and forget bits when the
 child closes/dup2s over an fd. TDD: 2 mask-lifecycle unit tests (356 green),
 then the live repro: `Popen(['python3.12','-m','py_compile','-'], bufsize=0,
 stdin=PIPE)` → rc 0 in seconds instead of hanging.
+
+**Then sudo hung too** — and this one was a double-decker (4436232). After
+apt-get update finished, sudo sat in ppoll() with a zombie child, forever.
+sudo blocks SIGCHLD and counts on ppoll to atomically swap in a mask that
+unblocks it — fakelinux ignored ppoll's sigmask argument entirely. Fixing
+that wasn't enough: the wait STILL hung, because do_ppoll executes inside
+the SIGILL trap handler, whose sa_mask (the very fix for the nested-fork
+race!) blocks every host signal — so a SIGCHLD arriving mid-wait couldn't
+even run the forwarder to be queued as pending. Final shape: swap
+GUEST_SIGMASK for the wait, poll in 100 ms chunks with host signals
+unblocked, EINTR when a pending signal with a real handler becomes
+deliverable, and a TIF_RESTORE_SIGMASK-style override so the handler's
+sigreturn restores the pre-ppoll mask. Plus `Defaults !use_pty` in
+sudoers (we have no /dev/ptmx). sudo /bin/echo: instant. 358 tests green.
+install-dep is rerunning now.
