@@ -105,6 +105,69 @@ pub static GUEST_SIGMASK: AtomicU64 = AtomicU64::new(0);
 /// Pending signals (bitmask, bit N = Linux signal N is pending but was blocked).
 pub static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
 
+// ─── ppoll/pselect temporary sigmask swap ───────────────────────────────────
+//
+// Linux ppoll installs the caller's sigmask atomically for the duration of
+// the wait. If a handler fires as the syscall returns, the handler's sigframe
+// must restore the ORIGINAL (pre-ppoll) mask, not the temp one — the kernel
+// does this via TIF_RESTORE_SIGMASK. We emulate with an override consumed by
+// build_sigframe_and_redirect().
+
+/// Original mask to restore after a ppoll-style temp swap (see above).
+static SWAP_RESTORE_MASK: AtomicU64 = AtomicU64::new(0);
+static SWAP_RESTORE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pure core: pending signals that are unblocked under `mask` AND have a
+/// real guest handler — the set that must interrupt a ppoll with EINTR.
+/// (Pending DFL/IGN signals never invoke a handler, so they must not EINTR.)
+pub fn deliverable_set(pending: u64, mask: u64, handler_bits: u64) -> u64 {
+    pending & !mask & handler_bits
+}
+
+/// Bitmask of signals with a real guest handler installed (not DFL/IGN).
+fn handler_bits() -> u64 {
+    let mut bits = 0u64;
+    for sig in 1..=64usize {
+        let sa = GUEST_SIGACTIONS[sig].load();
+        if sa.handler != SIG_DFL && sa.handler != SIG_IGN {
+            bits |= 1u64 << (sig - 1);
+        }
+    }
+    bits
+}
+
+/// Pending signals deliverable under the CURRENT guest mask.
+pub fn deliverable_pending() -> u64 {
+    deliverable_set(
+        PENDING_SIGNALS.load(Ordering::SeqCst),
+        GUEST_SIGMASK.load(Ordering::SeqCst),
+        handler_bits(),
+    )
+}
+
+/// Install a temporary guest sigmask for the duration of a ppoll/pselect
+/// wait. Returns the previous mask (pass it to ppoll_mask_end).
+pub fn ppoll_mask_begin(new_mask: u64) -> u64 {
+    // Never allow blocking SIGKILL (9) or SIGSTOP (19) — bit (sig-1)
+    let protected = (1u64 << 8) | (1u64 << 18);
+    GUEST_SIGMASK.swap(new_mask & !protected, Ordering::SeqCst)
+}
+
+/// Undo a ppoll_mask_begin. If a deliverable signal is pending, the handler
+/// will be invoked at trap exit while the temp mask is still in effect — arm
+/// the sigframe override so its sigreturn restores the ORIGINAL mask.
+/// Otherwise restore the original mask immediately.
+pub fn ppoll_mask_end(old_mask: u64) {
+    if deliverable_pending() != 0 {
+        SWAP_RESTORE_MASK.store(old_mask, Ordering::SeqCst);
+        SWAP_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
+    } else {
+        SWAP_RESTORE_ACTIVE.store(false, Ordering::SeqCst);
+        GUEST_SIGMASK.store(old_mask, Ordering::SeqCst);
+    }
+}
+
 /// Reset signal state for a child process after fork().
 /// POSIX: child's pending signal set must be empty.
 /// Signal dispositions and mask are inherited (correct via COW).
@@ -216,7 +279,13 @@ pub unsafe fn build_sigframe_and_redirect(
     let regs = &mut mctx.ss;
     let guest_sp = regs.sp;
     let guest_tpidr = crate::trap::get_thread_tpidr();
-    let old_sigmask = GUEST_SIGMASK.load(Ordering::SeqCst);
+    // If a ppoll-style temp mask swap is in flight, the sigframe must restore
+    // the ORIGINAL (pre-ppoll) mask — Linux TIF_RESTORE_SIGMASK semantics.
+    let old_sigmask = if SWAP_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {
+        SWAP_RESTORE_MASK.load(Ordering::SeqCst)
+    } else {
+        GUEST_SIGMASK.load(Ordering::SeqCst)
+    };
 
     // Allocate frame on guest stack (stack grows down)
     let frame_addr = (guest_sp - RT_SIGFRAME_SIZE as u64) & !0xF; // 16-byte align
@@ -802,5 +871,36 @@ mod tests {
     #[test]
     fn sigtimedwait_pick_empty_pending() {
         assert_eq!(sigtimedwait_pick(0, u64::MAX), None);
+    }
+
+    // ppoll sigmask emulation: a pending signal that the ppoll temp mask
+    // unblocks (and that has a real guest handler) must interrupt the wait.
+    // Bug: do_ppoll ignored the sigmask arg, so sudo — which blocks SIGCHLD
+    // and relies on ppoll to atomically unblock it — slept forever in poll
+    // with a zombie child (hung `make install-dep` after apt-get update).
+    #[test]
+    fn deliverable_set_unblocked_with_handler() {
+        let sigchld = 1u64 << (17 - 1);
+        // SIGCHLD pending, temp mask unblocks it, handler installed → deliverable
+        assert_eq!(deliverable_set(sigchld, 0, sigchld), sigchld);
+        // still blocked by the temp mask → not deliverable
+        assert_eq!(deliverable_set(sigchld, sigchld, sigchld), 0);
+        // unblocked but disposition is SIG_DFL/IGN → must NOT cause EINTR
+        assert_eq!(deliverable_set(sigchld, 0, 0), 0);
+        // nothing pending
+        assert_eq!(deliverable_set(0, 0, sigchld), 0);
+    }
+
+    #[test]
+    fn ppoll_mask_swap_protects_kill_stop() {
+        // SIGKILL(9)/SIGSTOP(19) can never be blocked, even via ppoll's mask
+        let old = GUEST_SIGMASK.load(Ordering::SeqCst);
+        let swapped_old = ppoll_mask_begin(u64::MAX);
+        assert_eq!(swapped_old, old);
+        let now = GUEST_SIGMASK.load(Ordering::SeqCst);
+        assert_eq!(now & (1u64 << 8), 0, "SIGKILL must stay unblockable");
+        assert_eq!(now & (1u64 << 18), 0, "SIGSTOP must stay unblockable");
+        ppoll_mask_end(old);
+        assert_eq!(GUEST_SIGMASK.load(Ordering::SeqCst), old);
     }
 }

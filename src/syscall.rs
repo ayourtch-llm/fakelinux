@@ -1232,30 +1232,95 @@ fn do_readv(fd: u64, iov: u64, iovcnt: u64) -> u64 {
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
-fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, _sigmask: u64, _sigsetsize: u64) -> u64 {
+fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigsetsize: u64) -> u64 {
     // Linux pollfd layout: { int fd; short events; short revents; } = 8 bytes
     // macOS pollfd layout: same structure and same size
     // POLLIN/POLLOUT/POLLERR/POLLHUP values are the same on both platforms
 
     // Convert timespec to millisecond timeout for macOS poll()
-    let timeout_ms: i32 = if timeout_ptr == 0 {
+    let total_ms: i64 = if timeout_ptr == 0 {
         -1 // infinite timeout
     } else {
         unsafe {
             let ts = timeout_ptr as *const i64;
             let sec = *ts;
             let nsec = *ts.add(1);
-            // Convert to ms, clamping to i32 range
-            let ms = sec * 1000 + nsec / 1_000_000;
-            if ms > i32::MAX as i64 { i32::MAX } else { ms as i32 }
+            sec * 1000 + nsec / 1_000_000
         }
     };
 
-    // pollfd arrays have identical layout, so we can pass the guest buffer directly
-    let ret = unsafe {
-        libc::poll(fds_ptr as *mut libc::pollfd, nfds as libc::nfds_t, timeout_ms)
+    // Linux ppoll installs the caller's sigmask atomically for the wait.
+    // sudo blocks SIGCHLD and relies on ppoll to unblock it — ignoring the
+    // mask left SIGCHLD pending forever (zombie child, sudo asleep in poll).
+    let old_mask = if sigmask_ptr != 0 {
+        let new_mask = unsafe { (sigmask_ptr as *const u64).read_unaligned() };
+        Some(signal::ppoll_mask_begin(new_mask))
+    } else {
+        None
     };
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] ppoll nfds={} total_ms={} sigmask_ptr={:#x} old_mask={:?} cur_mask={:#x} pending={:#x} deliverable={:#x}\n",
+            pid, nfds, total_ms, sigmask_ptr, old_mask,
+            signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst),
+            signal::PENDING_SIGNALS.load(std::sync::atomic::Ordering::SeqCst),
+            signal::deliverable_pending()));
+    }
+
+    // Poll in chunks: a signal arriving mid-poll is queued as pending by the
+    // forwarder (IN_TRAP is set) and the host poll() is auto-restarted
+    // (SA_RESTART), so a single blocking poll() would never wake. Between
+    // chunks, a pending signal that is deliverable under the current mask
+    // (and has a real handler) interrupts the wait with EINTR — the handler
+    // itself runs at trap exit via deliver_pending_to_guest().
+    // We're inside the SIGILL trap handler, whose sa_mask blocks ALL host
+    // signals — a SIGCHLD arriving during the wait could never invoke the
+    // forwarder, so PENDING_SIGNALS would never update and the wait would
+    // sleep forever (sudo's event loop after its child exits). Unblock host
+    // signals for the duration of the wait: the forwarder sees IN_TRAP set
+    // and only queues to PENDING_SIGNALS, which is async-safe.
+    let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut saved_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut empty_set);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty_set, &mut saved_set);
+    }
+
+    const CHUNK_MS: i64 = 100;
+    let mut remaining = total_ms;
+    let result: u64 = loop {
+        if signal::deliverable_pending() != 0 {
+            break (-4_i64) as u64; // -EINTR (poll/ppoll are never restarted)
+        }
+        let chunk: i32 = if remaining < 0 {
+            CHUNK_MS as i32
+        } else {
+            remaining.min(CHUNK_MS).max(0) as i32
+        };
+        let ret = unsafe {
+            libc::poll(fds_ptr as *mut libc::pollfd, nfds as libc::nfds_t, chunk)
+        };
+        if ret < 0 {
+            let host_errno = unsafe { *libc::__error() };
+            if host_errno == libc::EINTR { continue; } // re-check pending, resume
+            break translate::linux_errno();
+        }
+        if ret > 0 { break ret as u64; }
+        if remaining >= 0 {
+            remaining -= chunk as i64;
+            if remaining <= 0 { break 0; } // timed out
+        }
+    };
+
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &saved_set, std::ptr::null_mut());
+    }
+    if let Some(old) = old_mask {
+        signal::ppoll_mask_end(old);
+    }
+    result
 }
 
 fn do_pread64(fd: i32, buf: u64, count: u64, offset: i64) -> u64 {
