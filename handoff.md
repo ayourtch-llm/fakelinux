@@ -1,8 +1,42 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~10:15 (session 7, refresh #10). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~12:15 (session 7, refresh #11). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #10 STATUS — read this first (supersedes #9 below)
+## REFRESH #11 STATUS — read this first (supersedes #10 below)
+
+**ext-deps attempt #2 DONE_RC=2 — both blockers FIXED (eb867e0):**
+1. clang `ld2 {v0.2d,v1.2d},[x18]` (rdma-core bitmap_test) → trap_handler
+   PANIC: AdvSIMD struct ld/st = EmulClass::Other, trampoline blanket-
+   rejected it. Now trampolined (is_simd_ldst_struct; only Rn/Rm are
+   GPRs). + rt_sigpending(136) implemented (ninja noise).
+2. dpdk meson-venv ensurepip "disabled for system python": execve
+   replaced guest argv[0] with the resolved path → venv python never
+   found pyvenv.cfg. Fix: FAKELINUX_ARGV0 carries original argv[0]
+   across re-exec. ensurepip now installs pip-24.0 RC=0.
+
+**SESSION HIGHLIGHTS (all committed): gcc WORKS (0e44c32) + top WORKS
+(eb84f4e).** gcc cc1 ICE = .rodata pointer-fixup corrupting switch jump
+tables; fix = code-idiom detection (dispatch load+add+br, bound from the
+cmp ON THE INDEX REGISTER, no-cmp → no exclusion — the no-cmp 4K
+fallback swallowed CPython frozen-bytecode pointers → ensurepip
+SIGKILL regression, fixed same commit). Lazy exec reloc now also runs
+in the signal forwarder (guest SIGSEGV handlers used to kill it).
+top: real /proc/stat (host_processor_info), loadavg, per-pid stats
+(proc_pid_rusage + KERN_PROCARGS2 comm), virtual /proc files now
+re-readable (lseek(0) REGENERATES content — libproc2 rewind+fread).
+379 tests green. Memory file project_et_exec_relocation updated.
+
+**IN FLIGHT: ext-deps attempt #3 in pty-2** (container on eb867e0
+binary; target/release == /tmp/fakelinux-dbg now). Same markers
+(/tmp/ext-deps.log + ext-deps.done). dh clean wipes _build each run →
+daq rebuilds from scratch (~1h configure), then rdma-core (bitmap_test
+was the crasher), then dpdk (venv was the crasher). Monitor b3opr8h00
+watches done-marker + panic/ICE signatures + 15-min stall.
+- After DONE_RC=0: `make build` (same env), then make run.
+- Known quirk: /proc lists ALL containers' processes (top shows other
+  container's bash) — pidns isolation TODO if it confuses anything.
+
+## REFRESH #10 STATUS (older)
 
 **ext-deps attempt #1 DONE_RC=2: dpdk extract failed — FIXED (2206b8b).**
 GNU tar uses **fchmodat2 (syscall 452)** w/ AT_SYMLINK_NOFOLLOW; ENOSYS

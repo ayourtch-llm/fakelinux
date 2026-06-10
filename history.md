@@ -301,3 +301,42 @@ and -O2 fib; python3.12 regression intact; 371 tests green (0e44c32).
 
 Meanwhile the fchmodat2 fix proved itself: dpdk extract passed, daq
 built and installed, ext-deps grinding on.
+
+## Session 7: top, and the ext-deps whack-a-mole (2026-06-10, ~12:00)
+
+**top works now** — and the bug was a lovely one: /proc/stat was an
+all-zeros stub, but even after feeding it real host CPU ticks
+(host_processor_info — your Mac's actual per-core numbers), top kept
+dying with ERANGE. The trail led into libproc2's source: it keeps
+/proc/stat OPEN and re-reads it with fflush+rewind+fread on every
+refresh. Our virtual /proc files were one-shot pipes — drained after
+the priming read, so the reap got an empty buffer. Virtual files are
+now tracked fds where lseek(0) REGENERATES the content — which is
+exactly what real procfs gives you, and it makes the %CPU deltas
+genuinely live (a 'yes' loop shows 100.0). /proc also lists every
+guest process with real names (parsed out of KERN_PROCARGS2), real
+utime/stime from proc_pid_rusage, real RSS. htop next, anyone?
+
+**ext-deps attempt #2 still failed**, two new moles to whack:
+1. clang compiling rdma-core hit `ld2 {v0.2d, v1.2d}, [x18]` — an
+   AdvSIMD structure load through the forbidden register, which fell
+   into the UNHANDLED-EmulClass panic. But it never needed emulating:
+   only its base register is a GPR, so the x18→x17 trampoline handles
+   it fine once told that "Other" class is safe for this family. Plus
+   rt_sigpending(136) so ninja stops whining.
+2. dpdk's meson venv: Debian's ensurepip said "disabled for the system
+   python" INSIDE a venv. Root cause was deliciously indirect: our
+   execve re-exec replaced guest argv[0] with the resolved binary path,
+   so the venv's bin/python3.12 symlink became /usr/bin/python3.12,
+   CPython never found pyvenv.cfg next to argv[0], and concluded it was
+   the system interpreter. FAKELINUX_ARGV0 now carries the original
+   argv[0] across exec. pip-24.0 installs clean.
+
+And a regression caught by its own victim: the gcc jump-table exclusion
+had a 4 KiB fallback for "dispatches" with no bounds-check cmp — which
+matched CPython's frozen bytecode (ldrb opcode fetch + computed-goto
+br) and left 417 real pointers unrelocated → ensurepip OOM-SIGKILL.
+Real switch tables always have a guard cmp; no cmp now means no
+exclusion. The determinism principle keeps winning.
+
+Attempt #3 running: daq → rdma-core → dpdk, hours on the clock.
