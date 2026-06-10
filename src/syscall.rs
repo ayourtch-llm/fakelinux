@@ -1895,9 +1895,13 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                         else { std::env::remove_var("FAKELINUX_SIGMASK"); }
                     }
 
-                    // Shebang: Linux passes the interpreter path as argv[0];
-                    // our default (argv[1] = interp path) already matches.
-                    std::env::remove_var("FAKELINUX_ARGV0");
+                    // Shebang: Linux passes the interpreter path VERBATIM as
+                    // argv[0] — interp_resolved above has been symlink-resolved
+                    // through the rootfs (a venv's /tmp/v/bin/python3 becomes
+                    // /usr/bin/python3.12), which breaks CPython's pyvenv.cfg
+                    // discovery (PEP 668 error in VPP's dpdk meson-venv).
+                    // Carry the unresolved guest path as the guest argv[0].
+                    std::env::set_var("FAKELINUX_ARGV0", interp);
 
                     // Merge guest env (DEBIAN_HAS_FRONTEND etc.) with FAKELINUX_* host overrides.
                     // fakelinux_env_overrides() walks the host environment and picks up ALL
