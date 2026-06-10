@@ -96,6 +96,7 @@ pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_RENAMEAT: u64 = 38;
 pub const SYS_FCHMOD: u64 = 52;
 pub const SYS_FCHMODAT: u64 = 53;
+pub const SYS_FCHMODAT2: u64 = 452;
 pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_FCHOWNAT: u64 = 54;
 pub const SYS_READV: u64 = 65;

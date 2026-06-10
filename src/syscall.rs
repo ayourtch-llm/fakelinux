@@ -338,6 +338,33 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             else if creds::do_geteuid() == 0 { 0 }
             else { translate::linux_errno() }
         }
+        SYS_FCHMODAT2 => {
+            // fchmodat2 (452): like fchmodat but WITH a real flags arg.
+            // GNU tar uses it with AT_SYMLINK_NOFOLLOW; flag values differ
+            // (Linux 0x100 vs macOS 0x20) and the path must not resolve the
+            // final symlink when set (dpdk tarball symlinks → ELOOP otherwise).
+            const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+            let nofollow = args[3] & LINUX_AT_SYMLINK_NOFOLLOW != 0;
+            let (eff_path, _hold) = if nofollow {
+                effective_path_ptr_nofollow(args[1])
+            } else {
+                effective_path_ptr(args[1])
+            };
+            let mac_dirfd = translate::translate_dirfd(args[0] as i32);
+            let mac_flags = if nofollow { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+            let ret = unsafe { libc::fchmodat(mac_dirfd, eff_path, args[2] as libc::mode_t, mac_flags) };
+            if ret == 0 { 0 }
+            else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
+                let ret2 = unsafe { libc::fchmodat(mac_dirfd, args[1] as *const i8, args[2] as libc::mode_t, mac_flags) };
+                if ret2 == 0 { 0 }
+                // Virtual root: silently succeed if real op fails with EPERM/ENOENT
+                else if creds::do_geteuid() == 0 { 0 }
+                else { translate::linux_errno() }
+            }
+            // Virtual root: silently succeed if real op fails with EPERM/ENOENT
+            else if creds::do_geteuid() == 0 { 0 }
+            else { translate::linux_errno() }
+        }
         SYS_FCHOWN => {
             let ret = unsafe { libc::fchown(args[0] as i32, args[1] as u32, args[2] as u32) };
             if ret == 0 { 0 }
@@ -3516,6 +3543,61 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
         assert_eq!(r, 0);
         assert_eq!(mode, 0o755, "chmod must actually land, not be faked");
+    }
+
+    // ── fchmodat2: Linux syscall 452 = (dirfd, path, mode, flags) ────────
+
+    #[test]
+    fn fchmodat2_plain_chmod_works() {
+        // GNU tar uses fchmodat2 when available; ENOSYS broke the dpdk
+        // tarball extract during VPP install-ext-deps.
+        let dir = std::env::temp_dir().join(format!("fakelinux_fchmodat2_test_{}", unsafe { libc::getpid() }));
+        let _ = std::fs::remove_dir(&dir);
+        let cpath = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkdir(cpath.as_ptr(), 0) }, 0);
+
+        let mut mctx: MContext64 = unsafe { std::mem::zeroed() };
+        const AT_FDCWD_LINUX: u64 = -100i64 as u64;
+        let r = emulate(
+            SYS_FCHMODAT2,
+            &[AT_FDCWD_LINUX, cpath.as_ptr() as u64, 0o755, 0 /* flags */, 0, 0],
+            &mut mctx,
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(r, 0);
+        assert_eq!(mode, 0o755, "chmod must actually land, not be faked");
+    }
+
+    #[test]
+    fn fchmodat2_nofollow_chmods_symlink_not_target() {
+        // tar passes AT_SYMLINK_NOFOLLOW (Linux 0x100, macOS 0x20 — must
+        // translate). The dpdk tarball has symlinks (doc/api/dts/custom.css);
+        // the ENOSYS fallback path tried to follow them → ELOOP → tar exit 2.
+        let base = std::env::temp_dir().join(format!("fakelinux_fchmodat2_nf_{}", unsafe { libc::getpid() }));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let target = base.join("target.txt");
+        std::fs::write(&target, b"hi").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let clink = std::ffi::CString::new(link.to_str().unwrap()).unwrap();
+        let mut mctx: MContext64 = unsafe { std::mem::zeroed() };
+        const AT_FDCWD_LINUX: u64 = -100i64 as u64;
+        const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        let r = emulate(
+            SYS_FCHMODAT2,
+            &[AT_FDCWD_LINUX, clink.as_ptr() as u64, 0o777, LINUX_AT_SYMLINK_NOFOLLOW, 0, 0],
+            &mut mctx,
+        );
+        let target_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(r, 0, "fchmodat2 with AT_SYMLINK_NOFOLLOW must succeed");
+        assert_eq!(target_mode, 0o644, "must chmod the symlink itself, NOT follow to the target");
     }
 
     // ── gettimeofday timeval conversion ──────────────────────────────────
