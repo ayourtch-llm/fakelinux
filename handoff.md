@@ -1,8 +1,39 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~08:00 (session 7, refresh #6). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-10 ~08:45 (session 7, refresh #7). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #6 STATUS — read this first (supersedes #5 below)
+## REFRESH #7 STATUS — read this first (supersedes #6 below)
+
+**Committed since #6** (all on `testing`, 358 tests green):
+- afd5a6a fix(exec): CLOEXEC re-applied before execve (py3compile deadlock)
+- 4436232 fix(ppoll): sigmask honored + chunked wait + HostSigUnblock
+- latest  fix(pselect6/epoll_pwait): same wait discipline as ppoll
+- sudoers drop-in `etc/sudoers.d/fakelinux-no-pty` committed.
+
+**IN FLIGHT RIGHT NOW: `UNATTENDED=y DEBIAN_FRONTEND=noninteractive
+make install-dep` running in pty-2** (container bash, /root/vpp).
+- Log: container `/tmp/install-dep.log`; on finish writes
+  `/tmp/install-dep.done` containing `DONE_RC=<rc>`.
+- debconf set to Noninteractive via debconf-set-selections (iperf3's
+  "start as daemon?" prompt hung the previous run — interactive debconf
+  reads /dev/tty which never gets pty input; pgroups broken: setpgid
+  errno 3, Ctrl-C doesn't propagate — kill containers from HOST).
+- WHEN DONE_RC=0: `UNATTENDED=y DEBIAN_FRONTEND=noninteractive make
+  install-ext-deps` (same log pattern), then `make build`, then
+  `make run`/`make test`. If DONE_RC≠0: read log tail, likely another
+  emulation bug — sample stuck pids from host, check do_read/ppoll.
+- If a kill was needed: `dpkg --configure -a` (use DEBIAN_FRONTEND=
+  noninteractive) then rerun install-dep (idempotent).
+
+Side quests queued: Rust in container, Claude Code in container (needs
+nodejs; user gives API key).
+
+CONTEXT RESET PROTOCOL (used to produce this refresh): watch pty-1 for
+context warning → finish activity → update this file → stop own
+background tasks/monitors (else /clear hangs!) → self-inject /clear +
+continuation prompt via tttt.
+
+## REFRESH #6 STATUS (older)
 
 **py3compile pipe deadlock FIXED** (afd5a6a): it was NOT a pipe bug — the
 CLOEXEC errpipe of CPython subprocess survived execve because FD_CLOEXEC
