@@ -4,6 +4,38 @@ A running log of what got fixed, how it was found, and what the bug
 actually was. Newest entries at the top. (Companion to `docs/diary.md`
 and `handoff.md` — this one is the narrative for humans.)
 
+## 2026-06-10 (session 7, part 4) — the road to `make build`: two host-OS impedance mismatches
+
+vpp is cloned (`git fsck` exit 0) and `make` inside the container
+prints the full VPP target menu. Getting `make install-dep` to run
+surfaced two delicious "macOS is not Linux" bugs that had nothing to
+do with instruction emulation:
+
+1. **Case-insensitive APFS vs linux-libc-dev.** `apt-get install
+   build-essential` died unpacking kernel headers:
+   `unable to install new version of '/usr/include/linux/netfilter/
+   xt_connmark.h': No such file or directory`. The netfilter headers
+   ship **eight case-colliding pairs** (`xt_connmark.h` vs
+   `xt_CONNMARK.h`, `ipt_ecn.h` vs `ipt_ECN.h`, …iptables match vs
+   target convention). On case-insensitive APFS both `.dpkg-new`
+   temp files are the *same file*; the first rename consumes it and
+   the second rename gets ENOENT. Fix (pragmatic): a dpkg
+   `path-exclude` conffile in the rootfs dropping the 8 uppercase
+   variants (VPP's source references none of them). The *real* fix
+   would be a case-sensitive APFS volume for the rootfs.
+
+2. **sudo vs host file ownership.** VPP's Makefile shells out to
+   `sudo`, and freshly-installed sudo refused:
+   `/etc/sudoers is owned by uid 501, should be 0`. We virtualize
+   credentials (guest is uid 0, unshare -r style) but stat results
+   leaked raw host uids. Fix: `creds::map_host_id` — our host uid/gid
+   maps to 0, everything else to 65534 (Linux overflowuid), wired into
+   both stat translators (6788b41). `sudo true` now works in-container.
+
+Also: TaskList + handoff survived context refresh #4; build-essential
+(gcc 13, g++, make, dpkg-dev) installed clean once the collision was
+excluded.
+
 ## 2026-06-10 (session 7, part 3) — TLS works: two crypto-adjacent bugs
 
 The road to `git clone https://gerrit.fd.io/r/vpp` went through TLS,
@@ -134,3 +166,19 @@ See `docs/diary.md` for sessions 1–6 (UMULH/MADD zstd corruption,
 nested-fork SIGCHLD race, XZ thread deadlock, x18 trampolines,
 .eh_frame literal-pool parsing, apt-get networking, mprotect rounding,
 rt_sigtimedwait + POSIX timers, …).
+
+## Session 7, refresh #5 (2026-06-10)
+
+**py3compile pipe deadlock SOLVED** (afd5a6a). The 6-hour install-dep hang
+turned out to be a beautiful one: lsof on the two stuck processes showed a
+pipe pair (parent fd 5 ↔ child fd 6) that had no business existing — it was
+CPython subprocess's *errpipe*, created with O_CLOEXEC, which should have
+died when the child exec'd py_compile. fakelinux strips FD_CLOEXEC from all
+fds before macOS fork (atfork handlers would close them otherwise) and
+restores it only in the parent — the exec'd child kept the errpipe open, so
+Popen() in the parent waited forever for EOF on it, and the child waited
+forever for stdin that the parent (stuck inside Popen!) never wrote. Fix:
+re-apply saved CLOEXEC bits right before execve, and forget bits when the
+child closes/dup2s over an fd. TDD: 2 mask-lifecycle unit tests (356 green),
+then the live repro: `Popen(['python3.12','-m','py_compile','-'], bufsize=0,
+stdin=PIPE)` → rc 0 in seconds instead of hanging.
