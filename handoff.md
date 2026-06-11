@@ -1,8 +1,53 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-10 ~13:20 (session 7, refresh #12). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-11 ~13:00 (session 7→8, refresh #13). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #12 STATUS — read this first (supersedes #11 below)
+## REFRESH #13 STATUS — read this first (supersedes #12 below)
+
+**Two fakelinux bugs found by ext-deps attempts #3/#4, both fixed+committed on `testing`:**
+1. **Shebang argv[0] symlink-resolved (c3a8f72)**: execve shebang branch
+   removed FAKELINUX_ARGV0, so the interpreter saw the rootfs-resolved
+   path (/tmp/venv/bin/python3 → /usr/bin/python3.12). CPython missed
+   pyvenv.cfg → system prefix → PEP 668 "externally-managed-environment"
+   killed dpdk's meson-venv pip install. Linux passes the shebang text
+   VERBATIM as argv[0]; we now set FAKELINUX_ARGV0=interp
+   (syscall.rs ~line 1898). Test: `tests/test_shebang_argv0.sh` (red→green).
+2. **Env-lock self-deadlock in trap_handler (bf94855)**: handler called
+   std::env::var (FAKELINUX_TRACE_LR/_X18 + lazy _X18_STORES). Signal
+   landed while the forked child held the env lock in
+   pidns::set_child_env setenv → handler blocked forever in
+   env_read_lock (semaphore_wait_trap). Symptom: xdp-tools `sh configure`
+   hung 10h, dash with 2 unreaped zombies; `sample <pid>` gave the stack.
+   Fix: init_trace_flags() caches knobs in install_handler(); handler
+   loads atomics only. Unit test trap::trace_flag_tests pins it.
+   **RULE: nothing reachable from signal context may call std::env or
+   any lock-taking std API.**
+
+**ext-deps attempt #5 IN FLIGHT — DETACHED from Claude session:**
+- nohup, host PID 37329 (whole tree survives /clear AND usage outages —
+  attempt #4's 10h hang went unnoticed partly because usage ran out and
+  scheduled wakeups couldn't fire; log markers are the source of truth).
+- Log: `ubuntu-rootfs/tmp/ext-deps5.log`; completion marker line
+  `DONE_RC=<n>` appended at end. No harness monitor survives /clear;
+  NEXT SESSION: check `grep DONE_RC ubuntu-rootfs/tmp/ext-deps5.log`,
+  re-arm a Monitor (dedup errors vs $seen var! and stall-check mtime of
+  _build/*.log sub-logs — main log goes quiet during configure/ninja).
+- Attempt #4 proved the whole chain works: daq, rdma-core (513 tgts),
+  **DPDK 26.03 (meson venv pip OK, 2002 ninja targets, installed)**,
+  quicly all built; only xdp-tools was left when it hit deadlock (2).
+  dh clean wipes _build on every rerun → ~12h full rebuild per attempt.
+- After DONE_RC=0: `make build` (UNATTENDED=y DEBIAN_FRONTEND=
+  noninteractive PKG_VERSION=26.10 PKG_SUFFIX=0), then make run.
+- Launch incantation (from repo root):
+  `FAKELINUX_ROOT=$PWD/ubuntu-rootfs ./target/release/fakelinux
+  --container ubuntu-rootfs/usr/bin/bash -c 'cd /root/vpp && make
+  install-ext-deps > /tmp/ext-deps5.log 2>&1; echo "DONE_RC=$?" >>
+  /tmp/ext-deps5.log'`
+- Loose thread (minor): 36x `write(1) EAGAIN` pipe retry spam from one
+  short-lived proc in attempt #4 — benign, but fakelinux's nonblocking
+  pipe write path may deserve a retry/poll loop someday.
+
+## REFRESH #12 STATUS (older)
 
 **Two user-reported bugs FIXED + committed this refresh:**
 1. **curl 5s delay (d68fd35)**: curl sets Linux TCP_KEEPIDLE

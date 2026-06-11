@@ -392,3 +392,32 @@ turns out to be a master. apt output now comes down in straight
 columns and the terminal survives. Bonus discovery: with the pty
 actually working, dpkg children's stderr now lands on screen — the
 FAKELINUX_QUIET idea moves up the wishlist.
+
+## 2026-06-10/11 — the venv that wasn't, and the 10-hour zombie vigil
+
+ext-deps attempt #3 ran four hours and delivered a gift: rdma-core —
+attempt #2's killer — built all 513 targets clean. The new wall was
+dpkg's DPDK recipe: `pip install` inside a freshly-created venv died
+with Ubuntu's PEP 668 "externally-managed-environment" lecture. But the
+venv was real, pyvenv.cfg and all. The trail led to the shebang:
+`#!/tmp/venv/bin/python3` should land in argv[0] *verbatim* — that's
+literally how CPython finds pyvenv.cfg — but our execve shebang branch
+helpfully handed over the rootfs-resolved /usr/bin/python3.12 instead.
+One env var (FAKELINUX_ARGV0=interp) and a red-then-green shell test
+later, pip installed into the venv like it always should have (c3a8f72).
+
+Attempt #4 then made it further than ever: daq, rdma-core, DPDK 26.03 —
+meson, 2002 ninja targets, installed — then quicly… and then silence.
+Ten hours of it (compounded by the Claude usage tank running dry, so
+the babysitter never woke — lesson: long builds now run nohup-detached,
+log markers are the ground truth). The corpse: xdp-tools' `sh
+configure`, a dash subshell frozen with two zombie children it refused
+to reap. `sample` told the whole story in one stack: trap_handler →
+std::env::var → env_read_lock → semaphore_wait_trap, while the thread
+it interrupted was *holding* the env lock in setenv right after fork.
+The signal handler was reading FAKELINUX_TRACE_* debug knobs from the
+environment on every trap — a self-deadlock with a 10-hour fuse.
+Fix bf94855: read the knobs once at handler install, atomics-only in
+signal context. New house rule, now in the handoff in bold: nothing
+reachable from a signal handler calls std::env. Attempt #5 is grinding
+through the ~12h rebuild, detached, with the fixed binary.
