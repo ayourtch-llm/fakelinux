@@ -782,13 +782,65 @@ static X18_STORE_TRACE: AtomicI8 = AtomicI8::new(-1);
 /// pid for which we've already snapshotted /proc/self/maps. 0 = none yet.
 static X18_STORE_MAPS_DUMPED_PID: AtomicU64 = AtomicU64::new(0);
 
-#[inline]
-fn x18_store_trace_enabled() -> bool {
-    let cached = X18_STORE_TRACE.load(Ordering::Relaxed);
-    if cached >= 0 { return cached == 1; }
+// Trace flags read in trap_handler context. std::env::var takes the Rust env
+// lock — if a signal lands while the interrupted code holds it (e.g. setenv in
+// pidns::set_child_env after fork), the handler self-deadlocks on
+// env_read_lock (semaphore_wait_trap, seen hanging xdp-tools configure for
+// 10h). ALL env access for handler paths must happen in init_trace_flags(),
+// called from install_handler() before any guest code runs.
+static TRACE_LR_ENABLED: AtomicBool = AtomicBool::new(false);
+static TRACE_X18_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Read handler-path trace knobs from the environment ONCE, outside signal
+/// context. Async-signal-safe getters below only load atomics.
+pub fn init_trace_flags() {
     let v: i8 = if std::env::var_os("FAKELINUX_TRACE_X18_STORES").is_some() { 1 } else { 0 };
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
-    v == 1
+    TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
+    TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
+}
+
+#[inline]
+fn x18_store_trace_enabled() -> bool {
+    // No lazy env fallback: a first call from signal context would deadlock.
+    X18_STORE_TRACE.load(Ordering::Relaxed) == 1
+}
+
+#[inline]
+fn trace_lr_enabled() -> bool { TRACE_LR_ENABLED.load(Ordering::Relaxed) }
+
+#[inline]
+fn trace_x18_enabled() -> bool { TRACE_X18_ENABLED.load(Ordering::Relaxed) }
+
+#[cfg(test)]
+mod trace_flag_tests {
+    use super::*;
+    #[test]
+    fn getters_are_cached_and_ignore_env_after_init() {
+        std::env::remove_var("FAKELINUX_TRACE_LR");
+        std::env::remove_var("FAKELINUX_TRACE_X18");
+        std::env::remove_var("FAKELINUX_TRACE_X18_STORES");
+        init_trace_flags();
+        assert!(!trace_lr_enabled());
+        assert!(!trace_x18_enabled());
+        assert!(!x18_store_trace_enabled());
+        // Mutating the environment after init must NOT be observed by the
+        // getters — proves they never touch std::env (async-signal-safety).
+        std::env::set_var("FAKELINUX_TRACE_LR", "1");
+        std::env::set_var("FAKELINUX_TRACE_X18", "1");
+        std::env::set_var("FAKELINUX_TRACE_X18_STORES", "1");
+        assert!(!trace_lr_enabled());
+        assert!(!trace_x18_enabled());
+        assert!(!x18_store_trace_enabled());
+        // Re-init picks them up (outside signal context).
+        init_trace_flags();
+        assert!(trace_lr_enabled());
+        assert!(trace_x18_enabled());
+        assert!(x18_store_trace_enabled());
+        std::env::remove_var("FAKELINUX_TRACE_LR");
+        std::env::remove_var("FAKELINUX_TRACE_X18");
+        std::env::remove_var("FAKELINUX_TRACE_X18_STORES");
+    }
 }
 
 /// On the first store seen in each process, snapshot /proc/self/maps to
@@ -1755,7 +1807,7 @@ unsafe extern "C" fn trap_handler(
     // LR watch (debug-only). Disabled by default — was for fork LR corruption
     // investigation, but proved misleading (was watching wrong slot for glibc 2.39's
     // _Fork). Enable with FAKELINUX_TRACE_LR=1 if needed.
-    if std::env::var("FAKELINUX_TRACE_LR").is_ok() {
+    if trace_lr_enabled() {
         let lw_addr = FORK_LR_WATCH_ADDR.load(Ordering::Relaxed);
         let lw_exp = FORK_LR_WATCH_EXPECTED.load(Ordering::Relaxed);
         if lw_addr != 0 && lw_exp != 0 {
@@ -2028,7 +2080,7 @@ unsafe extern "C" fn trap_handler(
                         ));
                         libc::write(2, buf.as_ptr() as *const _, n);
                     }
-                    if seq < 200 && std::env::var("FAKELINUX_TRACE_X18").is_ok() {
+                    if seq < 200 && trace_x18_enabled() {
                         let mut buf = [0u8; 128];
                         let n = raw_fmt(&mut buf, format_args!(
                             "x18[{}] pc={:#x} instr={:#010x} x18={:#x}\n",
@@ -2281,6 +2333,9 @@ pub fn trap_handler_ptr() -> libc::sighandler_t {
 }
 
 pub fn install_handler() {
+    // Cache env-derived trace knobs BEFORE the handler can ever fire — the
+    // handler must never touch std::env (env-lock self-deadlock).
+    init_trace_flags();
     unsafe {
         // Allocate a signal-handler stack
         let stack_size: usize = 128 * 1024;
