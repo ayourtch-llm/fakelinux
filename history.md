@@ -421,3 +421,38 @@ Fix bf94855: read the knobs once at handler install, atomics-only in
 signal context. New house rule, now in the handoff in bold: nothing
 reachable from a signal handler calls std::env. Attempt #5 is grinding
 through the ~12h rebuild, detached, with the fixed binary.
+
+## 2026-06-11 evening → 06-12 night (session 8): ext-deps marathon + the cc1 hunt
+
+Attempt #5 ran detached all afternoon and got FURTHER THAN EVER:
+rdma-core finished (including a 3-hour sanitize_static_lib step that
+looks exactly like a hang — llvm-nm/objcopy per static lib, all output
+to /tmp scratch — fooled my own stall detector twice), dpdk 26.03 built
+all 2002 ninja targets and installed (the meson-venv pip install that
+killed attempt #3 sailed through — the shebang argv[0] fix works),
+quicly built... and then xdp-tools, the very last package, hit a wall:
+gcc-13's cc1 segfaults compiling libbpf's bpf.c at -O3, "during RTL
+pass: ira". An internal compiler error, deterministic, same pc every
+time — gcc's own "bug is not reproducible, likely a hardware or OS
+problem" message is wrong on both counts: it reproduces 5/5, and the
+"OS problem" is us.
+
+Notable: xdp-tools is the ONLY package in the chain built with gcc
+(everything else uses clang), which is why 14 hours of building never
+tripped this before. And the VPP main build defaults to gcc too, so
+this bug is squarely in the critical path.
+
+The debugging story so far is the fun part: got lldb to debug GUEST
+code running under fakelinux. The trick is
+`platform.plugin.darwin.ignored-exceptions EXC_BAD_INSTRUCTION|
+EXC_BAD_ACCESS` — without it lldb eats every Mach exception before
+fakelinux's SIGILL/SIGSEGV handlers can see them, and the lazy-reloc
+faults loop forever. With it, a conditional breakpoint at the crash
+callee (`$x0 == 0`) caught the smoking gun: an RTL expression on the
+heap with its first operand NULL — code 86, second operand valid.
+The ira-pass RTL dump for the function is complete and clean, so the
+corruption strikes between IRA's dump and reload. Next: find who
+writes (or fails to write) that operand slot.
+
+Stamps are intact, so once cc1 is fixed, `dpkg-buildpackage -nc`
+resumes at xdp-tools — no 12-hour rebuild.

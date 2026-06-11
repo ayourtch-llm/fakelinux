@@ -1,8 +1,78 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-11 ~13:00 (session 7→8, refresh #13). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~00:00 (session 8→9, refresh #14). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #13 STATUS — read this first (supersedes #12 below)
+## REFRESH #14 STATUS — read this first (supersedes #13 below)
+
+**ext-deps attempt #5: DONE_RC=2 — died at the LAST package (xdp-tools).**
+Everything else BUILT+INSTALLED with stamps intact in
+`ubuntu-rootfs/root/vpp/build/external/deb/_build/`: daq, rdma-core
+(17:14, incl. 3h sanitize_static_lib llvm-nm/objcopy grind — that step
+writes only to guest /tmp, looks like a stall but isn't), dpdk 26.03
+(ALL 2002 ninja targets + install 22:31; meson venv pip worked —
+c3a8f72 shebang-argv0 fix CONFIRMED in real build), quicly (22:35).
+
+**CURRENT BUG — gcc-13 cc1 deterministic SIGSEGV (ICE) — IN PROGRESS:**
+- xdp-tools is the only gcc user (everything else clang). cc1 ICEs on
+  the FIRST real compile: libbpf bpf.c, -O3, "during RTL pass: ira".
+  gcc driver's "bug is not reproducible" is a LIE — 100% deterministic.
+- MINIMIZED REPRO (fast, ~30s):
+  `FAKELINUX_ROOT=$PWD/ubuntu-rootfs ./target/release/fakelinux
+  ubuntu-rootfs/usr/libexec/gcc/aarch64-linux-gnu/13/cc1 -fpreprocessed
+  /tmp/min2.i -quiet -mlittle-endian -mabi=lp64 -O3 -fPIC -o /tmp/min2.s`
+  (/tmp/min2.i = head -14093 of bpf.i, lives in ubuntu-rootfs/tmp/).
+- Crash: pc=0x70100fadc `ldrh w20,[x19]` x19=0 (callee 0x100faa0 — an
+  rtx-code switch helper — entered with x0=NULL). Caller callsite
+  0x100fe04, loads arg from `ldr x0,[x19,#8]`.
+- lldb session DATA (bp 0x70100faa0 cond $x0==0 HIT): caller x19 =
+  heap rtx at 0x11970d780: [+0]=0x20000056 (rtx code 0x56=86, check
+  which code that is in gcc-13 aarch64 rtl.def order!), [+8]=NULL ←the
+  bug, [+16]=0x117dbd490 valid heap ptr, [+24]=0x20020034 (inline rtx
+  header? code 0x34=52). Heap addrs NOT stable across runs — same-run
+  watchpoint needed, or break earlier at rtx creation.
+- -fdump-rtl-all: ira dump (301r.ira) for bpf_prog_load is COMPLETE
+  (564 insns, sane RTL, no (nil) operands in wrong places); 302r.reload
+  does NOT contain bpf_prog_load → corruption manifests between ira's
+  RTL dump and reload (i.e. inside IRA allocation / start of LRA).
+  Dumps: ubuntu-rootfs/tmp/min2dump.*.
+- **LLDB-ON-GUEST RECIPE (works, hard-won!):**
+  `settings set platform.plugin.darwin.ignored-exceptions
+  EXC_BAD_INSTRUCTION|EXC_BAD_ACCESS` (BEFORE run; if launch says
+  "attach failed" just retry — flaky once), `run` stops at first guest
+  SIGILL (= anchor; guest text already mapped+patched), then
+  `process handle SIGILL/SIGSEGV/SIGBUS/SIGCHLD --pass true --stop
+  false --notify false`, then `breakpoint set -a 0x70100faa0 -c "$x0
+  == 0"` + breakpoint command add, then continues. Script:
+  /tmp/lldb-cc1c.txt (host /tmp). Without ignored-exceptions lldb
+  stops on every Mach exception and lazy-reloc faults LOOP FOREVER.
+- Suspects (unconfirmed): (a) ET_EXEC pointer fixup false pos/neg —
+  loader.rs fixup_exec_pointers_skip_dynamic + scan_rodata_table_
+  exclusions; cc1's global at 0x1ed8290 (adrp'd in callee) worth
+  checking; (b) emulated-instruction bug à la UMULH (x18-fallback or
+  SIMD path) corrupting IRA's bitmaps/pointers.
+- Next debug steps: (1) identify rtx code 86 + the callee fn (objdump
+  around 0x100faa0; compare gcc-13.2 aarch64 sources); (2) same-run
+  watchpoint: bp where the rtx is allocated, watch [rtx+8]; cheaper:
+  bp at 0x100fe04 (callsite) cond `*(long*)($x19+8)==0` to catch
+  earlier visits; (3) FAKELINUX_TRACE_X18 audit of cc1 run, diff
+  emulated-instr classes vs known-good; (4) try -O2 / -fno-* flag
+  bisect to shrink which optimization triggers it.
+
+**AFTER cc1 FIX — resume ext-deps WITHOUT the 12h clean rebuild:**
+container: `cd /root/vpp/build/external/deb && dpkg-buildpackage -b
+-uc -us -nc` (-nc = no clean → stamps survive, ONLY xdp-tools
+rebuilds). Then back at top level the make stamps/deb install may need
+`make -C /root/vpp/build/external install-deb` rerun (it'll find the
+deb). THEN: `make build` (UNATTENDED=y DEBIAN_FRONTEND=noninteractive
+PKG_VERSION=26.10 PKG_SUFFIX=0) + push notification to user.
+NOTE: vpp `make build` may default to gcc → cc1 bug blocks it anyway;
+fixing cc1 is NOT optional. Detach long builds with nohup + DONE_RC
+log marker (usage outages kill harness wakeups; log = ground truth).
+Monitor recipe: watch DONE marker + panic/Error sigs (dedup vs $seen)
++ true-stall = no file mtime in logs AND guest /tmp AND all fakelinux
+procs <20% CPU (sanitize-type steps write only to /tmp scratch).
+
+## REFRESH #13 STATUS (older)
 
 **Two fakelinux bugs found by ext-deps attempts #3/#4, both fixed+committed on `testing`:**
 1. **Shebang argv[0] symlink-resolved (c3a8f72)**: execve shebang branch
