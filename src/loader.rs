@@ -1075,6 +1075,38 @@ fn setup_stack(
 /// uses absolute assignment (idempotent). But for R_AARCH64_JUMP_SLOT with
 /// lazy binding, ld-linux ADDS the load delta to the current GOT value.
 /// If we pre-adjust those GOT entries, ld-linux double-relocates them.
+/// Decide whether an 8-byte word found in a relocated ET_EXEC's data is
+/// plausibly an unrelocated absolute pointer (and should be eagerly fixed
+/// up by adding base_offset), versus a packed small-integer struct that
+/// merely aliases into the [orig_lo, orig_hi) range.
+///
+/// Real case: gcc cc1's insn_operand_data flags word for match_operator
+/// operands — {mode:16, strict_low, is_operator=1, eliminable=0,
+/// allows_mem=0} — reads as u64 0x0100_0000|mode, square inside cc1's
+/// [0x400000, 0x2400000) range. Adding the 0x7_0000_0000 base set the
+/// `eliminable` byte to 7, so reload's elimination_costs_in_insn walked
+/// match_operator operands after NULLing their nested operand slot
+/// (*recog_data.operand_loc[i] = 0): deterministic SIGSEGV in
+/// eliminate_regs_1 on any function with a ccmp insn (libbpf bpf.c, ICE
+/// "during RTL pass: ira").
+///
+/// Heuristic: a packed-flags word has ≤2 nonzero bytes, sits at or above
+/// 16M (byte 3+ carries a flag — small binaries like python3.12 live
+/// entirely below 16M, where sparse-looking REAL pointers are common and
+/// rejecting them broke CPython's static type tables), and has byte 2
+/// zero (mode:16 in bytes 0-1, strict_low in byte 2 is 0 for operators —
+/// a real pointer ≥16M almost always has nonzero bits in its 0xFF0000
+/// byte). The asymmetry justifying rejection: a missed real pointer is
+/// recovered by the lazy-relocation fault handler on first dereference,
+/// but a relocated non-pointer is silent memory corruption.
+fn plausible_unrelocated_pointer(val: u64, orig_lo: u64, orig_hi: u64) -> bool {
+    if val < orig_lo || val >= orig_hi {
+        return false;
+    }
+    let sparse = val.to_le_bytes().iter().filter(|&&b| b != 0).count() <= 2;
+    !(sparse && val >= 0x100_0000 && val & 0xFF_0000 == 0)
+}
+
 fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
     // Find PT_DYNAMIC range to exclude
     let dyn_phdr = elf.phdrs.iter().find(|p| p.p_type == 2 /* PT_DYNAMIC */);
@@ -1162,7 +1194,7 @@ fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
                 continue;
             }
             let val = unsafe { *(ptr_addr as *const u64) };
-            if val >= orig_lo && val < orig_hi {
+            if plausible_unrelocated_pointer(val, orig_lo, orig_hi) {
                 unsafe { *(ptr_addr as *mut u64) = val + base_offset; }
                 fixed += 1;
             }
@@ -1446,7 +1478,7 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
         while o + 8 <= sh_size {
             let p = (start + o) as *mut u64;
             let val = unsafe { *p };
-            if val >= orig_lo && val < orig_hi {
+            if plausible_unrelocated_pointer(val, orig_lo, orig_hi) {
                 if addr_in_sorted_ranges(sh_addr + o, &exclusions) {
                     skipped_tables += 1;
                 } else {
@@ -2030,5 +2062,63 @@ mod tests {
         let strs: Vec<&str> = out.iter().map(|c| c.to_str().unwrap()).collect();
         assert_eq!(strs.iter().filter(|s| s.starts_with("X=")).count(), 1);
         assert!(strs.contains(&"X=first"));
+    }
+
+    // ── plausible_unrelocated_pointer ─────────────────────────────────────
+    // The eager ET_EXEC pointer fixup must not relocate packed small-int
+    // struct fields that alias into the pointer range. Real case: gcc cc1's
+    // insn_operand_data flags word for a match_operator operand
+    // {mode:16, strict_low, is_operator=1, eliminable=0, allows_mem=0}
+    // reads as u64 0x0100_0000..0x0100_0040 — inside cc1's
+    // [0x400000, 0x2400000) PT_LOAD range. Relocating it added
+    // 0x7_0000_0000, setting the `eliminable` byte to 7, which made
+    // reload's elimination_costs_in_insn walk match_operator operands
+    // after NULLing their nested operand slot → deterministic ICE
+    // (SIGSEGV in eliminate_regs_1) on any ccmp insn, e.g. libbpf bpf.c.
+
+    const CC1_LO: u64 = 0x400000;
+    const CC1_HI: u64 = 0x2400000;
+
+    #[test]
+    fn fixup_rejects_match_operator_flags_words() {
+        // All 166 aliasing words in cc1's insn tables: 0x1000000 | mode.
+        for w in [0x0100_0000u64, 0x0100_000e, 0x0100_0040, 0x0100_0011] {
+            assert!(
+                !plausible_unrelocated_pointer(w, CC1_LO, CC1_HI),
+                "flags word {w:#x} must not be treated as a pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn fixup_accepts_real_pointers() {
+        // Real pointers from cc1's insn_data: name/operand/predicate ptrs.
+        for w in [0x198f348u64, 0x16a7c78, 0x1147c00, 0x11373f4, 0x8945a4] {
+            assert!(
+                plausible_unrelocated_pointer(w, CC1_LO, CC1_HI),
+                "real pointer {w:#x} must be relocated"
+            );
+        }
+    }
+
+    #[test]
+    fn fixup_accepts_sparse_low_pointers() {
+        // python3.12's image sits below 16M; its .rodata holds real
+        // pointers with only 1-2 nonzero bytes (static type tables).
+        // Rejecting them caused "__delattr__" string bytes to be chased
+        // as a pointer (SIGSEGV in typeobject init).
+        for w in [0x4100a0u64, 0x400000, 0x500000, 0xb00008] {
+            assert!(
+                plausible_unrelocated_pointer(w, 0x400000, 0xb8dfc8),
+                "sparse low pointer {w:#x} must be relocated"
+            );
+        }
+    }
+
+    #[test]
+    fn fixup_rejects_out_of_range() {
+        assert!(!plausible_unrelocated_pointer(0x3fffff, CC1_LO, CC1_HI));
+        assert!(!plausible_unrelocated_pointer(CC1_HI, CC1_LO, CC1_HI));
+        assert!(!plausible_unrelocated_pointer(0, CC1_LO, CC1_HI));
     }
 }
