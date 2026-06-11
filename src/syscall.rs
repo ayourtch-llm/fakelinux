@@ -2239,6 +2239,8 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
             "fakelinux: [{}] MMAP anon addr={:#x} len={:#x} prot={} flags={:#x} → {:#x}..{:#x}\n",
             pid, addr, length, prot, flags, result_addr, result_addr + length));
     }
+    // Software watchpoint arming (FAKELINUX_WATCH) — atomics only.
+    crate::trap::watch_on_anon_mmap(ret as u64, length);
     ret as u64
 }
 

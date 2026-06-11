@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 use crate::syscall;
 
 extern "C" {
-    fn mach_task_self() -> u32;
-    fn mach_vm_read_overwrite(
+    pub fn mach_task_self() -> u32;
+    pub fn mach_vm_read_overwrite(
         target_task: u32,
         address: u64,
         size: u64,
@@ -791,6 +791,26 @@ static X18_STORE_MAPS_DUMPED_PID: AtomicU64 = AtomicU64::new(0);
 static TRACE_LR_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_X18_ENABLED: AtomicBool = AtomicBool::new(false);
 
+// ── Software watchpoint (debug tool) ─────────────────────────────────────
+// FAKELINUX_WATCH=<seq>:<len>:<off> (hex, no 0x): arm a write-watch on the
+// 8-byte slot at offset <off> into the <seq>-th anonymous guest mmap of
+// length <len>. The page is kept PROT_READ; each write faults, we patch the
+// NEXT instruction with a UDF probe, let the store execute natively (any
+// store form incl. writeback/STP), then re-protect and log if the watched
+// slot changed. Single-threaded guests only.
+pub static WATCH_MMAP_LEN: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_MMAP_SEQ: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_OFF: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_PAGE: AtomicU64 = AtomicU64::new(0);
+static WATCH_STEP_PC: AtomicU64 = AtomicU64::new(0);
+static WATCH_STEP_ORIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WATCH_PREV_VAL: AtomicU64 = AtomicU64::new(0);
+static WATCH_FAULT_PC: AtomicU64 = AtomicU64::new(0);
+/// UDF payload for the watchpoint single-step probe (distinct from
+/// UDF_MARKER 0xF000 and never produced by the loader patcher).
+pub const UDF_WATCH_STEP: u32 = 0x0000_F00D;
+
 /// Read handler-path trace knobs from the environment ONCE, outside signal
 /// context. Async-signal-safe getters below only load atomics.
 pub fn init_trace_flags() {
@@ -798,6 +818,128 @@ pub fn init_trace_flags() {
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
+    if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() == 3 {
+            if let (Ok(seq), Ok(len), Ok(off)) = (
+                u64::from_str_radix(parts[0], 16),
+                u64::from_str_radix(parts[1], 16),
+                u64::from_str_radix(parts[2], 16),
+            ) {
+                WATCH_MMAP_SEQ.store(seq, Ordering::Relaxed);
+                WATCH_MMAP_LEN.store(len, Ordering::Relaxed);
+                WATCH_OFF.store(off, Ordering::Relaxed);
+                eprintln!("fakelinux: WATCH armed-pending: seq={} len={:#x} off={:#x}", seq, len, off);
+            }
+        }
+    }
+}
+
+/// Called by do_mmap after a successful anonymous mapping. Arms the watch
+/// when the seq-th mmap of the configured length appears. Runs in trap
+/// context — atomics + raw prints only.
+pub fn watch_on_anon_mmap(base: u64, length: u64) {
+    let want_len = WATCH_MMAP_LEN.load(Ordering::Relaxed);
+    if want_len == 0 || length != want_len || WATCH_ADDR.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if WATCH_MMAP_SEQ.fetch_sub(1, Ordering::Relaxed) != 1 {
+        return;
+    }
+    let addr = base + WATCH_OFF.load(Ordering::Relaxed);
+    let page = addr & !0x3FFF;
+    WATCH_ADDR.store(addr, Ordering::Relaxed);
+    WATCH_PAGE.store(page, Ordering::Relaxed);
+    unsafe {
+        libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ);
+        let mut buf = [0u8; 160];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: WATCH armed: addr={:#x} page={:#x} (mmap base={:#x})\n",
+            addr, page, base));
+        libc::write(2, buf.as_ptr() as *const _, n);
+    }
+}
+
+/// Handle a write fault on the watched page: record the pre-value, patch a
+/// UDF probe after the faulting instruction, unprotect, retry natively.
+/// Returns true if the fault was ours.
+pub unsafe fn watch_handle_fault(mctx: &mut MContext64, fault_addr: u64) -> bool {
+    let page = WATCH_PAGE.load(Ordering::Relaxed);
+    if page == 0 || fault_addr < page || fault_addr >= page + 0x4000 {
+        return false;
+    }
+    let pc = mctx.ss.pc;
+    let waddr = WATCH_ADDR.load(Ordering::Relaxed);
+    // Host-code store (e.g. our own emulation writing on the guest's
+    // behalf): unprotect, log, and disarm — patching host code would be
+    // fatal. CURRENT_X18_INSTR identifies the emulated guest instruction.
+    let host_anchor = watch_handle_fault as usize as u64;
+    if pc.wrapping_sub(host_anchor) < 0x8000000 || host_anchor.wrapping_sub(pc) < 0x8000000 {
+        let mut buf = [0u8; 224];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: WATCH HOST-CODE write! host_pc={:#x} fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
+            pc, fault_addr, CURRENT_X18_INSTR, CURRENT_X18_PC));
+        libc::write(2, buf.as_ptr() as *const _, n);
+        libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+        WATCH_PAGE.store(0, Ordering::Relaxed);
+        return true;
+    }
+    WATCH_PREV_VAL.store((waddr as *const u64).read(), Ordering::Relaxed);
+    WATCH_FAULT_PC.store(pc, Ordering::Relaxed);
+    // Patch the next instruction with the step probe.
+    let step = pc + 4;
+    let tpage = step & !0x3FFF;
+    libc::mprotect(tpage as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+    WATCH_STEP_ORIG.store((step as *const u32).read(), Ordering::Relaxed);
+    (step as *mut u32).write(UDF_WATCH_STEP);
+    extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+    sys_icache_invalidate(step as *mut _, 4);
+    libc::mprotect(tpage as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+    WATCH_STEP_PC.store(step, Ordering::Relaxed);
+    // Let the store execute natively.
+    libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+    true
+}
+
+/// Handle the UDF step probe: restore the patched instruction, re-protect
+/// the watched page, log if the watched slot changed. Returns true if pc
+/// was the active probe.
+pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
+    let step = WATCH_STEP_PC.load(Ordering::Relaxed);
+    if step == 0 || mctx.ss.pc != step {
+        return false;
+    }
+    // Restore the original instruction.
+    let orig = WATCH_STEP_ORIG.load(Ordering::Relaxed);
+    let tpage = step & !0x3FFF;
+    libc::mprotect(tpage as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+    (step as *mut u32).write(orig);
+    extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+    sys_icache_invalidate(step as *mut _, 4);
+    libc::mprotect(tpage as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+    WATCH_STEP_PC.store(0, Ordering::Relaxed);
+    // Re-protect the watched page and check the slot.
+    let page = WATCH_PAGE.load(Ordering::Relaxed);
+    if page != 0 {
+        libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ);
+        let waddr = WATCH_ADDR.load(Ordering::Relaxed);
+        let cur = (waddr as *const u64).read();
+        let prev = WATCH_PREV_VAL.load(Ordering::Relaxed);
+        if cur != prev {
+            let fpc = WATCH_FAULT_PC.load(Ordering::Relaxed);
+            let instr = (fpc as *const u32).read();
+            let r = &mctx.ss;
+            let mut buf = [0u8; 512];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: WATCH WRITE [{:#x}] {:#x} → {:#x} by pc={:#x} instr={:#010x} lr={:#x}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n  x19={:#x} x20={:#x} x21={:#x} x22={:#x} sp={:#x}\n",
+                waddr, prev, cur, fpc, instr, r.lr,
+                r.x[0], r.x[1], r.x[2], r.x[3], r.x[4], r.x[5], r.x[6], r.x[7],
+                r.x[19], r.x[20], r.x[21], r.x[22], r.sp));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
+    }
+    // Do not advance pc — re-execute the restored instruction.
+    true
 }
 
 #[inline]
@@ -1922,6 +2064,12 @@ unsafe extern "C" fn trap_handler(
         return;
     }
 
+    // Software-watchpoint step probe (UDF_WATCH_STEP at pc)
+    if watch_handle_step(mctx) {
+        IN_TRAP.store(false, Ordering::SeqCst);
+        return;
+    }
+
     // Check if this is our __libc_fork return probe
     let probe_addr = FORK_RETURN_PROBE.load(Ordering::Relaxed);
     if probe_addr != 0 && pc == probe_addr {
@@ -2488,6 +2636,13 @@ fn lazy_reloc_pick_register(
 /// catchers…) the forwarder replaces our fixup handler, and without this
 /// hook lazy relocation would silently stop working for that process.
 pub unsafe fn try_lazy_exec_fixup(mctx: &mut MContext64) -> bool {
+    // Software watchpoint: write fault on the watched page?
+    if WATCH_PAGE.load(Ordering::Relaxed) != 0 {
+        let fa = mctx.es.far;
+        if watch_handle_fault(mctx, fa) {
+            return true; // retry the store with the page unprotected
+        }
+    }
     let base_offset = EXEC_BASE_OFFSET.load(Ordering::Relaxed);
     if base_offset != 0 {
         let orig_lo = EXEC_ORIG_LO.load(Ordering::Relaxed);
@@ -2617,6 +2772,31 @@ unsafe extern "C" fn crash_handler(
         regs.fp, regs.sp, regs.lr, guest_tpidr
     ));
     libc::write(2, buf.as_ptr() as *const _, n);
+    // Dump the top of the guest stack (callee-saved spill area) — lets us
+    // recover caller-saved registers (e.g. an rtx pointer spilled by the
+    // crashing callee's prologue) without a debugger. Safe mach read.
+    {
+        let mut words = [0u64; 20];
+        let mut out_size: libc::vm_size_t = 0;
+        let kr = mach_vm_read_overwrite(
+            mach_task_self(),
+            regs.sp as u64,
+            (words.len() * 8) as u64,
+            words.as_mut_ptr() as u64,
+            &mut out_size,
+        );
+        if kr == 0 && out_size as usize == words.len() * 8 {
+            for chunk in 0..(words.len() / 4) {
+                let i = chunk * 4;
+                let mut sbuf = [0u8; 192];
+                let sn = raw_fmt(&mut sbuf, format_args!(
+                    "  [sp+{:#04x}] {:#018x} {:#018x} {:#018x} {:#018x}\n",
+                    i * 8, words[i], words[i + 1], words[i + 2], words[i + 3]
+                ));
+                libc::write(2, sbuf.as_ptr() as *const _, sn);
+            }
+        }
+    }
     // If the faulting PC is inside an x18 trampoline island, identify which
     // guest instruction the trampoline belongs to.
     if let Some((island, idx, off, orig_pc)) = crate::x18_trampoline::find_trampoline_for_pc(regs.pc) {

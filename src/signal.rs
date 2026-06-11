@@ -536,6 +536,28 @@ unsafe extern "C" fn signal_forwarder(
                 r.x[24], r.x[25], r.x[26], r.x[27], r.x[28], r.fp
             ));
             libc::write(2, buf2.as_ptr() as *const _, n2);
+            // Top of guest stack — recovers callee-saved spills (e.g. the
+            // caller's pointer argument) without a debugger. Safe mach read.
+            let mut words = [0u64; 20];
+            let mut out_size: libc::vm_size_t = 0;
+            let kr = crate::trap::mach_vm_read_overwrite(
+                crate::trap::mach_task_self(),
+                r.sp as u64,
+                (words.len() * 8) as u64,
+                words.as_mut_ptr() as u64,
+                &mut out_size,
+            );
+            if kr == 0 && out_size as usize == words.len() * 8 {
+                for chunk in 0..(words.len() / 4) {
+                    let i = chunk * 4;
+                    let mut sbuf = [0u8; 192];
+                    let sn = crate::trap::raw_fmt(&mut sbuf, format_args!(
+                        "  [sp+{:#04x}] {:#018x} {:#018x} {:#018x} {:#018x}\n",
+                        i * 8, words[i], words[i + 1], words[i + 2], words[i + 3]
+                    ));
+                    libc::write(2, sbuf.as_ptr() as *const _, sn);
+                }
+            }
         }
     }
 
