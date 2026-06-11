@@ -456,3 +456,71 @@ writes (or fails to write) that operand slot.
 
 Stamps are intact, so once cc1 is fixed, `dpkg-buildpackage -nc`
 resumes at xdp-tools — no 12-hour rebuild.
+
+## 2026-06-12 — the cc1 ICE falls: one byte, seven, in exactly the wrong place
+
+The "who NULLs the operand slot" hunt is over, and the answer is a
+small masterpiece of indirection. Spoiler: nobody corrupted the heap.
+The NULL was written by gcc itself, on purpose. The bug was a single
+flag byte in a static table — corrupted by us, at load time, weeks of
+session-time ago.
+
+The road there first: lldb turned out to be the wrong tool. A
+conditional breakpoint on the crash callee costs a debugger round-trip
+per call — eliminate_regs_1 runs thousands of times per function, and
+after 22 minutes the compile had made 30 seconds of progress. Worse,
+lldb's expression evaluator allocates memory in the inferior, which
+SHIFTS the guest's mmap layout, so addresses from one run are useless
+in the next. Heap watchpoints across runs: dead on arrival.
+
+So fakelinux grew its own debugger instead. Two new pieces:
+1. Crash dumps now print the top of the guest stack — which recovered
+   the crashing rtx's address from the callee's spill slot at
+   [sp+0x20], no debugger attached, from a plain 40-second crash run.
+2. FAKELINUX_WATCH=<seq>:<len>:<off> — an in-process software
+   watchpoint. Heap ADDRESSES vary per run, but the SEQUENCE of
+   anonymous mmaps is deterministic, so "5th 2MB mapping, offset
+   0x89780" names the same GGC slot in every run. The watched page
+   stays PROT_READ; each write faults, fakelinux patches the NEXT
+   instruction with a UDF probe, lets the store execute natively (any
+   form — STR, STP, writeback), then re-protects and logs old→new
+   value plus the writer's pc and registers. Total cost: two ~40s runs.
+
+The watch log read like a story. The slot was born as XEXP(ne, 0) =
+the CC register, flickered between two pointers a few dozen times
+(IRA's validate/cancel experiments), and then: `str xzr, [x0]` from
+gcc's own elimination_costs_in_insn. That's reload1.cc doing
+`*recog_data.operand_loc[i] = 0` — a deliberate, documented,
+temporary NULL ("terminate the search in check_eliminable_occurrences"),
+restored a few lines later. Real gcc does this millions of times a day
+on real hardware. So why does it only crash here?
+
+Because of WHO walks the tree afterwards. The zeroed slot sits inside
+a ccmp instruction's match_operator operand, and genoutput.cc
+deliberately marks operator operands eliminable=0 — that zero is the
+only thing keeping elimination_costs_in_insn from recursing into a
+tree whose entrails were just NULLed. And our ET_EXEC pointer fixup
+had turned that 0 into a 7. The operand-data flags word
+{is_operator=1, eliminable=0} happens to read as the u64 0x1000000 —
+which looks exactly like an unrelocated pointer into cc1's
+[0x400000, 0x2400000) range. The fixup "relocated" it by adding
+0x7_0000_0000... and 7<<32 lands precisely in the eliminable byte.
+All 166 match_operator entries in cc1's insn tables got the same
+treatment. Every ccmp-containing function was a landmine.
+
+The fix is a plausibility filter on the eager fixup: sparse words
+(≤2 nonzero bytes) at or above 16M with an empty 0xFF0000 byte are
+packed flags, not pointers. The first, simpler version of the rule
+(plain "≥3 nonzero bytes") promptly broke python3.12 — its whole
+image lives BELOW 16M where real pointers are legitimately sparse,
+and python died chasing the string "__delattr__" as a pointer. The
+final rule keeps those. The asymmetry that justifies all of this: a
+missed real pointer gets caught by lazy relocation on first deref; a
+relocated non-pointer is silent corruption you hunt for days.
+
+cc1 now compiles the repro at -O3 cleanly. gcc compiles and runs
+programs in the container. python3 still does its ssl/hashlib tricks.
+387 tests green, two commits (fcf612a fix, 7e933bb tooling), and the
+ext-deps build is resumed with -nc — stamps intact, xdp-tools
+rebuilding with a working compiler, full VPP `make build` chained
+after it. The monitor is watching for DONE_RC.

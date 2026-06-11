@@ -1,8 +1,50 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-12 ~00:00 (session 8→9, refresh #14). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~01:00 (session 9, refresh #15). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #14 STATUS — read this first (supersedes #13 below)
+## REFRESH #15 STATUS — read this first (supersedes #14 below)
+
+**cc1 ICE FIXED (fcf612a) — root cause was OURS, found + TDD'd + committed:**
+- insn_operand_data flags word for match_operator operands = u64
+  `0x1000000|mode` (is_operator=1, eliminable=0) — inside cc1's ET_EXEC
+  [0x400000,0x2400000) range. Eager pointer fixup added 0x7_0000_0000 →
+  the +7<<32 landed EXACTLY in the `eliminable` byte → reload's
+  elimination_costs_in_insn walked ccmp's match_operator AFTER zeroing
+  its nested CC-reg slot (*recog_data.operand_loc[i]=0, reload1.cc) →
+  eliminate_regs_1(NULL) → "during RTL pass: ira" ICE. genoutput.cc
+  documents eliminable==0 for MATCH_OPERATORs — that 0 is the guard.
+- Fix: loader.rs plausible_unrelocated_pointer() — reject sparse words
+  (≤2 nonzero bytes) ≥16M with zero 0xFF0000 byte. First attempt
+  (plain ≤2-bytes rule) broke python3.12 (sub-16M images have REAL
+  sparse pointers — "__delattr__" string bytes chased as ptr); final
+  rule keeps those. Verified: cc1 min2.i -O3 clean, python3 ssl OK,
+  gcc -O3 compile+run OK, 387 tests green.
+- **NEW DEBUG TOOL (7e933bb): FAKELINUX_WATCH=<seq>:<len>:<off>** (hex)
+  in-process software watchpoint. Heap addrs vary run-to-run but anon
+  mmap SEQUENCE is deterministic → name a slot as (k-th anon mmap of
+  len L, offset O). PROT_READ page; on write fault patch pc+4 with UDF
+  0xF00D, store executes natively, probe re-protects + logs old→new +
+  writer pc/instr/regs. Found the cc1 writer in 2 runs (~40s each)
+  after lldb conditional-bp proved useless (hours, perturbs layout).
+  Crash dumps now also print [sp..sp+0xa0] (recovered the rtx ptr from
+  the callee's spill at [sp+0x20] — no debugger needed).
+- lldb lessons recorded: conditional bp on hot fn = ~30x slowdown via
+  round-trips; expression evals allocate in inferior → CHANGES mmap
+  layout; ignored-exceptions recipe still in #14 below if ever needed.
+
+**IN FLIGHT: ext-deps resume + FULL VPP BUILD, detached (host PID 81402):**
+- Script: ubuntu-rootfs/tmp/resume-ext5.sh — dpkg-buildpackage -b -nc
+  (stamps intact, only xdp-tools rebuilds with WORKING gcc) → PKG_RC=
+  → make -C build/external install-deb → INSTALLDEB_RC= → make build
+  (UNATTENDED=y DEBIAN_FRONTEND=noninteractive PKG_VERSION=26.10
+  PKG_SUFFIX=0) → DONE_RC=. Log: ubuntu-rootfs/tmp/ext5b.log.
+- Monitor bm68eh8lx watches RC markers + ICE/panic/SIGSEGV sigs
+  (dedup via /tmp/ext5b.seen). On DONE_RC=0: make run + PUSH NOTIFY
+  user. If vpp's cmake build hits new emulation bugs, the
+  FAKELINUX_WATCH tool + [sp..] dumps are the weapons.
+- NOTE: binary now at fix commit; build started ~00:55.
+
+## REFRESH #14 STATUS (older, lldb recipe still useful)
 
 **ext-deps attempt #5: DONE_RC=2 — died at the LAST package (xdp-tools).**
 Everything else BUILT+INSTALLED with stamps intact in
