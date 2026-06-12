@@ -130,15 +130,22 @@ static TPIDR_KEY: AtomicU64 = AtomicU64::new(0);
 /// Whether init_tpidr_key() has been called.
 static TPIDR_KEY_INIT: AtomicBool = AtomicBool::new(false);
 
-/// Initialize the pthread key for per-thread TPIDR. Call once before loading the ELF.
+/// Initialize the pthread key for per-thread TPIDR. Idempotent; called once
+/// before loading the ELF (and freely from tests).
 pub fn init_tpidr_key() {
-    let mut key: libc::pthread_key_t = 0;
-    let ret = unsafe { libc::pthread_key_create(&mut key, None) };
-    if ret != 0 {
-        panic!("pthread_key_create for TPIDR failed: {}", ret);
-    }
-    TPIDR_KEY.store(key as u64, Ordering::SeqCst);
-    TPIDR_KEY_INIT.store(true, Ordering::SeqCst);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut key: libc::pthread_key_t = 0;
+        let ret = unsafe { libc::pthread_key_create(&mut key, None) };
+        if ret != 0 {
+            panic!("pthread_key_create for TPIDR failed: {}", ret);
+        }
+        TPIDR_KEY.store(key as u64, Ordering::SeqCst);
+        // Tell the trampoline system the TSD byte offset BEFORE marking
+        // initialized (same ordering rule as init_x18_key).
+        crate::x18_trampoline::set_tpidr_tsd_offset(key as u32 * 8);
+        TPIDR_KEY_INIT.store(true, Ordering::SeqCst);
+    });
 }
 
 /// Set the per-thread guest TPIDR value.
@@ -811,10 +818,101 @@ static WATCH_FAULT_PC: AtomicU64 = AtomicU64::new(0);
 /// UDF_MARKER 0xF000 and never produced by the loader patcher).
 pub const UDF_WATCH_STEP: u32 = 0x0000_F00D;
 
+// ── Trap statistics (FAKELINUX_TRAP_STATS=1) ─────────────────────────────
+// Counts SIGILL traps by kind, plus a lossy open-addressed histogram of the
+// exact x18 instruction words that reach the (expensive) signal fallback —
+// i.e. the sites the trampoline generator rejected. Dumped at exit_group.
+// All atomics; safe to bump from signal context.
+static TRAP_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static STAT_SVC: AtomicU64 = AtomicU64::new(0);
+pub static STAT_TPIDR: AtomicU64 = AtomicU64::new(0);
+pub static STAT_X18: AtomicU64 = AtomicU64::new(0);
+const STAT_SLOTS: usize = 256;
+static STAT_INSTR_KEY: [std::sync::atomic::AtomicU32; STAT_SLOTS] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; STAT_SLOTS];
+static STAT_INSTR_CNT: [AtomicU64; STAT_SLOTS] =
+    [const { AtomicU64::new(0) }; STAT_SLOTS];
+
+#[inline]
+pub fn trap_stats_enabled() -> bool {
+    TRAP_STATS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Record one signal-fallback x18 instruction (lossy on table overflow).
+pub fn stat_record_x18_instr(instr: u32) {
+    let mut idx = (instr.wrapping_mul(0x9E37_79B1) >> 24) as usize % STAT_SLOTS;
+    for _ in 0..8 {
+        let k = STAT_INSTR_KEY[idx].load(Ordering::Relaxed);
+        if k == instr {
+            STAT_INSTR_CNT[idx].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if k == 0 {
+            // claim the slot; on race the loser just probes on
+            if STAT_INSTR_KEY[idx]
+                .compare_exchange(0, instr, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                STAT_INSTR_CNT[idx].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        idx = (idx + 1) % STAT_SLOTS;
+    }
+}
+
+/// Dump trap statistics to stderr (raw writes — called on the exit path,
+/// possibly from signal context).
+pub fn dump_trap_stats() {
+    if !trap_stats_enabled() {
+        return;
+    }
+    let svc = STAT_SVC.load(Ordering::Relaxed);
+    let tpidr = STAT_TPIDR.load(Ordering::Relaxed);
+    let x18 = STAT_X18.load(Ordering::Relaxed);
+    if svc + tpidr + x18 == 0 {
+        return;
+    }
+    let pid = unsafe { libc::getpid() };
+    let mut buf = [0u8; 160];
+    let n = raw_fmt(&mut buf, format_args!(
+        "fakelinux: [{}] TRAP_STATS svc={} tpidr={} x18_fallback={}\n",
+        pid, svc, tpidr, x18));
+    unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
+    // top instructions, simple selection sort without allocating
+    let mut done = [false; STAT_SLOTS];
+    let mut printed = 0;
+    while printed < 15 {
+        let mut best = 0u64;
+        let mut best_i = usize::MAX;
+        for i in 0..STAT_SLOTS {
+            let c = STAT_INSTR_CNT[i].load(Ordering::Relaxed);
+            if !done[i] && c > best {
+                best = c;
+                best_i = i;
+            }
+        }
+        if best_i == usize::MAX || best == 0 {
+            break;
+        }
+        done[best_i] = true;
+        let instr = STAT_INSTR_KEY[best_i].load(Ordering::Relaxed);
+        let mut buf = [0u8; 160];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: [{}] TRAP_STATS x18 instr={:#010x} class={:?} count={}\n",
+            pid, instr, crate::decoder::decode_emul_class(instr), best));
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
+        printed += 1;
+    }
+}
+
 /// Read handler-path trace knobs from the environment ONCE, outside signal
 /// context. Async-signal-safe getters below only load atomics.
 pub fn init_trace_flags() {
     crate::loader::init_patch_cache();
+    crate::x18_trampoline::init_trampoline_flags();
+    TRAP_STATS_ENABLED.store(
+        std::env::var_os("FAKELINUX_TRAP_STATS").is_some(), Ordering::Relaxed);
     let v: i8 = if std::env::var_os("FAKELINUX_TRACE_X18_STORES").is_some() { 1 } else { 0 };
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
@@ -2134,6 +2232,7 @@ unsafe extern "C" fn trap_handler(
             // This was a patched MSR/MRS tpidr_el0
             if orig_instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
                 // MSR tpidr_el0, Xn
+                if trap_stats_enabled() { STAT_TPIDR.fetch_add(1, Ordering::Relaxed); }
                 let rn = (orig_instr & 0x1F) as usize;
                 let val = read_gpr(&mctx.ss, rn);
                 set_thread_tpidr(val);
@@ -2154,6 +2253,7 @@ unsafe extern "C" fn trap_handler(
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
+                if trap_stats_enabled() { STAT_TPIDR.fetch_add(1, Ordering::Relaxed); }
                 let rn = (orig_instr & 0x1F) as usize;
                 let val = get_thread_tpidr();
                 write_gpr(&mut mctx.ss, rn, val);
@@ -2192,6 +2292,10 @@ unsafe extern "C" fn trap_handler(
                 let pre_x18 = get_thread_x18();
                 let pre_regs: [u64; 5] = [mctx.ss.x[0], mctx.ss.x[1], mctx.ss.x[2], mctx.ss.x[3], mctx.ss.x[18]];
 
+                if trap_stats_enabled() {
+                    STAT_X18.fetch_add(1, Ordering::Relaxed);
+                    stat_record_x18_instr(orig_instr);
+                }
                 // Save emulating instruction for crash diagnostics
                 unsafe { CURRENT_X18_INSTR = orig_instr; CURRENT_X18_PC = pc; }
                 // FAKELINUX_TRACE_X18_OPS: log every emulated x18 op
@@ -2260,6 +2364,7 @@ unsafe extern "C" fn trap_handler(
 
         // Not in patch table → this was a SVC #0
         let nr = mctx.ss.x[8];
+        if trap_stats_enabled() { STAT_SVC.fetch_add(1, Ordering::Relaxed); }
 
         // FORK_TRAP logging for SVC (with canary check)
         {

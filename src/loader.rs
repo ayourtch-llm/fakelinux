@@ -581,11 +581,14 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
                 svc_patched += 1;
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
-                // MSR/MRS tpidr_el0 → patch to UDF, store original in side table.
+                // MSR/MRS tpidr_el0 → trampoline (native TLS access);
+                // fall back to UDF + side table if out of range/unknown.
                 let pc_addr = base.add(i) as u64;
                 crate::procfs::with(|_| {}); // ensure procfs is initialized
-                add_tpidr_patch(pc_addr, instr);
-                base.add(i).write(trap::UDF_MARKER);
+                if !crate::x18_trampoline::patch_tpidr_with_trampoline(pc_addr, instr) {
+                    add_tpidr_patch(pc_addr, instr);
+                    base.add(i).write(trap::UDF_MARKER);
+                }
                 tpidr_patched += 1;
             } else if !skip_x18 && trap::references_x18(instr) {
                 let pc_addr = base.add(i) as u64;
@@ -778,8 +781,10 @@ fn apply_cached_patch_site(pc_addr: u64, instr: u32) -> bool {
         true
     } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
            || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
-        add_runtime_tpidr_patch(pc_addr, instr);
-        unsafe { (pc_addr as *mut u32).write(trap::UDF_MARKER) };
+        if !crate::x18_trampoline::patch_tpidr_with_trampoline(pc_addr, instr) {
+            add_runtime_tpidr_patch(pc_addr, instr);
+            unsafe { (pc_addr as *mut u32).write(trap::UDF_MARKER) };
+        }
         true
     } else if trap::references_x18(instr) {
         if !crate::x18_trampoline::patch_x18_with_trampoline(pc_addr, instr) {
@@ -887,8 +892,10 @@ pub fn patch_new_code(start: u64, len: u64) -> Vec<u32> {
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
                 let pc_addr = base.add(i) as u64;
-                add_runtime_tpidr_patch(pc_addr, instr);
-                base.add(i).write(trap::UDF_MARKER);
+                if !crate::x18_trampoline::patch_tpidr_with_trampoline(pc_addr, instr) {
+                    add_runtime_tpidr_patch(pc_addr, instr);
+                    base.add(i).write(trap::UDF_MARKER);
+                }
                 tpidr_patched += 1;
                 sites.push((i * 4) as u32);
             } else if !skip_x18 && trap::references_x18(instr) {

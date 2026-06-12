@@ -53,6 +53,60 @@ fn encode_ldr_unsigned(rt: u32, rn: u32, byte_offset: u32) -> u32 {
 }
 
 /// Encode `STR Xt, [Xn, #imm]` unsigned offset (8-byte scaled).
+/// `STP Xt1, Xt2, [SP, #-32]!` (64-bit pre-index push).
+fn encode_stp_pre32(rt1: u32, rt2: u32) -> u32 {
+    // imm7 = -32/8 = -4 → 0x7C
+    0xA980_0000 | (0x7C << 15) | (rt2 << 10) | (31 << 5) | rt1
+}
+
+/// `LDP Xt1, Xt2, [SP], #32` (64-bit post-index pop).
+fn encode_ldp_post32(rt1: u32, rt2: u32) -> u32 {
+    // imm7 = 32/8 = 4
+    0xA8C0_0000 | (4 << 15) | (rt2 << 10) | (31 << 5) | rt1
+}
+
+/// `MRS Xt, TPIDRRO_EL0`.
+fn encode_mrs_tpidrro(rt: u32) -> u32 {
+    0xD53B_D060 | rt
+}
+
+/// `STR Xt, [SP, #-16]!` (pre-index push of one register).
+fn encode_str_pre16(rt: u32) -> u32 {
+    // imm9 = -16 → 0x1F0
+    0xF800_0C00 | (0x1F0 << 12) | (31 << 5) | rt
+}
+
+/// `LDR Xt, [SP], #16` (post-index pop of one register).
+fn encode_ldr_post16(rt: u32) -> u32 {
+    // imm9 = 16
+    0xF840_0400 | (16 << 12) | (31 << 5) | rt
+}
+
+const NOP: u32 = 0xD503_201F;
+
+/// Pick two scratch GPRs the instruction does not reference (prefer x16/x17 —
+/// the intra-procedure-call regs — then low caller-saved regs). None if the
+/// encoding is unknown.
+fn pick_scratch_pair(instr: u32) -> Option<(u32, u32)> {
+    let used = crate::decoder::referenced_gprs(instr)?;
+    const CANDIDATES: [u32; 26] = [
+        16, 17, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+        19, 20, 21, 22, 23, 24, 25, 26,
+    ];
+    let mut found = [0u32; 2];
+    let mut n = 0;
+    for &r in &CANDIDATES {
+        if used & (1 << r) == 0 {
+            found[n] = r;
+            n += 1;
+            if n == 2 {
+                return Some((found[0], found[1]));
+            }
+        }
+    }
+    None
+}
+
 fn encode_str_unsigned(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     debug_assert!(byte_offset % 8 == 0 && byte_offset / 8 < 4096);
     0xF900_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
@@ -86,10 +140,44 @@ struct CodeIsland {
 impl CodeIsland {
     /// Allocate a code island. Uses MAP_JIT for macOS ARM64 W^X support.
     fn alloc(size: usize) -> Option<Self> {
+        Self::alloc_at_hint(size, 0)
+    }
+
+    /// Allocate near `near_pc` so that `B` (±128 MB) can reach the island
+    /// from the patch site. A NULL-hint mmap lands wherever the kernel
+    /// likes — for big libraries (libLLVM text is ~120 MB) that's usually
+    /// out of branch range, and every rejected site costs a SIGILL per
+    /// execution forever after. Try hints at growing distances on both
+    /// sides; verify reachability of the WHOLE island before accepting.
+    fn alloc_near(size: usize, near_pc: u64) -> Option<Self> {
+        const MB: i64 = 1 << 20;
+        const DELTAS: [i64; 12] = [
+            16 * MB, -16 * MB, 32 * MB, -32 * MB, 48 * MB, -48 * MB,
+            64 * MB, -64 * MB, 96 * MB, -96 * MB, 112 * MB, -112 * MB,
+        ];
+        let sz = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        for &d in &DELTAS {
+            let hint = (near_pc as i64).saturating_add(d);
+            if hint <= 0 { continue; }
+            let hint = (hint as u64) & !(PAGE_SIZE as u64 - 1);
+            if let Some(island) = Self::alloc_at_hint(sz, hint) {
+                // both ends of the island must be B-reachable from near_pc
+                if encode_b(near_pc, island.base).is_some()
+                    && encode_b(near_pc, island.base + sz as u64 - 4).is_some() {
+                    return Some(island);
+                }
+                unsafe { libc::munmap(island.base as *mut _, island.capacity); }
+            }
+        }
+        // Out-of-range island is still useful for OTHER (closer) call sites.
+        Self::alloc_at_hint(sz, 0)
+    }
+
+    fn alloc_at_hint(size: usize, hint: u64) -> Option<Self> {
         let sz = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
+                hint as *mut _,
                 sz,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANON | 0x800, // 0x800 = MAP_JIT
@@ -119,9 +207,13 @@ impl CodeIsland {
     /// TSD slot still held the correct pointer). Instead, the original
     /// instruction is rewritten to use x17 in place of x18.
     fn emit(&mut self, orig_pc: u64, orig_instr: u32) -> Option<u64> {
-        // Rewrite all x18 register fields to x17. Instructions that already
-        // use x16/x17 are rejected by the caller, so x17 is free here.
-        let subst_instr = crate::decoder::substitute_gpr(orig_instr, 18, 17)?;
+        // Pick two scratch registers the instruction does not reference
+        // (s1 = TSD base pointer, s2 = substituted guest x18). Historically
+        // these were hardcoded x16/x17 and any instruction touching either
+        // fell back to UDF — ~40% of all x18 SIGILL traps in a clang run
+        // (e.g. `ccmp w17, w18`, `ldr x16, [x20, x18]`).
+        let (s1, s2) = pick_scratch_pair(orig_instr)?;
+        let subst_instr = crate::decoder::substitute_gpr(orig_instr, 18, s2)?;
 
         // TRAMP_INSTRS instructions x 4 bytes per trampoline
         //
@@ -151,20 +243,17 @@ impl CodeIsland {
 
         let b_back = encode_b(tramp_pc + (TRAMP_INSTRS as u64 - 1)*4, return_pc)?;
 
-        // MRS x16, TPIDRRO_EL0 = 0xD53BD060 | Rt, Rt=16 → 0xD53BD070
-        const MRS_X16_TPIDRRO: u32 = 0xD53BD070;
-
         let instrs: [u32; TRAMP_INSTRS] = [
-            0xA9BE_47F0,                               // stp x16, x17, [sp, #-32]!
-            MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
-            encode_ldr_unsigned(17, 16, tsd_off),       // ldr x17, [x16, #(key*8)]
+            encode_stp_pre32(s1, s2),                  // stp s1, s2, [sp, #-32]!
+            encode_mrs_tpidrro(s1),                    // mrs s1, tpidrro_el0
+            encode_ldr_unsigned(s2, s1, tsd_off),      // ldr s2, [s1, #(key*8)]
             0x9100_83FF,                               // add sp, sp, #32
-            subst_instr,                                // original instr, x18→x17
+            subst_instr,                               // original instr, x18→s2
             0xD100_83FF,                               // sub sp, sp, #32
-            MRS_X16_TPIDRRO,                           // mrs x16, tpidrro_el0
-            encode_str_unsigned(17, 16, tsd_off),       // str x17, [x16, #(key*8)]
-            0xA8C2_47F0,                               // ldp x16, x17, [sp], #32
-            b_back,                                     // b <return>
+            encode_mrs_tpidrro(s1),                    // mrs s1, tpidrro_el0
+            encode_str_unsigned(s2, s1, tsd_off),      // str s2, [s1, #(key*8)]
+            encode_ldp_post32(s1, s2),                 // ldp s1, s2, [sp], #32
+            b_back,                                    // b <return>
         ];
 
         // MAP_JIT requires pthread_jit_write_protect_np to toggle W^X
@@ -183,6 +272,53 @@ impl CodeIsland {
         self.used += size;
         Some(tramp_pc)
     }
+
+    /// Emit a TPIDR_EL0 access trampoline. Guest tpidr lives in a TSD slot
+    /// (same scheme as guest x18, different pthread key):
+    ///   MRS Xt, tpidr_el0 →  mrs Xt, tpidrro_el0 ; ldr Xt, [Xt, #off] ; b
+    ///   MSR tpidr_el0, Xt →  str Xs, [sp,#-16]! ; mrs Xs, tpidrro_el0 ;
+    ///                        str Xt, [Xs, #off] ; ldr Xs, [sp], #16 ; b
+    /// Uses the same fixed-size slots as x18 trampolines (NOP padded).
+    fn emit_tpidr(&mut self, orig_pc: u64, orig_instr: u32) -> Option<u64> {
+        let tpidr_off = TPIDR_TSD_BYTE_OFFSET.load(Ordering::Relaxed);
+        if tpidr_off == 0 { return None; }
+        let rt = orig_instr & 0x1F;
+        if rt == 31 { return None; } // MRS/MSR to xzr — pointless, keep UDF
+
+        let size = TRAMP_INSTRS * 4;
+        if self.used + size > self.capacity { return None; }
+        let tramp_pc = self.base + self.used as u64;
+        let return_pc = orig_pc + 4;
+
+        let is_mrs = orig_instr & crate::trap::MRS_TPIDR_MASK == crate::trap::MRS_TPIDR_BASE;
+        let mut instrs: [u32; TRAMP_INSTRS] = [NOP; TRAMP_INSTRS];
+        if is_mrs {
+            instrs[0] = encode_mrs_tpidrro(rt);
+            instrs[1] = encode_ldr_unsigned(rt, rt, tpidr_off);
+            instrs[2] = encode_b(tramp_pc + 2 * 4, return_pc)?;
+        } else {
+            let s = if rt == 0 { 1 } else { 0 };
+            instrs[0] = encode_str_pre16(s);
+            instrs[1] = encode_mrs_tpidrro(s);
+            instrs[2] = encode_str_unsigned(rt, s, tpidr_off);
+            instrs[3] = encode_ldr_post16(s);
+            instrs[4] = encode_b(tramp_pc + 4 * 4, return_pc)?;
+        }
+
+        unsafe {
+            pthread_jit_write_protect_np(0);
+            let p = tramp_pc as *mut u32;
+            for (i, &ins) in instrs.iter().enumerate() {
+                p.add(i).write(ins);
+            }
+            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+            sys_icache_invalidate(tramp_pc as *mut _, size);
+            pthread_jit_write_protect_np(1);
+        }
+
+        self.used += size;
+        Some(tramp_pc)
+    }
 }
 
 extern "C" {
@@ -196,34 +332,19 @@ static ISLANDS: Mutex<Vec<CodeIsland>> = Mutex::new(Vec::new());
 /// Patch an x18 instruction with a B-to-trampoline.
 /// Returns true on success, false to fall back to UDF.
 pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
-    // Environment override to disable trampolines for debugging
-    static DISABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-    let d = DISABLED.load(Ordering::Relaxed);
-    if d < 0 {
-        let v = if std::env::var_os("FAKELINUX_NO_X18_TRAMP").is_some() { 1 } else { 0 };
-        DISABLED.store(v, Ordering::Relaxed);
-        if v == 1 { return false; }
-    } else if d == 1 { return false; }
-
-    // AdvSIMD structure ld/st (e.g. clang's `ld2 {v0.2d, v1.2d}, [x18]`):
-    // EmulClass::Other, but perfectly trampolinable — only Rn/Rm are GPRs
-    // (Rt is a vector register, so the generic x16/x17 field check would
-    // misfire on v16/v17 operands).
-    let simd_struct = crate::decoder::is_simd_ldst_struct(instr);
-
-    // Skip if instruction also references x16 or x17 (our scratch regs)
-    if simd_struct {
-        let rn = (instr >> 5) & 0x1F;
-        let rm = (instr >> 16) & 0x1F; // only a GPR in the post-index form
-        let post_index = instr & 0x00800000 != 0;
-        if rn == 16 || rn == 17 || (post_index && (rm == 16 || rm == 17)) {
-            FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-    } else if uses_x16_or_x17(instr) {
-        FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Environment override to disable trampolines for debugging.
+    // Read once in init_trampoline_flags() (NOT here lazily — with the
+    // patch-site cache the first call can happen inside the trap handler,
+    // where std::env takes the env lock → self-deadlock, see bf94855).
+    if TRAMP_DISABLED.load(Ordering::Relaxed) {
         return false;
     }
+
+    // AdvSIMD structure ld/st (e.g. clang's `ld2 {v0.2d, v1.2d}, [x18]`):
+    // EmulClass::Other, but perfectly trampolinable — only Rn/Rm are GPRs.
+    // Scratch-register conflicts are handled by pick_scratch_pair() in
+    // emit(), which chooses two GPRs the instruction does not reference.
+    let simd_struct = crate::decoder::is_simd_ldst_struct(instr);
 
     // Skip instruction classes that cannot execute at a different PC or
     // whose control flow would escape the trampoline:
@@ -246,17 +367,26 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
         _ => {}
     }
 
-    // Verify the instruction's encoding is known so x18→x17 substitution will
-    // succeed in emit(); unknown encodings fall back to UDF emulation.
-    if crate::decoder::substitute_gpr(instr, 18, 17).is_none() {
+    // Verify scratch selection + substitution will succeed in emit();
+    // unknown encodings fall back to UDF emulation.
+    if pick_scratch_pair(instr)
+        .and_then(|(_, s2)| crate::decoder::substitute_gpr(instr, 18, s2))
+        .is_none()
+    {
         FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
 
     let mut islands = ISLANDS.lock().unwrap();
 
-    // Try existing islands
+    // Try existing islands. Pre-check B range to the island's NEXT free slot:
+    // emit() consumes the slot, so letting it succeed and then failing
+    // encode_b would leak trampoline space.
     for island in islands.iter_mut() {
+        let next_slot = island.base + island.used as u64;
+        if encode_b(pc_addr, next_slot).is_none() {
+            continue;
+        }
         if let Some(tramp) = island.emit(pc_addr, instr) {
             if let Some(b) = encode_b(pc_addr, tramp) {
                 unsafe { (pc_addr as *mut u32).write(b); }
@@ -266,8 +396,10 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
         }
     }
 
-    // Need new island (256 KB = ~8000 trampolines)
-    if let Some(mut island) = CodeIsland::alloc(256 * 1024) {
+    // Need a new island (256 KB = ~6500 trampolines), B-reachable from the
+    // patch site — a NULL-hint mmap usually lands out of ±128 MB range for
+    // big libraries, dooming every site there to a SIGILL per execution.
+    if let Some(mut island) = CodeIsland::alloc_near(256 * 1024, pc_addr) {
         if let Some(tramp) = island.emit(pc_addr, instr) {
             if let Some(b) = encode_b(pc_addr, tramp) {
                 unsafe { (pc_addr as *mut u32).write(b); }
@@ -276,9 +408,78 @@ pub fn patch_x18_with_trampoline(pc_addr: u64, instr: u32) -> bool {
                 return true;
             }
         }
+        // keep the island anyway — it may serve other call sites
+        islands.push(island);
     }
 
+    FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
     false
+}
+
+/// TSD byte offset of the guest TPIDR_EL0 slot (tpidr pthread key * 8).
+/// 0 = not yet initialized → TPIDR sites fall back to UDF.
+static TPIDR_TSD_BYTE_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_tpidr_tsd_offset(byte_offset: u32) {
+    TPIDR_TSD_BYTE_OFFSET.store(byte_offset, Ordering::SeqCst);
+}
+
+/// Patch an MRS/MSR tpidr_el0 instruction with a B-to-trampoline so TLS
+/// accesses execute natively instead of costing one SIGILL each (422k traps
+/// in a single VPP clang compile — the dominant trap source once x18 is
+/// trampolined). Returns false to fall back to UDF + side-table emulation.
+///
+/// SAFETY: every thread's TSD tpidr slot is populated before guest code can
+/// run on it (main.rs guest entry, thread.rs clone_entry CLONE_SETTLS, fork
+/// child re-set, signal trampoline restore), so reading the slot directly
+/// from asm matches get_thread_tpidr() exactly. The only semantic loss is a
+/// guest writing tpidr_el0 = 0 (the asm slot would read back 0, while the
+/// emulated path falls back to the stale global) — no real guest does that.
+pub fn patch_tpidr_with_trampoline(pc_addr: u64, instr: u32) -> bool {
+    if TRAMP_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    if TPIDR_TSD_BYTE_OFFSET.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let mut islands = ISLANDS.lock().unwrap();
+    for island in islands.iter_mut() {
+        let next_slot = island.base + island.used as u64;
+        if encode_b(pc_addr, next_slot).is_none() {
+            continue;
+        }
+        if let Some(tramp) = island.emit_tpidr(pc_addr, instr) {
+            if let Some(b) = encode_b(pc_addr, tramp) {
+                unsafe { (pc_addr as *mut u32).write(b); }
+                TRAMP_COUNT.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    if let Some(mut island) = CodeIsland::alloc_near(256 * 1024, pc_addr) {
+        if let Some(tramp) = island.emit_tpidr(pc_addr, instr) {
+            if let Some(b) = encode_b(pc_addr, tramp) {
+                unsafe { (pc_addr as *mut u32).write(b); }
+                TRAMP_COUNT.fetch_add(1, Ordering::Relaxed);
+                islands.push(island);
+                return true;
+            }
+        }
+        islands.push(island);
+    }
+    false
+}
+
+/// Read trampoline env knobs once, outside signal context (from
+/// trap::init_trace_flags via install_handler).
+static TRAMP_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn init_trampoline_flags() {
+    TRAMP_DISABLED.store(
+        std::env::var_os("FAKELINUX_NO_X18_TRAMP").is_some(),
+        Ordering::Relaxed,
+    );
 }
 
 static TRAMP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -329,18 +530,6 @@ pub fn find_trampoline_for_pc(pc: u64) -> Option<(u64, u64, u64, u64)> {
         }
     }
     None
-}
-
-/// Check if instruction references x16 or x17 in any GPR field.
-fn uses_x16_or_x17(instr: u32) -> bool {
-    // Check common 5-bit GPR fields: Rd(0), Rn(5), Rm(16), Ra(10)
-    for shift in [0u32, 5, 16, 10] {
-        let reg = (instr >> shift) & 0x1F;
-        if reg == 16 || reg == 17 {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -463,6 +652,111 @@ mod tests {
         f();
         assert_eq!(crate::trap::get_thread_x18(), 104,
             "ADD x18, x18, #4 must propagate to TSD");
+    }
+
+    // ── Dynamic scratch selection (x16/x17 conflicts used to fall back) ──
+
+    #[test]
+    fn scratch_pair_avoids_referenced_regs() {
+        // ldr x16, [x18] references {16, 18} → scratch must avoid both
+        let (s1, s2) = pick_scratch_pair(0xF9400250).unwrap();
+        assert!(s1 != 16 && s1 != 18 && s2 != 16 && s2 != 18 && s1 != s2);
+        // ccmp w17, w18, #0, al references {17, 18}
+        let (s1, s2) = pick_scratch_pair(0x7A52E220).unwrap();
+        assert!(s1 != 17 && s1 != 18 && s2 != 17 && s2 != 18 && s1 != s2);
+        // no conflicts → prefers x16/x17 (historical encoding)
+        assert_eq!(pick_scratch_pair(0xb9000243), Some((16, 17))); // str w3, [x18]
+    }
+
+    #[test]
+    fn push_pop_encoders_match_historical_x16_x17_encoding() {
+        assert_eq!(encode_stp_pre32(16, 17), 0xA9BE_47F0);
+        assert_eq!(encode_ldp_post32(16, 17), 0xA8C2_47F0);
+        assert_eq!(encode_mrs_tpidrro(16), 0xD53B_D070);
+    }
+
+    /// End-to-end: `LDR X16, [X18]` (uses scratch reg x16) was rejected by
+    /// the hardcoded-x16/x17 check and cost a SIGILL per execution — 54k
+    /// traps in a single VPP clang compile. Must now trampoline.
+    #[test]
+    fn test_trampoline_conflict_ldr_x16_through_guest_x18() {
+        crate::trap::init_x18_key();
+        // ldr x16, [x18] ; mov x0, x16 ; ret
+        let code = alloc_code_page(&[0xF9400250, 0xAA1003E0, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code, 0xF9400250),
+            "x16-conflicting instruction must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        let value: u64 = 0xDEAD_BEEF_1234;
+        crate::trap::set_thread_x18(&value as *const u64 as u64);
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(), 0xDEAD_BEEF_1234);
+    }
+
+    /// End-to-end: `CCMP W17, W18, #0, AL` (uses scratch reg x17) — the
+    /// single hottest fallback instruction in a VPP clang compile (66k traps).
+    #[test]
+    fn test_trampoline_conflict_ccmp_w17_w18() {
+        crate::trap::init_x18_key();
+        // mov w17, #5 ; ccmp w17, w18, #0, al ; cset w0, eq ; ret
+        let code = alloc_code_page(&[0x528000B1, 0x7A52E220, 0x1A9F17E0, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code + 4, 0x7A52E220),
+            "x17-conflicting CCMP must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code) };
+        crate::trap::set_thread_x18(5);
+        assert_eq!(f(), 1, "w17(5) == w18(5) → eq");
+        crate::trap::set_thread_x18(7);
+        assert_eq!(f(), 0, "w17(5) != w18(7) → ne");
+    }
+
+    // ── TPIDR (TLS) trampolines ──────────────────────────────────────────
+
+    /// End-to-end: `MRS X0, TPIDR_EL0` must read the guest tpidr from TSD
+    /// natively (422k SIGILL traps per VPP clang compile before this).
+    #[test]
+    fn test_tpidr_mrs_trampoline_reads_guest_tls() {
+        crate::trap::init_tpidr_key();
+        // mrs x0, tpidr_el0 ; ret
+        let code = alloc_code_page(&[0xD53BD040, 0xD65F03C0]);
+        assert!(patch_tpidr_with_trampoline(code, 0xD53BD040),
+            "MRS tpidr_el0 must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        crate::trap::set_thread_tpidr(0x1234_5678_9ABC);
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(), 0x1234_5678_9ABC);
+        crate::trap::set_thread_tpidr(0x42);
+        assert_eq!(f(), 0x42, "must track per-thread value, not a snapshot");
+    }
+
+    /// End-to-end: `MSR TPIDR_EL0, X0` must write the guest tpidr TSD slot
+    /// so a subsequent get_thread_tpidr() (and MRS trampoline) sees it.
+    #[test]
+    fn test_tpidr_msr_trampoline_writes_guest_tls() {
+        crate::trap::init_tpidr_key();
+        // msr tpidr_el0, x0 ; ret
+        let code = alloc_code_page(&[0xD51BD040, 0xD65F03C0]);
+        assert!(patch_tpidr_with_trampoline(code, 0xD51BD040),
+            "MSR tpidr_el0 must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        let f: extern "C" fn(u64) = unsafe { std::mem::transmute(code) };
+        f(0xCAFE_0042);
+        assert_eq!(crate::trap::get_thread_tpidr(), 0xCAFE_0042);
+    }
+
+    /// MRS/MSR with Rt=31 (xzr) must fall back to UDF, not emit nonsense.
+    #[test]
+    fn test_tpidr_xzr_falls_back() {
+        crate::trap::init_tpidr_key();
+        let code = alloc_code_page(&[0xD53BD05F, 0xD65F03C0]); // mrs xzr, tpidr_el0
+        assert!(!patch_tpidr_with_trampoline(code, 0xD53BD05F));
     }
 
     /// PC-relative and branch instructions must NOT be trampolined — they

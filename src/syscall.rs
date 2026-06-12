@@ -130,12 +130,16 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_LSEEK => do_lseek(args[0] as i32, args[1] as i64, args[2] as i32),
         SYS_FSTAT => do_fstat(args[0] as i32, args[1]),
         SYS_NEWFSTATAT => do_newfstatat(args[0] as i32, args[1], args[2], args[3] as i32),
-        SYS_EXIT_GROUP => unsafe { libc::_exit(args[0] as i32) },
+        SYS_EXIT_GROUP => unsafe {
+            crate::trap::dump_trap_stats();
+            libc::_exit(args[0] as i32)
+        },
         SYS_EXIT => {
             // SYS_EXIT only terminates the calling thread, not the whole process.
             // If this is the main thread (or there's only one thread), it acts like exit_group.
             // For child threads, call thread_exit() which does CLEARTID + pthread_exit.
             if thread::current_tid() == thread::main_tid() {
+                crate::trap::dump_trap_stats();
                 unsafe { libc::_exit(args[0] as i32) }
             } else {
                 thread::thread_exit(args[0] as i32);

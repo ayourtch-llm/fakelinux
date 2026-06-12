@@ -141,6 +141,27 @@ pub fn substitute_gpr(instr: u32, from: u32, to: u32) -> Option<u32> {
     None
 }
 
+/// Bitmask of every GPR number referenced by the instruction's register
+/// fields (bit n set = xn referenced). Field value 31 (SP/XZR) sets bit 31,
+/// which callers should treat as reserved anyway.
+///
+/// Returns `None` if the instruction is not in the table (unknown encoding).
+pub fn referenced_gprs(instr: u32) -> Option<u32> {
+    for entry in GEN_TABLE {
+        if (instr & entry.mask) == entry.value {
+            let mut mask = 0u32;
+            for &lsb in &entry.gpr_lsbs {
+                if lsb == 0xFF {
+                    break;
+                }
+                mask |= 1 << ((instr >> lsb) & 0x1F);
+            }
+            return Some(mask);
+        }
+    }
+    None
+}
+
 /// AdvSIMD load/store STRUCTURE instructions (LD1-LD4/ST1-ST4, multiple or
 /// single structures, optionally post-indexed). Their only GPR fields are
 /// Rn (bits 9:5) and — in the post-index register form — Rm (bits 20:16);
