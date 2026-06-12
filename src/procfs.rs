@@ -28,15 +28,41 @@ pub struct ProcFs {
 
 static PROCFS: Mutex<Option<ProcFs>> = Mutex::new(None);
 
-pub fn init(exe_path: &str) {
-    // Ensure exe_path is absolute (glibc asserts it starts with '/')
+/// Compute the guest-visible /proc/self/exe path: absolutize against cwd,
+/// then strip the rootfs prefix. The strip must happen AFTER absolutizing —
+/// a relative launch path ("ubuntu-rootfs/root/.../vpp") doesn't match the
+/// (absolute) root prefix, so stripping first leaks the HOST path into
+/// /proc/self/exe. VPP derives its plugin directory from that readlink and
+/// double-roots it → "Plugin path is: /Users/..." with zero plugins loaded.
+fn guest_exe_path(exe_path: &str, cwd: &str, root: Option<&str>) -> String {
     let abs_path = if exe_path.starts_with('/') {
         exe_path.to_string()
+    } else if exe_path.is_empty() {
+        cwd.to_string()
     } else {
-        let mut cwd = std::env::current_dir().unwrap_or_default();
-        cwd.push(exe_path);
-        cwd.to_string_lossy().to_string()
+        format!("{}/{}", cwd.trim_end_matches('/'), exe_path)
     };
+    if let Some(root) = root {
+        let root = root.trim_end_matches('/');
+        if !root.is_empty() {
+            if let Some(rest) = abs_path.strip_prefix(root) {
+                if rest.starts_with('/') {
+                    return rest.to_string();
+                }
+                if rest.is_empty() {
+                    return "/".to_string();
+                }
+            }
+        }
+    }
+    abs_path
+}
+
+pub fn init(exe_path: &str) {
+    // Ensure exe_path is absolute (glibc asserts it starts with '/'),
+    // and guest-relative (host rootfs prefix stripped).
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let abs_path = guest_exe_path(exe_path, &cwd.to_string_lossy(), crate::rootfs::get_root());
     let mut lock = PROCFS.lock().unwrap();
     *lock = Some(ProcFs {
         mappings: Vec::new(),
@@ -1121,6 +1147,44 @@ pub fn try_readlink(path: &[u8], buf: u64, bufsiz: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exe_path_strips_rootfs_after_absolutizing() {
+        // Relative launch path: absolutize against cwd, THEN strip the root.
+        assert_eq!(
+            guest_exe_path(
+                "ubuntu-rootfs/root/vpp/bin/vpp",
+                "/Users/u/fakelinux",
+                Some("/Users/u/fakelinux/ubuntu-rootfs"),
+            ),
+            "/root/vpp/bin/vpp"
+        );
+        // Absolute host path under the root strips too.
+        assert_eq!(
+            guest_exe_path(
+                "/Users/u/fakelinux/ubuntu-rootfs/bin/dash",
+                "/anything",
+                Some("/Users/u/fakelinux/ubuntu-rootfs"),
+            ),
+            "/bin/dash"
+        );
+        // Path NOT under the root is left alone (sysroot-less runs).
+        assert_eq!(
+            guest_exe_path("/bin/ls", "/x", Some("/Users/u/fakelinux/ubuntu-rootfs")),
+            "/bin/ls"
+        );
+        // Prefix match must respect path boundaries: ubuntu-rootfs2 ≠ root.
+        assert_eq!(
+            guest_exe_path(
+                "/Users/u/fakelinux/ubuntu-rootfs2/bin/sh",
+                "/x",
+                Some("/Users/u/fakelinux/ubuntu-rootfs"),
+            ),
+            "/Users/u/fakelinux/ubuntu-rootfs2/bin/sh"
+        );
+        // No rootfs configured → just absolutize.
+        assert_eq!(guest_exe_path("bin/true", "/cwd", None), "/cwd/bin/true");
+    }
 
     #[test]
     fn proc_stat_has_aggregate_and_per_cpu_rows() {
