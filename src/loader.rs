@@ -617,13 +617,248 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     }
 }
 
+// ── Persistent patch-site cache ──────────────────────────────────────────
+// patch_new_code scans every word of each executable file-backed mapping.
+// Build workloads spawn thousands of short-lived processes that each re-map
+// the same big libraries (libLLVM text alone is ~120MB = ~30M instructions),
+// so the scan dominates runtime (93% of samples in a profiled clang).
+// The set of patch sites for a given (file, offset, len) never changes, so
+// we cache the byte offsets on disk and on later mappings only re-apply the
+// patches at those offsets (validating each still matches a patchable
+// pattern; any mismatch falls back to a full scan).
+//
+// Runs in trap_handler (signal) context: file I/O uses raw libc only, and
+// the env knobs are read once in init_patch_cache() (see the env-lock
+// deadlock note in trap.rs above init_trace_flags).
+
+const PATCH_CACHE_MAGIC: u32 = 0x434C_5046; // "FPLC"
+const PATCH_CACHE_VERSION: u32 = 1;
+
+static PATCH_CACHE_DIR: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+static NO_X18_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read patch-cache env knobs ONCE, outside signal context. Called from
+/// trap::init_trace_flags() (i.e. install_handler, before any guest code).
+pub fn init_patch_cache() {
+    NO_X18_RUNTIME.store(
+        std::env::var_os("FAKELINUX_NO_X18").is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if std::env::var_os("FAKELINUX_NO_PATCH_CACHE").is_some() {
+        return;
+    }
+    let dir = std::env::var("FAKELINUX_PATCH_CACHE").unwrap_or_else(|_| {
+        format!("/tmp/fakelinux-patch-cache-{}", unsafe { libc::getuid() })
+    });
+    let cdir = match std::ffi::CString::new(dir) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    unsafe { libc::mkdir(cdir.as_ptr(), 0o700); } // EEXIST is fine
+    let _ = PATCH_CACHE_DIR.set(cdir);
+}
+
+/// Cache file name for one (file identity, mapping window).
+fn patch_cache_filename(dev: u64, ino: u64, mtime_s: i64, mtime_ns: i64,
+                        size: u64, offset: u64, len: u64) -> String {
+    format!("{:x}-{:x}-{:x}.{:x}-{:x}-{:x}-{:x}.v{}",
+        dev, ino, mtime_s, mtime_ns, size, offset, len, PATCH_CACHE_VERSION)
+}
+
+/// Serialize patch-site byte offsets: magic, version, count, then u32 LE offsets.
+fn encode_patch_cache(sites: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + sites.len() * 4);
+    out.extend_from_slice(&PATCH_CACHE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&PATCH_CACHE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(sites.len() as u64).to_le_bytes());
+    for s in sites {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a cache file. None on any size/magic/version mismatch.
+fn parse_patch_cache(data: &[u8]) -> Option<Vec<u32>> {
+    if data.len() < 16 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
+    let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    let count = u64::from_le_bytes(data[8..16].try_into().ok()?) as usize;
+    if magic != PATCH_CACHE_MAGIC || version != PATCH_CACHE_VERSION
+        || data.len() != 16 + count * 4 {
+        return None;
+    }
+    let mut sites = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 16 + i * 4;
+        sites.push(u32::from_le_bytes(data[off..off + 4].try_into().ok()?));
+    }
+    Some(sites)
+}
+
+/// Full cache path for the file behind `fd` mapped at (offset, len), or None
+/// if the cache is disabled or fstat fails.
+fn patch_cache_path(fd: i32, offset: u64, len: u64) -> Option<Vec<u8>> {
+    let dir = PATCH_CACHE_DIR.get()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_size <= 0 {
+        return None;
+    }
+    let name = patch_cache_filename(
+        st.st_dev as u64, st.st_ino, st.st_mtime, st.st_mtime_nsec,
+        st.st_size as u64, offset, len);
+    let mut path = dir.as_bytes().to_vec();
+    path.push(b'/');
+    path.extend_from_slice(name.as_bytes());
+    Some(path)
+}
+
+/// Read an entire file with raw libc (async-signal-safe I/O). None if missing.
+fn read_file_raw(path: &[u8]) -> Option<Vec<u8>> {
+    let cpath = std::ffi::CString::new(path).ok()?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+        if n < 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+    unsafe { libc::close(fd) };
+    Some(buf)
+}
+
+/// Atomically write a file with raw libc: write to <path>.tmp.<pid>, rename.
+fn write_file_raw_atomic(path: &[u8], data: &[u8]) {
+    let pid = unsafe { libc::getpid() };
+    let mut tmp = path.to_vec();
+    tmp.extend_from_slice(format!(".tmp.{}", pid).as_bytes());
+    let (ctmp, cpath) = match (std::ffi::CString::new(tmp), std::ffi::CString::new(path)) {
+        (Ok(t), Ok(p)) => (t, p),
+        _ => return,
+    };
+    let fd = unsafe {
+        libc::open(ctmp.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o600)
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut written = 0usize;
+    while written < data.len() {
+        let n = unsafe {
+            libc::write(fd, data[written..].as_ptr() as *const _, data.len() - written)
+        };
+        if n <= 0 {
+            unsafe { libc::close(fd); libc::unlink(ctmp.as_ptr()); }
+            return;
+        }
+        written += n as usize;
+    }
+    unsafe {
+        libc::close(fd);
+        libc::rename(ctmp.as_ptr(), cpath.as_ptr());
+    }
+}
+
+/// Classify one instruction word the same way the patch_new_code scan does.
+/// Returns false for anything the scan would not have patched (stale cache).
+fn apply_cached_patch_site(pc_addr: u64, instr: u32) -> bool {
+    if instr == trap::SVC_0 {
+        unsafe { (pc_addr as *mut u32).write(trap::UDF_MARKER) };
+        true
+    } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
+           || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
+        add_runtime_tpidr_patch(pc_addr, instr);
+        unsafe { (pc_addr as *mut u32).write(trap::UDF_MARKER) };
+        true
+    } else if trap::references_x18(instr) {
+        if !crate::x18_trampoline::patch_x18_with_trampoline(pc_addr, instr) {
+            add_runtime_tpidr_patch(pc_addr, instr);
+            unsafe { (pc_addr as *mut u32).write(trap::UDF_MARKER) };
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Try to patch from the persistent cache. Returns true if fully applied.
+/// Validates every cached offset BEFORE writing anything, so a stale entry
+/// falls back to the full scan with memory untouched.
+fn try_patch_from_cache(start: u64, len: u64, fd: i32, offset: u64) -> bool {
+    let path = match patch_cache_path(fd, offset, len) {
+        Some(p) => p,
+        None => return false,
+    };
+    let data = match read_file_raw(&path) {
+        Some(d) => d,
+        None => return false,
+    };
+    let sites = match parse_patch_cache(&data) {
+        Some(s) => s,
+        None => return false,
+    };
+    let skip_x18 = NO_X18_RUNTIME.load(std::sync::atomic::Ordering::Relaxed);
+    // Pass 1: validate (read-only).
+    for &site in &sites {
+        let off = site as u64;
+        if off + 4 > len || off & 3 != 0 {
+            return false;
+        }
+        let instr = unsafe { ((start + off) as *const u32).read() };
+        let patchable = instr == trap::SVC_0
+            || instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
+            || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE
+            || (!skip_x18 && trap::references_x18(instr));
+        if !patchable {
+            return false;
+        }
+    }
+    // Pass 2: apply.
+    for &site in &sites {
+        let pc_addr = start + site as u64;
+        let instr = unsafe { (pc_addr as *const u32).read() };
+        apply_cached_patch_site(pc_addr, instr);
+    }
+    crate::x18_trampoline::flush_all_islands();
+    if !sites.is_empty() {
+        eprintln!("fakelinux: runtime patch at {:#x}+{:#x}: {} sites (cached)",
+            start, len, sites.len());
+    }
+    true
+}
+
+/// patch_new_code for file-backed mappings: consult the persistent patch-site
+/// cache first; on miss run the full scan and record the sites it patched.
+pub fn patch_new_code_file(start: u64, len: u64, fd: i32, offset: u64) {
+    if try_patch_from_cache(start, len, fd, offset) {
+        return;
+    }
+    let sites = patch_new_code(start, len);
+    if let Some(path) = patch_cache_path(fd, offset, len) {
+        write_file_raw_atomic(&path, &encode_patch_cache(&sites));
+    }
+}
+
 /// Patch newly-executable code pages at runtime (called from mprotect/mmap).
 /// Scans the given address range for SVC #0 and MSR/MRS tpidr_el0, patches them,
 /// and adds TPIDR patches to the runtime table.
 ///
 /// The caller must ensure the memory is writable before calling this.
 /// After patching, the caller should set the final permissions and invalidate icache.
-pub fn patch_new_code(start: u64, len: u64) {
+/// Returns the byte offsets (from `start`) of every site it patched, for the
+/// patch-site cache.
+pub fn patch_new_code(start: u64, len: u64) -> Vec<u32> {
     // Try to extract code ranges from ELF section headers (most precise) or
     // program headers + PT_DYNAMIC (fallback). This prevents x18 patching from
     // corrupting non-code data (e.g. .dynstr version strings) in the same mapping.
@@ -635,8 +870,11 @@ pub fn patch_new_code(start: u64, len: u64) {
     let mut tpidr_patched = 0u64;
     let mut x18_patched = 0u64;
     let mut x18_skipped = 0u64;
+    let mut sites: Vec<u32> = Vec::new();
     let have_code_ranges = !code_ranges.is_empty();
-    let skip_x18 = std::env::var("FAKELINUX_NO_X18").is_ok();
+    // Cached at init_patch_cache() — std::env::var takes the env lock, which
+    // self-deadlocks in signal context (see init_trace_flags note in trap.rs).
+    let skip_x18 = NO_X18_RUNTIME.load(std::sync::atomic::Ordering::Relaxed);
     // Find embedded literal pools to exclude from x18 patching.
     let literal_pools = find_literal_pools(start, len);
     for i in 0..count as usize {
@@ -645,12 +883,14 @@ pub fn patch_new_code(start: u64, len: u64) {
             if instr == trap::SVC_0 {
                 base.add(i).write(trap::UDF_MARKER);
                 svc_patched += 1;
+                sites.push((i * 4) as u32);
             } else if instr & trap::MSR_TPIDR_MASK == trap::MSR_TPIDR_BASE
                    || instr & trap::MRS_TPIDR_MASK == trap::MRS_TPIDR_BASE {
                 let pc_addr = base.add(i) as u64;
                 add_runtime_tpidr_patch(pc_addr, instr);
                 base.add(i).write(trap::UDF_MARKER);
                 tpidr_patched += 1;
+                sites.push((i * 4) as u32);
             } else if !skip_x18 && trap::references_x18(instr) {
                 let pc_addr = base.add(i) as u64;
                 // x18 patterns have high false-positive rates on data (string tables,
@@ -663,6 +903,7 @@ pub fn patch_new_code(start: u64, len: u64) {
                         base.add(i).write(trap::UDF_MARKER);
                     }
                     x18_patched += 1;
+                    sites.push((i * 4) as u32);
                 } else if !have_code_ranges {
                     x18_skipped += 1;
                 }
@@ -686,6 +927,7 @@ pub fn patch_new_code(start: u64, len: u64) {
     // __libc_fork entry is NOT corruption — the 0x5000xxxx range is the guest binary's
     // text segment (loaded below brk). The probe was incorrectly "fixing" correct LRs
     // to wrong libapt-pkg addresses, CAUSING the fork child to run wrong code.
+    sites
 }
 
 /// Try to extract code ranges from ELF headers in mapped memory.
@@ -1862,6 +2104,58 @@ mod tests {
     use std::ffi::CString;
 
     fn c(s: &[u8]) -> CString { CString::new(s).unwrap() }
+
+    // ── patch-site cache (encode/parse/filename) ────────────────────────
+
+    #[test]
+    fn patch_cache_roundtrip() {
+        let sites = vec![0u32, 4, 0x1234, 0x7242cc0];
+        let enc = encode_patch_cache(&sites);
+        assert_eq!(parse_patch_cache(&enc), Some(sites));
+    }
+
+    #[test]
+    fn patch_cache_roundtrip_empty() {
+        // Zero sites is still a valid cache entry (skips the scan entirely).
+        let enc = encode_patch_cache(&[]);
+        assert_eq!(enc.len(), 16);
+        assert_eq!(parse_patch_cache(&enc), Some(vec![]));
+    }
+
+    #[test]
+    fn patch_cache_rejects_garbage() {
+        assert_eq!(parse_patch_cache(&[]), None);
+        assert_eq!(parse_patch_cache(&[0u8; 15]), None);
+        // wrong magic
+        let mut enc = encode_patch_cache(&[4]);
+        enc[0] ^= 0xff;
+        assert_eq!(parse_patch_cache(&enc), None);
+        // wrong version
+        let mut enc = encode_patch_cache(&[4]);
+        enc[4] ^= 0xff;
+        assert_eq!(parse_patch_cache(&enc), None);
+        // truncated payload
+        let mut enc = encode_patch_cache(&[4, 8]);
+        enc.pop();
+        assert_eq!(parse_patch_cache(&enc), None);
+        // count larger than payload
+        let enc = encode_patch_cache(&[4, 8]);
+        assert_eq!(parse_patch_cache(&enc[..20]), None);
+    }
+
+    #[test]
+    fn patch_cache_filename_distinguishes_identity() {
+        let a = patch_cache_filename(1, 2, 3, 4, 5, 6, 7);
+        // any field change → different cache entry
+        assert_ne!(a, patch_cache_filename(9, 2, 3, 4, 5, 6, 7));
+        assert_ne!(a, patch_cache_filename(1, 9, 3, 4, 5, 6, 7));
+        assert_ne!(a, patch_cache_filename(1, 2, 9, 4, 5, 6, 7));
+        assert_ne!(a, patch_cache_filename(1, 2, 3, 9, 5, 6, 7));
+        assert_ne!(a, patch_cache_filename(1, 2, 3, 4, 9, 6, 7));
+        assert_ne!(a, patch_cache_filename(1, 2, 3, 4, 5, 9, 7));
+        assert_ne!(a, patch_cache_filename(1, 2, 3, 4, 5, 6, 9));
+        assert_eq!(a, patch_cache_filename(1, 2, 3, 4, 5, 6, 7));
+    }
 
     // ── scan_rodata_table_exclusions ─────────────────────────────────────
     // Real gcc-13 cc1 crash: the pointer-fixup heuristic patched a switch

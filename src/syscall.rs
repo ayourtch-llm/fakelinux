@@ -2245,7 +2245,7 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
                 pread_full(fd, addr, read_len, offset as i64);
             }
             if has_exec && length > 0 {
-                loader::patch_new_code(addr, length);
+                loader::patch_new_code_file(addr, length, fd, offset);
                 extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
                 unsafe { sys_icache_invalidate(addr as *mut _, length as usize); }
             }
@@ -2282,7 +2282,7 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
 
         // Patch SVC/TPIDR if executable
         if has_exec && length > 0 {
-            loader::patch_new_code(result_addr, length);
+            loader::patch_new_code_file(result_addr, length, fd, offset);
             extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
             unsafe { sys_icache_invalidate(result_addr as *mut _, length as usize); }
         }

@@ -814,6 +814,7 @@ pub const UDF_WATCH_STEP: u32 = 0x0000_F00D;
 /// Read handler-path trace knobs from the environment ONCE, outside signal
 /// context. Async-signal-safe getters below only load atomics.
 pub fn init_trace_flags() {
+    crate::loader::init_patch_cache();
     let v: i8 = if std::env::var_os("FAKELINUX_TRACE_X18_STORES").is_some() { 1 } else { 0 };
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
