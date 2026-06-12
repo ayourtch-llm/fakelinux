@@ -1,8 +1,54 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-12 ~13:20 (session 11, refresh #17). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~14:45 (session 11, refresh #18). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #17 STATUS — read this first (supersedes #16 below)
+## REFRESH #18 STATUS — read this first (supersedes #17 below)
+
+**VPP RUN PROGRESS — 3 startup blockers fixed (all TDD'd, 406 tests green,
+committed on `testing`: 1282f7f sysfs, + /dev/shm commit, + mmap/VA commit):**
+
+USER'S TIP THAT CRACKED IT: add `interactive` to `unix {}` — fatal errors
+print right away instead of vanishing. Run (in tttt pty, needs real tty):
+`FAKELINUX_ROOT=$PWD/ubuntu-rootfs ./target/release/fakelinux --container
+ubuntu-rootfs/root/vpp/build-root/install-vpp_debug-native/vpp/bin/vpp
+'unix { nodaemon interactive } plugins { plugin dpdk_plugin.so { disable } }'`
+
+1. **"skip-core value >= available cpus"**: no /sys → 0 cpus. Fixed:
+   virtual sysfs cpu/NUMA topology in procfs.rs (sysfs_content(), pure,
+   tested) — cpu/online|possible|present, node0, core_id. Also maps now
+   SORTED (VPP VA sniffer reads END of LAST line).
+2. **svm_region_map ENOENT**: glibc shm_open → /dev/shm/<name>, macOS has
+   none. Fixed: rootfs::dev_passes_through — /dev native EXCEPT /dev/shm
+   (re-rooted; rootfs::init creates <root>/dev/shm).
+3. **svm mmap ENOMEM/SIGBUS**: VPP MAP_FIXEDs its region at 2^(bits-2) from
+   maps-derived VA bits. (a) macOS arm64 CANNOT map [0xfc0000000,
+   0x7000000000) (63GB-448GB dead zone, probed!) → 39-bit baseva died.
+   loader::reserve_va_top_page() = PROT_NONE page at 0x7ffffdffc000
+   (highest mappable, probed) → guests see 47 bits → baseva
+   0x200000000000 ✓. (b) 4K-randomized baseva = 4K-not-16K-aligned fresh
+   MAP_FIXED hit do_mmap's sub-page branch which ASSUMED pages existed →
+   silent no-op → SIGBUS. syscall::ensure_pages_writable() falls back to
+   anon MAP_FIXED. KNOWN GAP: MAP_SHARED is still anon+pread = NO real
+   sharing/writeback — fine for vpp main (workers = threads), will bite
+   multi-PROCESS svm clients (vpp_get_stats etc.).
+
+**CURRENT BLOCKER (next!): `clib_socket_init: socket (fd -1,
+'/run/vpp/stats.sock'): Protocol not supported` → vpp exits 0.**
+AF_UNIX socket gap — likely socket(AF_UNIX, SOCK_*|flags) translation or
+sun_path not rootfs-translated (known issue in handoff Known Issues).
+Also /run/vpp dir must exist in rootfs. After stats.sock: expect same for
+cli.sock + api segment. THEN: vpp# CLI should appear in the pty!
+
+CLEANUP between runs: `scripts/vpp-clean.sh` (kills stray vpp guests,
+wipes ubuntu-rootfs/dev/shm/*) — use it, inline rm+pkill trips the
+permission safety.
+
+Minor leftovers seen in runs: syscalls 236/237/239 get_mempolicy/mbind/
+migrate_pages + 168 getcpu unimplemented (NUMA noise, nonfatal);
+clib_elf_parse_file double-rooted HOST path (host-path leak shape, fix
+like 1227b91's /proc/self/fd readlink strip).
+
+## REFRESH #17 STATUS (older)
 
 **🎉 VPP BUILD COMPLETE — DONE_RC=0 (2026-06-12 ~13:10, ext8.log).**
 `make build` finished: vpp + all plugins/drivers/crypto engines built,

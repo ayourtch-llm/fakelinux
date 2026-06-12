@@ -611,3 +611,32 @@ maps its 16GB main heap, and keeps running. It wants get_mempolicy and
 getcpu, and clib_elf_parse_file trips over a leaked host path — next
 session's shopping list. The north star is no longer a star; it's a
 binary that runs.
+
+## Session 11, afternoon: "add interactive and you'll see it right away"
+
+The user came back with the kind of tip that saves hours: put
+`interactive` in vpp's `unix {}` section. Suddenly the silent early
+exit had a voice: "skip-core value greater or equal to available
+cpus". VPP counts CPUs by reading /sys/devices/system/cpu/online — and
+fakelinux had no /sys at all. Zero CPUs, fatal. A virtual sysfs (one
+fake NUMA node, host core count) fixed it in an afternoon's first act.
+
+Act two: `svm_region_map(mmap open): No such file or directory`.
+glibc's shm_open is just open("/dev/shm/<name>") — and /dev passes
+through to macOS, which has no /dev/shm. Carved out the one exception:
+/dev/shm now re-roots into the rootfs.
+
+Act three was the deep one. VPP sniffs its address-space size from the
+LAST line of /proc/self/maps and demands MAP_FIXED at exactly a
+quarter of it. Our guest stack implied 39 bits → 0x1ff8000000 — and a
+binary search of mmap probes revealed macOS arm64 simply refuses
+[63GB, 448GB). A dead zone, undocumented, non-negotiable. The fix:
+reserve one PROT_NONE page at the highest mappable address (probed:
+0x7ffffdffc000), so guests deduce 47 bits and aim at 0x200000000000 —
+which macOS happily maps. Plus a do_mmap branch that assumed
+"sub-page MAP_FIXED means the pages already exist" — VPP's
+4K-randomized baseva proved it wrong; now we create the pages.
+
+Three fixes, three failing tests written first, 406 green. vpp now
+sails through svm init and stops at /run/vpp/stats.sock — an AF_UNIX
+socket away from a CLI prompt.
