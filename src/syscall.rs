@@ -3640,6 +3640,16 @@ fn do_memfd_create(name: u64, flags: u32) -> u64 {
     // shm_open doesn't auto-extend on write, so use a real tmpfile instead.
     let _ = name;
 
+    // MFD_HUGETLB: no hugepages on macOS — fail like a Linux kernel built
+    // without CONFIG_HUGETLBFS. Succeeding here made VPP take the tmpfile's
+    // st_blksize (4K) as the "default hugepage size"; with 16K AT_PAGESZ
+    // that inverted pmalloc's page hierarchy and the buffer pool came out
+    // with ZERO buffers ("packet allocation failed" on every ping).
+    const MFD_HUGETLB: u32 = 0x4;
+    if flags & MFD_HUGETLB != 0 {
+        return (-38_i64) as u64; // -ENOSYS
+    }
+
     let template = std::ffi::CString::new("/tmp/fakelinux_memfd_XXXXXX").unwrap();
     let buf = template.into_bytes_with_nul();
     let mut buf = buf.to_vec();
@@ -3783,6 +3793,27 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn memfd_create_hugetlb_is_enosys() {
+        // VPP probes hugepage support with memfd_create("test", MFD_HUGETLB);
+        // if it succeeds it takes the fd's st_blksize (4K on APFS) as the
+        // "default hugepage size". With FAKELINUX_PAGESZ=16384 that makes
+        // pmalloc's def_log2_page_sz (12) SMALLER than the arena subpage
+        // size (14) → subpages_per_page = 1u32 << (12-14) underflows →
+        // map->n_pages overflows u32 to 0 → buffer pool created with ZERO
+        // buffers → vpp "Failed: packet allocation failed" on every ping.
+        // Linux without hugetlbfs returns ENOSYS; so must we.
+        const MFD_HUGETLB: u32 = 0x4;
+        let name = std::ffi::CString::new("test").unwrap();
+        let r = do_memfd_create(name.as_ptr() as u64, MFD_HUGETLB);
+        assert_eq!(r as i64, -38, "MFD_HUGETLB must fail with ENOSYS, got {}", r as i64);
+
+        // plain memfd_create still works
+        let fd = do_memfd_create(name.as_ptr() as u64, 0) as i64;
+        assert!(fd >= 0, "plain memfd_create broke: {}", fd);
+        unsafe { libc::close(fd as i32) };
     }
 
     #[test]
