@@ -218,6 +218,14 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_SCHED_GETAFFINITY => do_sched_getaffinity(args[0] as i32, args[1] as u32, args[2]),
         SYS_PSELECT6 => do_pselect6(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
         SYS_PRCTL => do_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
+        // NUMA syscalls: we present a single node 0 (matching the virtual
+        // /sys topology). getcpu is LOAD-BEARING: VPP seeds vm->numa_node
+        // from it, and an ENOSYS left garbage that tripped
+        // `numa_node < VLIB_BUFFER_MAX_NUMA_NODES` in vlib_buffer_funcs.
+        SYS_GETCPU => do_getcpu(args[0], args[1]),
+        SYS_GET_MEMPOLICY => do_get_mempolicy(args[0], args[1], args[2]),
+        SYS_SET_MEMPOLICY => 0,
+        SYS_MOVE_PAGES => do_move_pages(args[1], args[4]),
         SYS_SYSINFO => do_sysinfo(args[0]),
         SYS_GETRUSAGE => do_getrusage(args[0] as i32, args[1]),
         SYS_SCHED_YIELD => { unsafe { libc::sched_yield(); } 0 }
@@ -2869,6 +2877,45 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
     }
 }
 
+/// getcpu(cpu_ptr, node_ptr, tcache) — report cpu 0 on NUMA node 0,
+/// consistent with the virtual /sys topology (one node, node0).
+fn do_getcpu(cpu_ptr: u64, node_ptr: u64) -> u64 {
+    unsafe {
+        if cpu_ptr != 0 {
+            *(cpu_ptr as *mut u32) = 0;
+        }
+        if node_ptr != 0 {
+            *(node_ptr as *mut u32) = 0;
+        }
+    }
+    0
+}
+
+/// get_mempolicy(mode_ptr, nodemask_ptr, maxnode, addr, flags) — report
+/// MPOL_DEFAULT with node 0 in the mask.
+fn do_get_mempolicy(mode_ptr: u64, nodemask_ptr: u64, maxnode: u64) -> u64 {
+    unsafe {
+        if mode_ptr != 0 {
+            *(mode_ptr as *mut i32) = 0; // MPOL_DEFAULT
+        }
+        if nodemask_ptr != 0 && maxnode >= 1 {
+            let words = ((maxnode as usize) + 63) / 64;
+            std::ptr::write_bytes(nodemask_ptr as *mut u64, 0, words);
+            *(nodemask_ptr as *mut u64) = 1; // node 0
+        }
+    }
+    0
+}
+
+/// move_pages(pid, count, pages, nodes, status, flags) — with nodes=NULL
+/// this is a query: report every page on node 0 via status[].
+fn do_move_pages(count: u64, status_ptr: u64) -> u64 {
+    if status_ptr != 0 {
+        unsafe { std::ptr::write_bytes(status_ptr as *mut i32, 0, count as usize) };
+    }
+    0
+}
+
 fn do_sysinfo(buf: u64) -> u64 {
     // Linux struct sysinfo on aarch64 (64-bit) is 112 bytes:
     //   offset  0: i64 uptime
@@ -3702,6 +3749,33 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn numa_syscalls_report_single_node_zero() {
+        // getcpu writes BOTH outputs — VPP seeds vm->numa_node from the
+        // node value; ENOSYS left it garbage and tripped the
+        // VLIB_BUFFER_MAX_NUMA_NODES assertion on first buffer alloc (ping).
+        let mut cpu = 0xffff_ffffu32;
+        let mut node = 0xffff_ffffu32;
+        assert_eq!(do_getcpu(&mut cpu as *mut _ as u64, &mut node as *mut _ as u64), 0);
+        assert_eq!((cpu, node), (0, 0));
+        // Null pointers are legal (either output may be NULL).
+        assert_eq!(do_getcpu(0, 0), 0);
+
+        let mut mode = -1i32;
+        let mut mask = [0xffu8; 16];
+        assert_eq!(
+            do_get_mempolicy(&mut mode as *mut _ as u64, mask.as_mut_ptr() as u64, 128),
+            0
+        );
+        assert_eq!(mode, 0); // MPOL_DEFAULT
+        assert_eq!(u64::from_le_bytes(mask[0..8].try_into().unwrap()), 1); // node 0 only
+        assert_eq!(u64::from_le_bytes(mask[8..16].try_into().unwrap()), 0);
+
+        let mut status = [-1i32; 3];
+        assert_eq!(do_move_pages(3, status.as_mut_ptr() as u64), 0);
+        assert_eq!(status, [0, 0, 0]);
     }
 
     // ── file-backed MAP_FIXED at 4K-aligned (not 16K) fresh address ──────
