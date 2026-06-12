@@ -27,7 +27,7 @@ const LINUX_O_DIRECTORY: i32 = 0o40000;   // 0x4000 — asm-generic
 const LINUX_O_NOFOLLOW: i32 = 0o100000;   // 0x8000 — asm-generic
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 const LINUX_O_LARGEFILE: i32 = 0o100000; // no-op on 64-bit
-const LINUX_O_PATH: i32 = 0o10000000;    // 0x200000 — fd for path ops only
+pub const LINUX_O_PATH: i32 = 0o10000000;    // 0x200000 — fd for path ops only
 
 pub fn translate_open_flags(linux_flags: i32) -> i32 {
     let mut mac = linux_flags & (LINUX_O_RDONLY | LINUX_O_WRONLY | LINUX_O_RDWR); // 0,1,2 same

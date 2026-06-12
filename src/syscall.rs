@@ -63,6 +63,19 @@ fn effective_path_ptr_nofollow(path_ptr: u64) -> (*const i8, Option<std::ffi::CS
     }
 }
 
+/// Clamp dirfd-relative paths containing ".." inside the rootfs (chroot
+/// semantics): without this, e.g. statx(root_fd, "..") escapes to the HOST
+/// parent of the rootfs, which breaks systemd's root-detection (chase() abort).
+/// Returns the rebased absolute host path when it applies.
+fn rebased_at_path(mac_dirfd: i32, pathname: u64, nofollow: bool) -> Option<std::ffi::CString> {
+    if pathname == 0 {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+    rootfs::rebase_dotdot_at(mac_dirfd, path.to_bytes(), nofollow)
+        .map(|v| unsafe { std::ffi::CString::from_vec_with_nul_unchecked(v) })
+}
+
 /// Write a diagnostic message to stderr using raw write() — safe after fork.
 /// eprintln! uses Rust's Mutex<Stderr> which deadlocks in forked children.
 fn raw_eprintln(msg: &str) {
@@ -549,6 +562,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             // personality(PER_LINUX=0) — just return current (0)
             if args[0] == 0xFFFFFFFF { 0 } else { 0 }
         }
+        SYS_CAPGET => do_capget(args[0], args[1]),
+        SYS_CAPSET => 0, // we run as fake root — pretend any capability change succeeded
         SYS_SIGALTSTACK => do_guest_sigaltstack(args[0], args[1]),
         SYS_RENAMEAT2 => do_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
         SYS_MEMFD_CREATE => do_memfd_create(args[0], args[1] as u32),
@@ -723,6 +738,8 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     // Use translated pts path if available, otherwise normal rootfs translation
     let (eff_path, _hold) = if pts_hold.is_some() {
         (eff_pathname, None)
+    } else if let Some(cs) = rebased_at_path(mac_dirfd, pathname, false) {
+        (cs.as_ptr(), Some(cs))
     } else {
         effective_path_ptr(pathname)
     };
@@ -730,6 +747,22 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     let ret = unsafe { libc::openat(mac_dirfd, eff_path, mac_flags, mode) };
     if ret >= 0 {
         return ret as u64;
+    }
+
+    // Linux open(O_PATH|O_NOFOLLOW) on a symlink returns an fd to the symlink
+    // itself; macOS reports ELOOP. O_SYMLINK is the macOS equivalent — fstat on
+    // the resulting fd describes the link, matching Linux O_PATH semantics.
+    // (systemd-tmpfiles re-opens symlinks it just created this way.)
+    if mac_flags & libc::O_NOFOLLOW != 0
+        && linux_flags & translate::LINUX_O_PATH != 0
+        && unsafe { *libc::__error() } == libc::ELOOP
+    {
+        let ret2 = unsafe {
+            libc::openat(mac_dirfd, eff_path, (mac_flags & !libc::O_NOFOLLOW) | libc::O_SYMLINK, mode)
+        };
+        if ret2 >= 0 {
+            return ret2 as u64;
+        }
     }
 
     // In rootfs mode, if O_NOFOLLOW caused ELOOP, retry without it.
@@ -881,7 +914,9 @@ fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32
     // the final component (which might be a symlink) is NOT resolved.  Without
     // this, lstat() can never see symlinks — resolve_in_rootfs follows them all.
     let nofollow = mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0;
-    let (eff_path, _hold) = if nofollow {
+    let (eff_path, _hold) = if let Some(cs) = rebased_at_path(mac_dirfd, pathname, nofollow) {
+        (cs.as_ptr(), Some(cs))
+    } else if nofollow {
         effective_path_ptr_nofollow(pathname)
     } else {
         effective_path_ptr(pathname)
@@ -1281,24 +1316,48 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
     if linux_cmd == 15 { return 0; }
     if linux_cmd == 16 { return (-22_i64) as u64; }
 
-    // F_GETLK / F_SETLK / F_SETLKW — need struct flock translation
-    if linux_cmd == translate::LINUX_F_GETLK
-        || linux_cmd == translate::LINUX_F_SETLK
-        || linux_cmd == translate::LINUX_F_SETLKW
+    // F_GETLK / F_SETLK / F_SETLKW — need struct flock translation.
+    // Linux OFD variants (36/37/38) map to macOS F_OFD_* (92/90/91) — used by
+    // systemd's take_etc_passwd_lock (sysusers would fail with EINVAL otherwise).
+    const LINUX_F_OFD_GETLK: i32 = 36;
+    const LINUX_F_OFD_SETLK: i32 = 37;
+    const LINUX_F_OFD_SETLKW: i32 = 38;
+    const MAC_F_OFD_SETLK: i32 = 90;
+    const MAC_F_OFD_SETLKW: i32 = 91;
+    const MAC_F_OFD_GETLK: i32 = 92;
+    if matches!(linux_cmd, translate::LINUX_F_GETLK | translate::LINUX_F_SETLK
+        | translate::LINUX_F_SETLKW
+        | LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW)
     {
         let mac_cmd = match linux_cmd {
             translate::LINUX_F_GETLK => libc::F_GETLK,
             translate::LINUX_F_SETLK => libc::F_SETLK,
             translate::LINUX_F_SETLKW => libc::F_SETLKW,
+            LINUX_F_OFD_GETLK => MAC_F_OFD_GETLK,
+            LINUX_F_OFD_SETLK => MAC_F_OFD_SETLK,
+            LINUX_F_OFD_SETLKW => MAC_F_OFD_SETLKW,
             _ => unreachable!(),
         };
         let mut mac_flock = translate::linux_flock_to_mac(arg);
-        let ret = unsafe { libc::fcntl(fd, mac_cmd, &mut mac_flock as *mut libc::flock) };
+        let mut ret = unsafe { libc::fcntl(fd, mac_cmd, &mut mac_flock as *mut libc::flock) };
+        if ret < 0 && matches!(linux_cmd, LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW)
+            && unsafe { *libc::__error() } == libc::EINVAL
+        {
+            // OFD locks unsupported on this filesystem/kernel — fall back to
+            // classic POSIX locks (close-on-any-fd caveat is fine in emulation).
+            let posix_cmd = match linux_cmd {
+                LINUX_F_OFD_GETLK => libc::F_GETLK,
+                LINUX_F_OFD_SETLK => libc::F_SETLK,
+                _ => libc::F_SETLKW,
+            };
+            mac_flock = translate::linux_flock_to_mac(arg);
+            ret = unsafe { libc::fcntl(fd, posix_cmd, &mut mac_flock as *mut libc::flock) };
+        }
         if ret < 0 {
             return translate::linux_errno();
         }
         // For F_GETLK, write back the result
-        if linux_cmd == translate::LINUX_F_GETLK {
+        if matches!(linux_cmd, translate::LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
             translate::mac_flock_to_linux(&mac_flock, arg);
         }
         return ret as u64;
@@ -1474,7 +1533,9 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
     // When AT_SYMLINK_NOFOLLOW is set, use nofollow path translation so that
     // the final component (which might be a symlink) is NOT resolved.
     let nofollow = mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0;
-    let (eff_path, _hold) = if nofollow {
+    let (eff_path, _hold) = if let Some(cs) = rebased_at_path(mac_dirfd, pathname, nofollow) {
+        (cs.as_ptr(), Some(cs))
+    } else if nofollow {
         effective_path_ptr_nofollow(pathname)
     } else {
         effective_path_ptr(pathname)
@@ -1504,7 +1565,13 @@ fn do_statx(linux_dirfd: i32, pathname: u64, linux_flags: i32, _mask: u32, statx
 fn do_faccessat(linux_dirfd: i32, pathname: u64, mode: i32, linux_flags: i32) -> u64 {
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
     let mac_flags = translate::translate_at_flags(linux_flags);
-    let (eff_path, _hold) = effective_path_ptr(pathname);
+    let (eff_path, _hold) = if let Some(cs) =
+        rebased_at_path(mac_dirfd, pathname, mac_flags & libc::AT_SYMLINK_NOFOLLOW != 0)
+    {
+        (cs.as_ptr(), Some(cs))
+    } else {
+        effective_path_ptr(pathname)
+    };
     let ret = unsafe { libc::faccessat(mac_dirfd, eff_path, mode, mac_flags) };
     if ret == 0 { return 0; }
     // Fallback to original if translated path failed (SYSROOT-only mode)
@@ -1529,6 +1596,22 @@ fn do_readlinkat(linux_dirfd: i32, pathname: u64, buf: u64, bufsiz: u64) -> u64 
     }
 
     let mac_dirfd = translate::translate_dirfd(linux_dirfd);
+
+    // Linux readlinkat(fd, "", buf) where fd is an O_PATH fd of a symlink reads
+    // the link target (systemd's fd_readlink). Our O_PATH symlink fds are
+    // O_SYMLINK fds — recover the link's own path via F_GETPATH and readlink it.
+    if path.to_bytes().is_empty() && linux_dirfd >= 0 {
+        let mut pbuf = [0u8; libc::PATH_MAX as usize + 1];
+        if unsafe { libc::fcntl(mac_dirfd, libc::F_GETPATH, pbuf.as_mut_ptr()) } >= 0 {
+            let ret = unsafe {
+                libc::readlink(pbuf.as_ptr() as *const i8, buf as *mut i8, bufsiz as usize)
+            };
+            if ret >= 0 {
+                return ret as u64;
+            }
+        }
+        return translate::linux_errno();
+    }
     // readlinkat operates on the symlink itself — must NOT follow the final
     // component, otherwise we'd readlink a resolved regular file → EINVAL.
     let (eff_path, _hold) = effective_path_ptr_nofollow(pathname);
@@ -2624,6 +2707,37 @@ fn do_pselect6(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: 
     }
 
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
+}
+
+/// capget(2). We emulate root with full capabilities: effective/permitted
+/// all-ones, inheritable zero. Version probe (data=NULL) negotiates V3.
+/// Needed by libcap (setpriv, systemd) — ENOSYS makes setpriv fail with
+/// "activate capabilities: Function not implemented" during man-db triggers.
+fn do_capget(hdrp: u64, datap: u64) -> u64 {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    if hdrp == 0 {
+        return (-14_i64) as u64; // -EFAULT
+    }
+    let hdr = hdrp as *mut u32; // struct { u32 version; int pid; }
+    let version = unsafe { *hdr };
+    if version != LINUX_CAPABILITY_VERSION_3 {
+        // Kernel behavior: write back the preferred version; EINVAL only if
+        // the caller also asked for data, plain 0 for a pure probe.
+        unsafe { *hdr = LINUX_CAPABILITY_VERSION_3 };
+        return if datap != 0 { (-22_i64) as u64 } else { 0 };
+    }
+    if datap != 0 {
+        // V3: two struct { u32 effective, permitted, inheritable; } elements.
+        let d = datap as *mut u32;
+        for i in 0..2 {
+            unsafe {
+                *d.add(i * 3) = 0xFFFF_FFFF; // effective
+                *d.add(i * 3 + 1) = 0xFFFF_FFFF; // permitted
+                *d.add(i * 3 + 2) = 0; // inheritable
+            }
+        }
+    }
+    0
 }
 
 fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {

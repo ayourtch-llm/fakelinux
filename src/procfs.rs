@@ -1061,9 +1061,16 @@ pub fn try_readlink(path: &[u8], buf: u64, bufsiz: u64) -> Option<u64> {
             };
             if ret == 0 {
                 let len = pathbuf.iter().position(|&b| b == 0).unwrap_or(pathbuf.len());
-                let copy_len = len.min(bufsiz as usize);
+                // Strip the rootfs prefix — the guest must see its own path,
+                // not the host one. Leaking the host path makes the guest
+                // re-open it, which re-translates under the rootfs → ENOENT
+                // (broke systemd-sysusers' fsync_full of /etc/.#groupXXXX).
+                let host = &pathbuf[..len];
+                let stripped = crate::rootfs::strip_root_prefix(host);
+                let p: &[u8] = stripped.as_deref().unwrap_or(host);
+                let copy_len = p.len().min(bufsiz as usize);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(pathbuf.as_ptr(), buf as *mut u8, copy_len);
+                    std::ptr::copy_nonoverlapping(p.as_ptr(), buf as *mut u8, copy_len);
                 }
                 return Some(copy_len as u64);
             }

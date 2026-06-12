@@ -359,6 +359,85 @@ pub fn strip_root_prefix(host_path: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Join a guest-visible absolute directory path with a relative path,
+/// normalizing "." and clamping ".." at the guest root (chroot semantics).
+/// Returns an absolute guest path ("/" when everything cancels out).
+///
+/// Without this, a relative ".." resolved against a dirfd that points at the
+/// guest root escapes to the HOST parent directory. systemd's path_is_root_at()
+/// compares statx(fd, ".") vs statx(fd, "..") inodes to detect "/" — the escape
+/// makes it conclude the root fd is NOT root, and chase() then aborts on
+/// `Assertion 'path_is_absolute(p)'` in every systemd tool.
+pub fn join_guest_relative(guest_dir: &[u8], rel: &[u8]) -> Vec<u8> {
+    let mut stack: Vec<&[u8]> = guest_dir
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .collect();
+    for comp in rel.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            stack.pop(); // pop at root is a no-op → clamp
+        } else {
+            stack.push(comp);
+        }
+    }
+    let mut out = Vec::new();
+    for c in &stack {
+        out.push(b'/');
+        out.extend_from_slice(c);
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    out
+}
+
+/// Guest-visible absolute path of an open host fd, when the fd lives inside
+/// the rootfs. Uses F_GETPATH; AT_FDCWD resolves via getcwd().
+pub fn guest_path_of_fd(fd: i32) -> Option<Vec<u8>> {
+    let mut buf = [0u8; libc::PATH_MAX as usize + 1];
+    if fd == libc::AT_FDCWD {
+        if unsafe { libc::getcwd(buf.as_mut_ptr() as *mut i8, buf.len()) }.is_null() {
+            return None;
+        }
+    } else if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    strip_root_prefix(&buf[..len])
+}
+
+/// For a dirfd-relative path containing a ".." component, compute the
+/// rootfs-clamped HOST path (NUL-terminated) so ".." cannot escape the guest
+/// root. Returns None when not applicable (not in rootfs mode, absolute path,
+/// no "..", or dirfd outside the rootfs) — caller falls back to passthrough.
+pub fn rebase_dotdot_at(host_dirfd: i32, rel: &[u8], nofollow: bool) -> Option<Vec<u8>> {
+    if !in_full_rootfs_mode() {
+        return None;
+    }
+    if rel.is_empty() || rel[0] == b'/' {
+        return None;
+    }
+    if !rel.split(|&b| b == b'/').any(|c| c == b"..") {
+        return None;
+    }
+    let guest_dir = guest_path_of_fd(host_dirfd)?;
+    let guest = join_guest_relative(&guest_dir, rel);
+    let translated = if nofollow {
+        translate_path_nofollow(&guest)
+    } else {
+        translate_path(&guest)
+    };
+    // /proc, /dev etc. fall through untranslated — use the guest path verbatim.
+    translated.or_else(|| {
+        let mut v = guest;
+        v.push(0);
+        Some(v)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +511,27 @@ mod tests {
         // Path that doesn't match
         let path3 = b"/other/path/var/lib";
         assert!(!path3.starts_with(root.as_slice()));
+    }
+
+    #[test]
+    fn test_join_guest_relative_clamps_dotdot_at_root() {
+        // ".." at the guest root must clamp to "/" (chroot semantics).
+        // systemd's path_is_root_at() does statx(root_fd, "..") and expects
+        // the same inode as statx(root_fd, ".") — escaping to the host parent
+        // makes chase() assert (path_is_absolute) in every systemd tool.
+        assert_eq!(join_guest_relative(b"/", b".."), b"/");
+        assert_eq!(join_guest_relative(b"/", b"../.."), b"/");
+        assert_eq!(join_guest_relative(b"/", b"../etc"), b"/etc");
+        assert_eq!(join_guest_relative(b"/usr", b".."), b"/");
+        assert_eq!(join_guest_relative(b"/usr/bin", b"../../etc"), b"/etc");
+        assert_eq!(join_guest_relative(b"/usr/bin", b"../lib"), b"/usr/lib");
+    }
+
+    #[test]
+    fn test_join_guest_relative_normalizes() {
+        assert_eq!(join_guest_relative(b"/usr", b"."), b"/usr");
+        assert_eq!(join_guest_relative(b"/usr", b"./x/../y"), b"/usr/y");
+        assert_eq!(join_guest_relative(b"/", b"."), b"/");
+        assert_eq!(join_guest_relative(b"/a//b/", b"c/.."), b"/a/b");
     }
 }
