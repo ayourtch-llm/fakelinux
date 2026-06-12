@@ -755,3 +755,74 @@ Linux: VPP prints "received signal SIGINT, PC 0x..." — formatting the
 PC out of OUR ucontext — and exits 0, politely.
 
 418 tests green. Commit 87d26c2. Thanks for the bug report :D
+
+## Session 13 — the empty buffer pool (2026-06-12)
+
+You came back, tried the vpp I left running, and pinged your shiny new
+loop0 over IPv6 — and vpp said "Failed: packet allocation failed",
+five times in a row. `show buffers` told the real story: the pool
+existed but held ZERO buffers. Total 0, Avail 0. vpp had been running
+this whole time with no packet memory at all.
+
+The trail led through three layers. `show physmem` showed an oddity:
+pmalloc's default-page-size was 4K but the buffer arena's subpage-size
+was 16K — upside down (the "default" is supposed to be the BIGGER
+hugepage unit). Why did vpp think the system hugepage size was 4K?
+Because clib_mem_main_init probes hugepage support with
+memfd_create("test", MFD_HUGETLB) — and our memfd emulation cheerfully
+ignored the flag and handed back a plain APFS tmpfile, whose
+st_blksize (4096) vpp then trusted as the hugepage size.
+
+From there the arithmetic conspired beautifully: subpages_per_page =
+1u32 << (12 - 14) underflowed to 1<<30, and map->n_pages = 5464 *
+(1<<30) overflowed u32 to *exactly* zero (5464 is divisible by 4).
+Zero pages → the buffer-populate loop never ran → empty pool. No
+assert, no error, just a silent nothing.
+
+The fix is one honest errno: MFD_HUGETLB → ENOSYS, exactly what a
+Linux kernel without CONFIG_HUGETLBFS says. vpp then falls back to
+reading /proc/meminfo, finds no Hugepagesize line, shrugs, and uses
+the real page size. Restarted vpp: 7837 buffers in the pool, and
+`ping 2001:db8::1` came back 5 sent, 5 received, 0% loss — actual
+ICMPv6 echo replies flowing through vpp's graph on a Mac.
+
+Lesson for the books: succeed-by-ignoring-flags is a trap. Guests use
+feature probes' RESULTS (here, the fd's block size) as ground truth.
+If we don't support a flag, fail it the way Linux would. (011d8bb,
+419 tests green.)
+
+## Session 13, part two — Claude in the bottle (2026-06-12)
+
+After the buffer-pool victory you asked the obvious next-level
+question: can Claude Code itself run inside the contraption? The
+recursion is irresistible — Claude debugging a Linux emulator from
+inside the Linux emulator.
+
+The road there was very Ubuntu. apt install nodejs npm first died on
+a dpkg statoverride referencing a messagebus group that didn't exist
+(casualty of some long-forgotten killed run — recreated it), then
+npm's INSANE 300-package dependency tree (webpack? eslint? to install
+a package manager?) hit the old APFS case-insensitivity wall:
+node-neo-async ships angelFall.js AND angelfall.js. Rather than fight
+that, we dodged: purged the swamp, kept bare nodejs 18.19.1 (which
+works beautifully), and discovered the modern claude-code npm package
+is just an installer stub anyway — the real Claude Code is a NATIVE
+249MB Bun-compiled ELF per platform.
+
+So the guest curl'd all 76MB of claude-code-linux-arm64 from the npm
+registry through our emulated network stack (not a hiccup), the
+binary landed in /usr/local/bin/claude, and we pulled the trigger on
+`claude --version`. The loader chewed through a quarter gigabyte of
+code patching SVCs and x18s... ld.so ran... libraries loaded... and
+then a fakelinux crash dump with a very suspicious x18=0x0, followed
+by — beautifully — Bun's own crash reporter announcing "Bun v1.3.14,
+Linux Kernel v6.1.0, glibc v2.39" from inside the wreckage, then a
+100% CPU hang.
+
+Leading theory for next session: Bun's JIT generates x18-using code
+at runtime (x18 is a free register on Linux arm64 — nobody told Bun
+that on macOS the kernel zeroes it), and JIT'd pages may never pass
+through our patch path. The interpreter/runtime-patch machinery vs a
+JavaScript JIT — now THAT is a fight worth watching. Also fixed along
+the way: containers now start at / instead of inheriting a host cwd
+that doesn't exist in the guest's universe (34da147).
