@@ -2837,12 +2837,47 @@ unsafe extern "C" fn segv_fixup_handler(
         {
             static RECOVERED: AtomicU64 = AtomicU64::new(0);
             let n = RECOVERED.fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                let mut buf = [0u8; 200];
+            if n < 8 || n % 8192 == 0 {
+                // include the island page's protection — distinguishes a
+                // stripped-X page from per-thread JIT write-mode anomalies
+                let prot = {
+                    extern "C" {
+                        fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64,
+                            flavor: i32, info: *mut i32, info_cnt: *mut u32, object: *mut u32) -> i32;
+                    }
+                    let mut a = mctx.ss.pc;
+                    let mut s = 0u64;
+                    let mut info = [0i32; 19];
+                    let mut cnt = 9u32;
+                    let mut obj = 0u32;
+                    if mach_vm_region(mach_task_self(), &mut a, &mut s, 9,
+                        info.as_mut_ptr(), &mut cnt, &mut obj) == 0 { info[0] } else { -1 }
+                };
+                let mut buf = [0u8; 220];
                 let m = raw_fmt(&mut buf, format_args!(
-                    "fakelinux: [{}] island fetch fault RECOVERED: island_pc={:#x} orig_pc={:#x} instr={:#010x}\n",
-                    libc::getpid(), mctx.ss.pc, orig_pc, orig_instr));
+                    "fakelinux: [{}] island fetch fault RECOVERED #{}: island_pc={:#x} (prot={}) orig_pc={:#x} instr={:#010x}\n",
+                    libc::getpid(), n, mctx.ss.pc, prot, orig_pc, orig_instr));
                 libc::write(2, buf.as_ptr() as *const _, m);
+            }
+            // Repair permanently: point the site back at UDF emulation so it
+            // costs one normal SIGILL trap per execution instead of a SIGBUS
+            // + island lookup here every time. Guest text is anon-backed —
+            // mprotect from signal context is safe.
+            {
+                let page = orig_pc & !0x3FFF;
+                if libc::mprotect(page as *mut _, 0x4000,
+                    libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                    if orig_instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE
+                        || orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE
+                        || crate::decoder::references_x18(orig_instr) {
+                        crate::loader::add_runtime_tpidr_patch_pub(orig_pc, orig_instr);
+                        (orig_pc as *mut u32).write(UDF_MARKER);
+                    }
+                    extern "C" { fn sys_icache_invalidate(s: *mut libc::c_void, n: usize); }
+                    sys_icache_invalidate(orig_pc as *mut _, 4);
+                    libc::mprotect(page as *mut _, 0x4000,
+                        libc::PROT_READ | libc::PROT_EXEC);
+                }
             }
             mctx.ss.pc = orig_pc;
             let handled = if orig_instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {

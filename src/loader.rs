@@ -32,6 +32,11 @@ fn add_tpidr_patch(pc: u64, instr: u32) {
         .push((pc, instr));
 }
 
+/// Public wrapper for the SIGBUS island-recovery path in trap.rs.
+pub fn add_runtime_tpidr_patch_pub(pc: u64, instr: u32) {
+    add_runtime_tpidr_patch(pc, instr);
+}
+
 fn add_runtime_tpidr_patch(pc: u64, instr: u32) {
     if let Ok(mut table) = TPIDR_PATCHES_RUNTIME.write() {
         // Insert in sorted order for binary search
