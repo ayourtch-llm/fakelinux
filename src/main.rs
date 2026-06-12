@@ -168,6 +168,20 @@ fn main() {
     if container_mode {
         pidns::init_container();
         eprintln!("fakelinux: container mode (--container), virtual PID 1");
+        // A container starts at /. If the host cwd is outside the rootfs the
+        // guest inherits a path that doesn't exist in its world (dpkg's
+        // "cannot stat initial working directory for /Users/..."). Host cwds
+        // INSIDE the rootfs are kept — getcwd strips the prefix for those.
+        if !rootfs.is_empty() {
+            let inside = std::env::current_dir()
+                .map(|d| d.starts_with(&rootfs))
+                .unwrap_or(false);
+            if !inside {
+                if let Err(e) = std::env::set_current_dir(&rootfs) {
+                    eprintln!("fakelinux: cannot chdir into rootfs: {}", e);
+                }
+            }
+        }
     } else if std::env::var("FAKELINUX_CONTAINER").is_ok() {
         let init_pid: i32 = std::env::var("FAKELINUX_INIT_PID")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
