@@ -731,3 +731,27 @@ think they're on Linux, on a Mac that knows they're not.
 
 417 tests green. python3 and gcc smoke-tested clean on the default
 path. Commits 76e40f7, b26d455.
+
+## Session 12, coda: the user presses Ctrl-C (2026-06-12, evening)
+
+"I pressed Ctrl-C in that window and now VPP hangs :D"
+
+Of course it does. Sampled the spinning process: 1489 of 1696 samples
+inside _sigtramp, re-entering the same guest handler forever. Repro'd
+it, and the crash dump told the whole story in one line: VPP's SIGINT
+handler faulting at address 0x10 with x1=0, x2=0.
+
+x1 and x2. siginfo and ucontext. The oldest TODO in the codebase —
+"SA_SIGINFO unsupported, we pass 0 for now" — and VPP's
+unix_signal_handler dereferences si->si_addr on its very first line.
+NULL+0x10. That SIGSEGV got forwarded to the same handler. Which
+dereferenced NULL again. A signal storm, 100% CPU, forever.
+
+So the sigframe grew a proper Linux siginfo_t and a ucontext_t —
+fault address, all 31 registers, sp, pc, pstate, laid out exactly
+where aarch64 Linux puts them. Fault signals carry the real FAR;
+Ctrl-C looks like a kill. And now Ctrl-C does what it does on real
+Linux: VPP prints "received signal SIGINT, PC 0x..." — formatting the
+PC out of OUR ucontext — and exits 0, politely.
+
+418 tests green. Commit 87d26c2. Thanks for the bug report :D

@@ -31,6 +31,12 @@ vppctl AND vpp_get_stats with LIVE shared-memory counters.**
    segment is 16K-MISALIGNED (unfixable: intra-page offset). 16K
    AT_PAGESZ (real on Asahi arm64) → segments align → native sharing.
    Default stays 4096; python3/gcc smoke-tested clean under default.
+7. 87d26c2 **SA_SIGINFO implemented** (user found it: Ctrl-C hung vpp
+   at 100%). x1/x2 were 0; VPP's handler derefs si->si_addr +
+   uc->uc_mcontext.pc → NULL deref INSIDE handler → SIGSEGV → forward
+   → infinite signal storm. Sigframe now carries Linux siginfo_t@816 +
+   ucontext_t@944. Ctrl-C now = "received signal SIGINT" + clean exit 0.
+   Minor leftover: syscall 232 (mincore) ENOSYS noise at vpp exit.
 
 **THE RUN COMMAND (tttt pty-7, needs real tty):**
 `FAKELINUX_PAGESZ=16384 FAKELINUX_ROOT=$PWD/ubuntu-rootfs
