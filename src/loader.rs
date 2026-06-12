@@ -741,11 +741,16 @@ fn read_file_raw(path: &[u8]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Atomically write a file with raw libc: write to <path>.tmp.<pid>, rename.
+/// Atomically write a file with raw libc: write to a unique temp, rename.
+/// Temp name includes pid AND a process-wide counter — two threads of one
+/// process writing the same cache key must not share a temp file (the
+/// interleaved writes would rename garbage over a good cache entry).
 fn write_file_raw_atomic(path: &[u8], data: &[u8]) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pid = unsafe { libc::getpid() };
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.to_vec();
-    tmp.extend_from_slice(format!(".tmp.{}", pid).as_bytes());
+    tmp.extend_from_slice(format!(".tmp.{}.{}", pid, seq).as_bytes());
     let (ctmp, cpath) = match (std::ffi::CString::new(tmp), std::ffi::CString::new(path)) {
         (Ok(t), Ok(p)) => (t, p),
         _ => return,

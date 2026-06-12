@@ -52,7 +52,6 @@ fn encode_ldr_unsigned(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     0xF940_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
 }
 
-/// Encode `STR Xt, [Xn, #imm]` unsigned offset (8-byte scaled).
 /// `STP Xt1, Xt2, [SP, #-32]!` (64-bit pre-index push).
 fn encode_stp_pre32(rt1: u32, rt2: u32) -> u32 {
     // imm7 = -32/8 = -4 → 0x7C
@@ -107,6 +106,7 @@ fn pick_scratch_pair(instr: u32) -> Option<(u32, u32)> {
     None
 }
 
+/// Encode `STR Xt, [Xn, #imm]` unsigned offset (8-byte scaled).
 fn encode_str_unsigned(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     debug_assert!(byte_offset % 8 == 0 && byte_offset / 8 < 4096);
     0xF900_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
@@ -135,6 +135,11 @@ struct CodeIsland {
     base: u64,
     capacity: usize,
     used: usize,
+    /// Per-slot (guest_orig_pc, orig_instr) — lets the SIGBUS recovery path
+    /// fall back to emulating the original instruction if a trampoline
+    /// becomes unexecutable (e.g. PROT_EXEC stripped by an overlapping
+    /// guest mprotect, or per-thread JIT write-mode anomalies).
+    meta: Vec<(u64, u32)>,
 }
 
 impl CodeIsland {
@@ -155,7 +160,35 @@ impl CodeIsland {
             16 * MB, -16 * MB, 32 * MB, -32 * MB, 48 * MB, -48 * MB,
             64 * MB, -64 * MB, 96 * MB, -96 * MB, 112 * MB, -112 * MB,
         ];
+        // ET_EXEC images are relocated to 0x700400000+ and brk grows above
+        // the image — both use MAP_FIXED at addresses computed by the
+        // loader/guest, NOT by the kernel. An island placed in a temporary
+        // hole there gets silently clobbered (zeroed) by a later fixed map:
+        // cc1's data PT_LOAD destroyed a live island → SIGBUS storms in gcc.
+        // For pcs in that territory, only use the arena BELOW 0x700000000,
+        // which the guest never fixed-maps.
+        const ET_EXEC_ZONE: u64 = 0x7_0000_0000;
         let sz = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if near_pc >= ET_EXEC_ZONE {
+            for &d in &DELTAS {
+                if d <= 0 { continue; }
+                let hint = (ET_EXEC_ZONE - d as u64) & !(PAGE_SIZE as u64 - 1);
+                if let Some(island) = Self::alloc_at_hint(sz, hint) {
+                    if island.base + (sz as u64) <= ET_EXEC_ZONE
+                        && encode_b(near_pc, island.base).is_some()
+                        && encode_b(near_pc, island.base + sz as u64 - 4).is_some() {
+                        return Some(island);
+                    }
+                    unsafe {
+                        libc::munmap((island.base - PAGE_SIZE as u64) as *mut _,
+                            island.capacity + 2 * PAGE_SIZE);
+                    }
+                }
+            }
+            // Out of B range of the arena — never place an island in
+            // MAP_FIXED territory; UDF emulation is slow but correct.
+            return None;
+        }
         for &d in &DELTAS {
             let hint = (near_pc as i64).saturating_add(d);
             if hint <= 0 { continue; }
@@ -166,26 +199,45 @@ impl CodeIsland {
                     && encode_b(near_pc, island.base + sz as u64 - 4).is_some() {
                     return Some(island);
                 }
-                unsafe { libc::munmap(island.base as *mut _, island.capacity); }
+                // unmap the whole region including the guard pages
+                unsafe {
+                    libc::munmap((island.base - PAGE_SIZE as u64) as *mut _,
+                        island.capacity + 2 * PAGE_SIZE);
+                }
             }
         }
         // Out-of-range island is still useful for OTHER (closer) call sites.
         Self::alloc_at_hint(sz, 0)
     }
 
+    /// Islands get a PROT_NONE guard page on each side: islands now live
+    /// NEAR guest mappings (alloc_near), and do_mprotect/do_mmap round
+    /// write-granting ranges OUTWARD to 16KB pages — without guards, a
+    /// guest mprotect on an adjacent region with an unaligned end bled one
+    /// page into the island, stripping PROT_EXEC → SIGBUS fetching a
+    /// trampoline (intact bytes, unexecutable page; hit ~1/1600 VPP
+    /// compiles). The rounding bleeds at most one page each side, so the
+    /// guards absorb it.
     fn alloc_at_hint(size: usize, hint: u64) -> Option<Self> {
         let sz = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let total = sz + 2 * PAGE_SIZE;
+        let hint = if hint == 0 { 0 } else { hint.saturating_sub(PAGE_SIZE as u64) };
         let ptr = unsafe {
             libc::mmap(
                 hint as *mut _,
-                sz,
+                total,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANON | 0x800, // 0x800 = MAP_JIT
                 -1, 0,
             )
         };
         if ptr == libc::MAP_FAILED { return None; }
-        Some(CodeIsland { base: ptr as u64, capacity: sz, used: 0 })
+        unsafe {
+            libc::mprotect(ptr, PAGE_SIZE, libc::PROT_NONE);
+            libc::mprotect((ptr as u64 + PAGE_SIZE as u64 + sz as u64) as *mut _,
+                PAGE_SIZE, libc::PROT_NONE);
+        }
+        Some(CodeIsland { base: ptr as u64 + PAGE_SIZE as u64, capacity: sz, used: 0, meta: Vec::new() })
     }
 
     fn flush_icache(&self) {
@@ -269,6 +321,7 @@ impl CodeIsland {
             pthread_jit_write_protect_np(1); // executable
         }
 
+        self.meta.push((orig_pc, orig_instr));
         self.used += size;
         Some(tramp_pc)
     }
@@ -316,6 +369,7 @@ impl CodeIsland {
             pthread_jit_write_protect_np(1);
         }
 
+        self.meta.push((orig_pc, orig_instr));
         self.used += size;
         Some(tramp_pc)
     }
@@ -497,6 +551,42 @@ pub fn flush_all_islands() {
     if t > 0 || f > 0 {
         eprintln!("fakelinux: x18 trampolines: {} ok, {} fallback to UDF", t, f);
     }
+}
+
+/// SIGBUS recovery: if `pc` is the FIRST instruction of a trampoline slot
+/// (off==0 → no trampoline side effects have executed yet), return the
+/// slot's (guest_orig_pc, orig_instr) so the fault handler can emulate the
+/// original instruction directly and continue at orig_pc+4. try_lock —
+/// safe from a crash handler.
+pub fn island_fault_recovery_info(pc: u64) -> Option<(u64, u32)> {
+    const TRAMP_SIZE: u64 = TRAMP_INSTRS as u64 * 4;
+    let islands = ISLANDS.try_lock().ok()?;
+    for island in islands.iter() {
+        if pc >= island.base && pc < island.base + island.used as u64 {
+            let delta = pc - island.base;
+            if delta % TRAMP_SIZE != 0 {
+                return None; // mid-trampoline — partial state, can't recover
+            }
+            let idx = (delta / TRAMP_SIZE) as usize;
+            return island.meta.get(idx).copied();
+        }
+    }
+    None
+}
+
+/// Diagnostic: does [addr, addr+len) intersect any island (incl. guards)?
+/// Returns (island_base, island_capacity). try_lock — safe anywhere.
+pub fn range_hits_island(addr: u64, len: u64) -> Option<(u64, u64)> {
+    let islands = ISLANDS.try_lock().ok()?;
+    let pg = PAGE_SIZE as u64;
+    for island in islands.iter() {
+        let lo = island.base - pg; // include guard pages
+        let hi = island.base + island.capacity as u64 + pg;
+        if addr < hi && addr + len > lo {
+            return Some((island.base, island.capacity as u64));
+        }
+    }
+    None
 }
 
 /// If `pc` lies inside a trampoline island, return
@@ -711,6 +801,21 @@ mod tests {
         assert_eq!(f(), 1, "w17(5) == w18(5) → eq");
         crate::trap::set_thread_x18(7);
         assert_eq!(f(), 0, "w17(5) != w18(7) → ne");
+    }
+
+    /// Slot metadata must map an island pc back to (orig_pc, orig_instr)
+    /// at slot boundaries (SIGBUS recovery), and refuse mid-slot pcs.
+    #[test]
+    fn island_recovery_info_maps_slots() {
+        crate::trap::init_x18_key();
+        let instr = 0xb9000243; // str w3, [x18]
+        let code = alloc_code_page(&[instr, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code, instr));
+        let b = unsafe { (code as *const u32).read() };
+        let imm = (((b & 0x03FF_FFFF) as i64) << 38) >> 38;
+        let tramp = code.wrapping_add((imm * 4) as u64);
+        assert_eq!(island_fault_recovery_info(tramp), Some((code, instr)));
+        assert_eq!(island_fault_recovery_info(tramp + 4), None, "mid-slot");
     }
 
     // ── TPIDR (TLS) trampolines ──────────────────────────────────────────

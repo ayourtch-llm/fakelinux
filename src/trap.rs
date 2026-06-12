@@ -2827,6 +2827,44 @@ unsafe extern "C" fn segv_fixup_handler(
     if try_lazy_exec_fixup(mctx) {
         return; // fixed — retry the faulting instruction
     }
+    // Island-fetch fault recovery: a trampoline page became unexecutable
+    // (PROT_EXEC stripped / per-thread JIT write mode). If the fault is at
+    // a slot boundary, no trampoline side effects have executed — emulate
+    // the original instruction (the UDF slow path) and continue after it.
+    if mctx.es.far == mctx.ss.pc {
+        if let Some((orig_pc, orig_instr)) =
+            crate::x18_trampoline::island_fault_recovery_info(mctx.ss.pc)
+        {
+            static RECOVERED: AtomicU64 = AtomicU64::new(0);
+            let n = RECOVERED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                let mut buf = [0u8; 200];
+                let m = raw_fmt(&mut buf, format_args!(
+                    "fakelinux: [{}] island fetch fault RECOVERED: island_pc={:#x} orig_pc={:#x} instr={:#010x}\n",
+                    libc::getpid(), mctx.ss.pc, orig_pc, orig_instr));
+                libc::write(2, buf.as_ptr() as *const _, m);
+            }
+            mctx.ss.pc = orig_pc;
+            let handled = if orig_instr & MSR_TPIDR_MASK == MSR_TPIDR_BASE {
+                let rn = (orig_instr & 0x1F) as usize;
+                set_thread_tpidr(read_gpr(&mctx.ss, rn));
+                true
+            } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
+                let rn = (orig_instr & 0x1F) as usize;
+                let val = get_thread_tpidr();
+                write_gpr(&mut mctx.ss, rn, val);
+                true
+            } else {
+                emulate_x18_instruction(orig_instr, mctx)
+            };
+            if handled {
+                if mctx.ss.pc == orig_pc {
+                    mctx.ss.pc = orig_pc + 4;
+                }
+                return;
+            }
+        }
+    }
     // Fixup failed — fall through to crash diagnostics
     crash_handler(sig, info, ctx);
 }
@@ -2912,10 +2950,28 @@ unsafe extern "C" fn crash_handler(
         let _ = mach_vm_read_overwrite(
             mach_task_self(), orig_pc.wrapping_sub(8), 16,
             around.as_mut_ptr() as u64, &mut out_size);
-        let mut buf3 = [0u8; 256];
+        // Query the ACTUAL protection of the faulting page: distinguishes a
+        // stripped-PROT_EXEC page (process-wide) from per-thread JIT write
+        // mode (page still shows rwx).
+        let (prot_cur, prot_max) = {
+            extern "C" {
+                fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64,
+                    flavor: i32, info: *mut i32, info_cnt: *mut u32, object: *mut u32) -> i32;
+            }
+            let mut addr = regs.pc;
+            let mut size = 0u64;
+            let mut info = [0i32; 19]; // VM_REGION_BASIC_INFO_64
+            let mut cnt = 9u32; // VM_REGION_BASIC_INFO_COUNT_64
+            let mut obj = 0u32;
+            let kr = mach_vm_region(mach_task_self(), &mut addr, &mut size,
+                9 /*VM_REGION_BASIC_INFO_64*/, info.as_mut_ptr(), &mut cnt, &mut obj);
+            if kr == 0 { (info[0], info[1]) } else { (-1, -1) }
+        };
+        let mut buf3 = [0u8; 320];
         let n3 = raw_fmt(&mut buf3, format_args!(
-            "  pc in trampoline island={:#x} idx={} off={} guest_orig_pc={:#x}\n  guest code around: {:#010x} {:#010x} [{:#010x}] {:#010x}\n",
-            island, idx, off, orig_pc, around[0], around[1], around[2], around[3]
+            "  pc in trampoline island={:#x} idx={} off={} guest_orig_pc={:#x} page_prot={}/{}\n  guest code around: {:#010x} {:#010x} [{:#010x}] {:#010x}\n",
+            island, idx, off, orig_pc, prot_cur, prot_max,
+            around[0], around[1], around[2], around[3]
         ));
         libc::write(2, buf3.as_ptr() as *const _, n3);
     }

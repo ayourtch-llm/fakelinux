@@ -2211,6 +2211,19 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     let has_exec = prot & 4 != 0; // PROT_EXEC
     let is_fixed = flags & 0x10 != 0; // MAP_FIXED
 
+    // DIAGNOSTIC: a MAP_FIXED mapping over a trampoline island silently
+    // destroys live trampolines (this zeroed cc1's island when its data
+    // PT_LOAD landed on one). Islands now avoid fixed territory; scream if
+    // it ever happens again.
+    if is_fixed && length > 0 {
+        if let Some((ib, ic)) = crate::x18_trampoline::range_hits_island(addr, length) {
+            let pid = unsafe { libc::getpid() };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] MAP_FIXED HITS ISLAND! addr={:#x} len={:#x} island={:#x}+{:#x}\n",
+                pid, addr, length, ib, ic));
+        }
+    }
+
     // Handle 4KB/16KB page size mismatch for MAP_FIXED mappings.
     // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
     // adjacent data if applied at 16KB granularity. Skip these.
@@ -2432,6 +2445,15 @@ fn do_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     };
 
     let aligned_len = aligned_end - aligned_addr;
+
+    // DIAGNOSTIC: a guest mprotect range overlapping a trampoline island
+    // would strip PROT_EXEC from live trampolines → SIGBUS on next fetch.
+    if let Some((ib, ic)) = crate::x18_trampoline::range_hits_island(aligned_addr, aligned_len) {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] MPROTECT HITS ISLAND! addr={:#x} len={:#x} prot={} island={:#x}+{:#x}\n",
+            pid, aligned_addr, aligned_len, prot, ib, ic));
+    }
 
     // When adding PROT_EXEC, scan and patch SVC/TPIDR instructions first.
     // The page must be writable to patch, so we need mprotect→RW, patch,
