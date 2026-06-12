@@ -24,9 +24,10 @@ fd table (pipe redirections, dup2'd fds) across exec.
 
 ## Medium Priority
 
-### SA_SIGINFO not supported
-x1 (siginfo_t*) and x2 (ucontext_t*) are set to 0. SA_SIGINFO handlers that
-dereference these will crash. Fix: build synthetic siginfo_t and ucontext_t.
+### ~~SA_SIGINFO not supported~~ FIXED (87d26c2)
+The rt_sigframe now carries a Linux siginfo_t (si_signo/si_code/si_addr) and
+a ucontext_t prefix (uc_mcontext: fault_address, regs, sp, pc, pstate);
+x1/x2 point at them. Was: VPP's SIGINT handler NULL-deref'd → signal storm.
 
 ### ~~SA_RESTART not implemented~~ FIXED
 SA_RESTART is now handled in signal delivery.
