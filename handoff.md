@@ -1,8 +1,46 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-12 ~01:00 (session 9, refresh #15). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~09:30 (session 10, refresh #16). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #15 STATUS — read this first (supersedes #14 below)
+## REFRESH #16 STATUS — read this first (supersedes #15 below)
+
+**ext-deps COMPLETE!** ext5b.log: PKG_RC=0 (xdp-tools built with fixed gcc —
+the fcf612a cc1 fix CONFIRMED in the real build), INSTALLDEB_RC=0
+(vpp-ext-deps 26.10-0 installed). DONE_RC=2 was a NEW, later failure:
+`make build` → `make install-dep` → apt installs VPP build deps → systemd
+package postinst aborted (dpkg error 134).
+
+**systemd postinst FIXED (1227b91) — five rootfs/syscall fixes, TDD'd:**
+- ROOT CAUSE: dirfd-relative ".." escaped the rootfs. systemd's
+  path_is_root_at() does statx(fd,".") vs statx(fd,"..") — ".." on the
+  guest-root fd escaped to the HOST parent → "fd is not root" → chase()
+  abort `Assertion 'path_is_absolute(p)'` in machine-id-setup/tmpfiles/
+  sysusers. Fix: rootfs::join_guest_relative (pure, tested) clamps ".."
+  at guest root; rebase_dotdot_at uses F_GETPATH + strip_root_prefix;
+  wired into openat/newfstatat/statx/faccessat.
+- O_PATH|O_NOFOLLOW on symlink → ELOOP on macOS; retry with O_SYMLINK
+  (fd to the link itself = Linux O_PATH semantics; tmpfiles re-opens
+  symlinks it creates this way).
+- readlinkat(fd, "") on O_PATH symlink fd → F_GETPATH + readlink.
+- /proc/self/fd/N readlink LEAKED THE HOST PATH → guest re-opened it,
+  got double-rooted ENOENT (broke sysusers' fsync of /etc/.#groupXXX).
+  Now strips rootfs prefix. (Generic fix — watch for other host-path
+  leak bugs of this shape!)
+- Linux OFD locks F_OFD_GETLK/SETLK/SETLKW 36/37/38 → macOS 92/90/91
+  (systemd take_etc_passwd_lock); capget/capset 90/91 = fake-root full
+  caps (setpriv "activate capabilities" during man-db triggers).
+- Verified: dpkg --configure systemd rc=0 in guest; cc1 -O3 min2.i OK;
+  python3 ssl OK; 389 tests green.
+
+**IN FLIGHT: resume #6 — install-dep + FULL VPP BUILD, detached (host PID
+94414):** script ubuntu-rootfs/tmp/resume-ext6.sh: dpkg --configure -a
+(DPKGFIX_RC=) → make install-dep (INSTALLDEP_RC=) → make build (DONE_RC=).
+Log: ubuntu-rootfs/tmp/ext6.log. Background watcher buievtptw exits on RC
+markers / ICE / assertion signatures. Started ~09:25. If cmake/ninja hit
+new emulation bugs: FAKELINUX_WATCH watchpoint + [sp..] crash dumps are
+the weapons (see #15).
+
+## REFRESH #15 STATUS (older)
 
 **cc1 ICE FIXED (fcf612a) — root cause was OURS, found + TDD'd + committed:**
 - insn_operand_data flags word for match_operator operands = u64

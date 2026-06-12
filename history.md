@@ -524,3 +524,46 @@ programs in the container. python3 still does its ssl/hashlib tricks.
 ext-deps build is resumed with -nc — stamps intact, xdp-tools
 rebuilding with a working compiler, full VPP `make build` chained
 after it. The monitor is watching for DONE_RC.
+
+## Session 10 (2026-06-12): the rootfs learns what "/" means
+
+The detached build from last night delivered a milestone wrapped in a
+failure. PKG_RC=0: xdp-tools compiled — the cc1 ICE fix held up in the
+real build, not just the minimized repro. INSTALLDEB_RC=0: vpp-ext-deps
+26.10 installed. Months of ext-deps grinding, done. But DONE_RC=2 — a
+brand-new failure, one stage later: `make build` runs `make install-dep`,
+apt pulls in VPP's build dependencies, and the systemd package's
+postinst aborted three tools in a row with the same cryptic line:
+`Assertion 'path_is_absolute(p)' failed at src/basic/chase.c:648`.
+
+Reading systemd's source revealed an elegant trap. To decide whether an
+fd points at "/", systemd compares statx(fd, ".") against
+statx(fd, "..") — at the real root, "." and ".." are the same inode.
+But fakelinux only translates *absolute* paths; a relative ".."
+resolved against a dirfd sails straight through to macOS. So ".." on
+the guest-root fd escaped to the HOST parent of ubuntu-rootfs,
+the inodes differed, systemd concluded "/" was not root, took a code
+path that returns relative paths, and the assert tripped. A chroot
+that doesn't clamp ".." at its root isn't a chroot — it took systemd's
+paranoia to expose it.
+
+The fix went in TDD-style: a pure join_guest_relative() that
+normalizes and clamps ".." at the guest root (tests first, red, then
+green), an F_GETPATH-based rebase for dirfd-relative paths wired into
+openat/newfstatat/statx/faccessat. Then the dominoes behind it, each a
+small fidelity gap: Linux open(O_PATH|O_NOFOLLOW) on a symlink means
+"give me the link itself" — macOS says ELOOP unless you ask with
+O_SYMLINK. readlinkat(fd, "") on such an fd reads the target — macOS
+needs F_GETPATH + readlink. /proc/self/fd/N readlink was leaking the
+HOST path into the guest, which then re-rooted it into a path that
+doesn't exist — sysusers died fsyncing /etc/.#groupXXXX through that
+loop. systemd locks /etc/passwd with OFD locks (F_OFD_SETLKW=38) —
+macOS has them too, just renumbered (91). And setpriv wanted
+capget/capset, which a fake root can answer with "you have all the
+capabilities, of course."
+
+Five fixes, one commit (1227b91), 389 tests green, and
+`dpkg --configure systemd` returned 0 inside the guest. The build
+resumed: dpkg --configure -a healed the wounded package database,
+make install-dep completed — and for the first time, `make build` is
+actually building VPP itself.
