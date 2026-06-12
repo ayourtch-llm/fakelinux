@@ -30,6 +30,9 @@ pub fn in_full_rootfs_mode() -> bool {
 pub fn init(root: &str, sysroot: &str) {
     if !root.is_empty() {
         let r = root.trim_end_matches('/');
+        // /dev/shm is re-rooted (see dev_passes_through) — make sure the
+        // backing directory exists so guest shm_open doesn't ENOENT.
+        let _ = std::fs::create_dir_all(format!("{}/dev/shm", r));
         let _ = ROOT.set(r.to_string());
     }
     if !sysroot.is_empty() {
@@ -43,6 +46,13 @@ pub fn init(root: &str, sysroot: &str) {
 ///
 /// When FAKELINUX_ROOT is set: all absolute paths except /proc, /dev, /tmp are translated.
 /// When only FAKELINUX_SYSROOT is set: only library/linker config paths are translated.
+/// True if a path stays native (macOS /dev). /dev/shm is the exception:
+/// macOS has no /dev/shm, and glibc shm_open needs it — those re-root.
+fn dev_passes_through(path: &[u8]) -> bool {
+    path.starts_with(b"/dev")
+        && !(path == b"/dev/shm" || path.starts_with(b"/dev/shm/"))
+}
+
 pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     // Only translate absolute paths
     if !path.starts_with(b"/") {
@@ -53,8 +63,10 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     if path.starts_with(b"/proc") {
         return None;
     }
-    // Don't translate /dev (macOS handles these)
-    if path.starts_with(b"/dev") {
+    // Don't translate /dev (macOS handles these) — EXCEPT /dev/shm, which
+    // macOS doesn't have: glibc shm_open opens /dev/shm/<name>, so those are
+    // re-rooted into the rootfs as regular files (MAP_SHARED works on them).
+    if dev_passes_through(path) {
         return None;
     }
     // For /tmp:
@@ -164,7 +176,7 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
                 // /proc and /dev always pass through (handled natively / virtually).
                 // /tmp passes through only in sysroot-only mode; in full rootfs mode
                 // it must be re-rooted so dpkg's /tmp staging stays inside the guest.
-                if target.starts_with(b"/proc") || target.starts_with(b"/dev") {
+                if target.starts_with(b"/proc") || dev_passes_through(target) {
                     return simple;
                 }
                 if target.starts_with(b"/tmp") && !in_full_rootfs_mode() {
@@ -206,7 +218,7 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
                         let target2 = &link_buf[..link_len2 as usize];
 
                         if target2.starts_with(b"/") {
-                            if target2.starts_with(b"/proc") || target2.starts_with(b"/dev") {
+                            if target2.starts_with(b"/proc") || dev_passes_through(target2) {
                                 return simple;
                             }
                             if target2.starts_with(b"/tmp") && !in_full_rootfs_mode() {
@@ -285,7 +297,7 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
     if !path.starts_with(b"/") {
         return None;
     }
-    if path.starts_with(b"/proc") || path.starts_with(b"/dev") {
+    if path.starts_with(b"/proc") || dev_passes_through(path) {
         return None;
     }
     if path.starts_with(b"/tmp") && !in_full_rootfs_mode() {
@@ -485,6 +497,21 @@ mod tests {
         assert!(translate_path(b"/proc/self/exe").is_none());
         assert!(translate_path(b"/dev/null").is_none());
         assert!(translate_path(b"/tmp/foo").is_none());
+    }
+
+    #[test]
+    fn test_dev_shm_is_not_passed_through() {
+        // glibc shm_open → open("/dev/shm/<name>"); macOS has no /dev/shm so
+        // it must be re-rooted into the rootfs (VPP's svm regions need this).
+        // Everything else under /dev stays native.
+        assert!(dev_passes_through(b"/dev"));
+        assert!(dev_passes_through(b"/dev/null"));
+        assert!(dev_passes_through(b"/dev/pts/0"));
+        assert!(dev_passes_through(b"/dev/shmx")); // not the shm dir
+        assert!(!dev_passes_through(b"/dev/shm"));
+        assert!(!dev_passes_through(b"/dev/shm/"));
+        assert!(!dev_passes_through(b"/dev/shm/global_vm"));
+        assert!(!dev_passes_through(b"/dev/shm/vpe-api"));
     }
 
     #[test]
