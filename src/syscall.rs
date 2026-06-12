@@ -2317,6 +2317,40 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
         }
     }
 
+    // ── File-backed MAP_SHARED: map natively when 16K-alignable ──────────
+    // The anon+pread emulation below gives each process a private SNAPSHOT:
+    // writes never reach the backing file, so multi-process shared memory is
+    // broken (vpp_get_stats received the stats-segment memfd via SCM_RIGHTS
+    // and read zeros — vpp's counter writes stayed in vpp's anon pages).
+    // Exec mappings stay on the anon+pread path: our code patching must
+    // never write through to the file. Unaligned addr/offset can't map
+    // natively (4K Linux vs 16K macOS pages) and falls through too.
+    let is_shared = flags & 0x1 != 0;
+    if fd >= 0 && flags & 0x20 == 0 && is_shared && !has_exec
+        && offset & (page - 1) == 0
+        && addr & (page - 1) == 0
+    {
+        let mut mac_flags = libc::MAP_SHARED;
+        if is_fixed {
+            mac_flags |= libc::MAP_FIXED;
+        }
+        let hint = if addr == 0 { std::ptr::null_mut() } else { addr as *mut _ };
+        let ret = unsafe {
+            libc::mmap(hint, length as usize, mac_prot, mac_flags, fd, offset as i64)
+        };
+        if ret != libc::MAP_FAILED {
+            if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
+                let pid = unsafe { libc::getpid() };
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] MMAP file SHARED native fd={} addr={:#x} len={:#x} prot={} off={:#x} → {:#x}\n",
+                    pid, fd, addr, length, prot, offset, ret as u64));
+            }
+            return ret as u64;
+        }
+        // Native shared mapping failed (e.g. fd not mmappable) — fall
+        // through to the snapshot emulation rather than erroring out.
+    }
+
     // ── File-backed mmap (fd >= 0): always map anonymous + pread ─────────
     // Never create file-backed pages. On macOS, mmap(fd) and mprotect on
     // file-backed pages from inside a signal handler causes an uninterruptible
@@ -3749,6 +3783,45 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn map_shared_file_writes_reach_the_file() {
+        // anon+pread emulation gives every process a private SNAPSHOT —
+        // vpp_get_stats received the stats memfd via SCM_RIGHTS and read
+        // zeros because vpp's writes never hit the backing file. File-backed
+        // MAP_SHARED must be a real shared mapping when 16K-alignable.
+        let path = std::ffi::CString::new("/tmp/fakelinux-test-shared").unwrap();
+        let fd = unsafe {
+            libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o600)
+        };
+        assert!(fd >= 0);
+        unsafe { libc::ftruncate(fd, 0x8000) };
+
+        // Two independent MAP_SHARED mappings of the same file must alias.
+        let a = do_mmap(0, 0x8000, 3, 0x1, fd, 0); // PROT_READ|WRITE, MAP_SHARED
+        assert!((a as i64) > 0, "mmap a failed: {}", a as i64);
+        let b = do_mmap(0, 0x8000, 3, 0x1, fd, 0);
+        assert!((b as i64) > 0, "mmap b failed: {}", b as i64);
+        assert_ne!(a, b);
+        unsafe {
+            *(a as *mut u64) = 0xfeedface_deadbeef;
+            assert_eq!(
+                *(b as *const u64),
+                0xfeedface_deadbeef,
+                "MAP_SHARED mappings do not alias — writes invisible to other mapping"
+            );
+        }
+        // And the write reaches the file itself (what a fresh process sees).
+        let mut buf = [0u8; 8];
+        assert_eq!(unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, 8, 0) }, 8);
+        assert_eq!(u64::from_le_bytes(buf), 0xfeedface_deadbeef);
+        unsafe {
+            libc::munmap(a as *mut _, 0x8000);
+            libc::munmap(b as *mut _, 0x8000);
+            libc::close(fd);
+            libc::unlink(path.as_ptr());
+        }
     }
 
     #[test]
