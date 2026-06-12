@@ -289,7 +289,20 @@ pub fn mac_to_linux(mac_sig: i32) -> i32 {
 // NEON/FP save area: 32 x 128-bit (16 bytes) = 512 bytes, starts at offset 296
 // Total = 296 + 512 = 808, rounded up to 816 for 16-byte alignment
 const NEON_SAVE_OFFSET: usize = 296;
-const RT_SIGFRAME_SIZE: usize = 816; // (296 + 512) rounded up to 16-byte alignment
+// SA_SIGINFO data appended after the restore area (sigreturn never reads it):
+//   offset 816:  Linux siginfo_t (128 bytes) — si_signo@0, si_errno@4,
+//                si_code@8, union@16 (si_addr / si_pid+si_uid)
+//   offset 944:  Linux aarch64 ucontext_t prefix (480 bytes):
+//                uc_flags@0, uc_link@8, uc_stack@16, uc_sigmask@40,
+//                uc_mcontext@176: fault_address@+0, regs[31]@+8, sp@+256,
+//                pc@+264, pstate@+272, then zeroed __reserved terminator
+//                (magic=0,size=0 = "no FP records").
+// Guest handlers receive x1/x2 pointing here (VPP's unix_signal_handler
+// dereferences si->si_addr and uc->uc_mcontext.pc unconditionally).
+const SIGINFO_OFFSET: usize = 816;
+const UCONTEXT_OFFSET: usize = 944;
+const UCONTEXT_MCONTEXT: usize = 176; // offsetof(ucontext_t, uc_mcontext) on aarch64
+const RT_SIGFRAME_SIZE: usize = UCONTEXT_OFFSET + 480;
 
 /// Build a Linux rt_sigframe on the guest stack and redirect execution to the
 /// guest signal handler. Called from signal_forwarder (macOS signal context).
@@ -303,6 +316,8 @@ pub unsafe fn build_sigframe_and_redirect(
     linux_sig: i32,
     handler: u64,
     handler_mask: u64,
+    fault_addr: u64,
+    si_code: i32,
 ) {
     let regs = &mut mctx.ss;
     let guest_sp = regs.sp;
@@ -354,6 +369,32 @@ pub unsafe fn build_sigframe_and_redirect(
         neon_dst.add(i).write_unaligned(mctx.ns.v[i]);
     }
 
+    // ---- SA_SIGINFO data: Linux siginfo_t + ucontext_t ----
+    // Guest handlers (VPP's unix_signal_handler) dereference these
+    // unconditionally; x1=x2=0 turned every forwarded signal into a NULL
+    // deref INSIDE the handler → SIGSEGV → forward → infinite signal storm.
+    let si = p.add(SIGINFO_OFFSET);
+    std::ptr::write_bytes(si, 0, 128);
+    (si as *mut i32).write_unaligned(linux_sig); // si_signo
+    (si.add(8) as *mut i32).write_unaligned(si_code); // si_code
+    (si.add(16) as *mut u64).write_unaligned(fault_addr); // si_addr (union)
+
+    let uc = p.add(UCONTEXT_OFFSET);
+    std::ptr::write_bytes(uc, 0, RT_SIGFRAME_SIZE - UCONTEXT_OFFSET);
+    (uc.add(40) as *mut u64).write_unaligned(old_sigmask); // uc_sigmask[0]
+    let mc = uc.add(UCONTEXT_MCONTEXT);
+    (mc as *mut u64).write_unaligned(fault_addr); // fault_address
+    for i in 0..29usize {
+        let val = if i == 18 { crate::trap::get_thread_x18() } else { regs.x[i] };
+        (mc.add(8 + i * 8) as *mut u64).write_unaligned(val); // regs[0..28]
+    }
+    (mc.add(8 + 29 * 8) as *mut u64).write_unaligned(regs.fp); // regs[29]
+    (mc.add(8 + 30 * 8) as *mut u64).write_unaligned(regs.lr); // regs[30]
+    (mc.add(256) as *mut u64).write_unaligned(regs.sp);
+    (mc.add(264) as *mut u64).write_unaligned(regs.pc);
+    (mc.add(272) as *mut u64).write_unaligned(regs.cpsr as u64); // pstate
+    // __reserved stays zeroed: {magic=0,size=0} terminator = no FP records.
+
     // Block signals in handler_mask | (1 << linux_sig) during handler execution
     // Linux kernel convention: bit (sig-1) represents signal sig
     let block_mask = handler_mask | (1u64 << (linux_sig - 1) as u64);
@@ -367,10 +408,8 @@ pub unsafe fn build_sigframe_and_redirect(
     regs.pc = handler;
     regs.x[0] = linux_sig as u64;        // x0 = signal number
     regs.lr = trampoline_addr;            // LR points to executable sigreturn trampoline
-    // x1 and x2 would be siginfo_t* and ucontext_t* for SA_SIGINFO handlers,
-    // but we pass 0 for now (simple signal handler ABI).
-    regs.x[1] = 0;
-    regs.x[2] = 0;
+    regs.x[1] = frame_addr + SIGINFO_OFFSET as u64; // siginfo_t*
+    regs.x[2] = frame_addr + UCONTEXT_OFFSET as u64; // ucontext_t*
 }
 
 /// Restore guest state from an rt_sigframe on the stack. Called during rt_sigreturn.
@@ -561,7 +600,15 @@ unsafe extern "C" fn signal_forwarder(
         }
     }
 
-    build_sigframe_and_redirect(mctx, linux_sig, handler, handler_mask);
+    // siginfo content: fault signals carry the fault address + a fault code;
+    // everything else looks like SI_USER (kill).
+    let (fault_addr, si_code) = match sig {
+        libc::SIGSEGV => (mctx.es.far, 1),          // SEGV_MAPERR
+        libc::SIGBUS => (mctx.es.far, 2),           // BUS_ADRERR
+        libc::SIGILL | libc::SIGFPE | libc::SIGTRAP => (mctx.ss.pc, 1),
+        _ => (0, 0),                                 // SI_USER
+    };
+    build_sigframe_and_redirect(mctx, linux_sig, handler, handler_mask, fault_addr, si_code);
 }
 
 // ---- Guest syscall handlers ----
@@ -679,7 +726,8 @@ pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
             let (handler, handler_mask) = (sa.handler, sa.mask);
 
             if handler != SIG_DFL && handler != SIG_IGN {
-                build_sigframe_and_redirect(mctx, sig, handler, handler_mask);
+                // Async (queued) signals: SI_USER shape, no fault address.
+                build_sigframe_and_redirect(mctx, sig, handler, handler_mask, 0, 0);
             }
             break; // deliver one at a time
         }
@@ -918,6 +966,43 @@ fn install_forwarder(mac_sig: i32, handler: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigframe_passes_siginfo_and_ucontext() {
+        // VPP's unix_signal_handler is SA_SIGINFO and dereferences
+        // si->si_addr (siginfo offset 16) and uc->uc_mcontext.pc (ucontext
+        // offset 440). Passing x1=x2=0 made the handler itself SIGSEGV on
+        // Ctrl-C, which forwarded again → infinite signal storm at 100% CPU.
+        crate::trap::init_tpidr_key();
+        crate::trap::init_x18_key();
+        let mut mctx: crate::trap::MContext64 = unsafe { std::mem::zeroed() };
+        let stack = vec![0u8; 16384];
+        let top = (stack.as_ptr() as u64 + 16384) & !0xF;
+        mctx.ss.sp = top;
+        mctx.ss.pc = 0x12345678;
+        mctx.ss.lr = 0x9abc;
+        mctx.ss.x[5] = 0x55;
+        unsafe { build_sigframe_and_redirect(&mut mctx, 2, 0x4000, 0, 0xdead_f00d, 0x80) };
+        assert_eq!(mctx.ss.x[0], 2, "x0 = signum");
+        let si = mctx.ss.x[1];
+        let uc = mctx.ss.x[2];
+        assert!(si > mctx.ss.sp && si < top, "x1 must point into the sigframe");
+        assert!(uc > mctx.ss.sp && uc < top, "x2 must point into the sigframe");
+        unsafe {
+            assert_eq!(*(si as *const i32), 2, "si_signo");
+            assert_eq!(*((si + 8) as *const i32), 0x80, "si_code");
+            assert_eq!(*((si + 16) as *const u64), 0xdead_f00d, "si_addr");
+            assert_eq!(*((uc + 176) as *const u64), 0xdead_f00d, "uc_mcontext.fault_address");
+            assert_eq!(*((uc + 184 + 5 * 8) as *const u64), 0x55, "uc_mcontext.regs[5]");
+            assert_eq!(*((uc + 184 + 30 * 8) as *const u64), 0x9abc, "regs[30]=lr");
+            assert_eq!(*((uc + 432) as *const u64), top, "uc_mcontext.sp");
+            assert_eq!(*((uc + 440) as *const u64), 0x12345678, "uc_mcontext.pc");
+        }
+        // sigreturn still works: frame layout below the new fields unchanged.
+        assert!(unsafe { do_rt_sigreturn(&mut mctx) }, "sigreturn restores");
+        assert_eq!(mctx.ss.pc, 0x12345678);
+        assert_eq!(mctx.ss.sp, top);
+    }
 
     #[test]
     fn sigtimedwait_pick_lowest_in_set() {

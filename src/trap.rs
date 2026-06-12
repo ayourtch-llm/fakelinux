@@ -2505,7 +2505,9 @@ unsafe extern "C" fn trap_handler(
         if sa.handler != 0 && sa.handler != 1 {
             // Guest has a SIGILL handler — let signal_forwarder handle it
             IN_TRAP.store(false, Ordering::SeqCst);
-            crate::signal::build_sigframe_and_redirect(mctx, linux_sig as i32, sa.handler, sa.mask);
+            // SIGILL: si_addr = faulting pc, si_code = ILL_ILLOPC.
+            crate::signal::build_sigframe_and_redirect(
+                mctx, linux_sig as i32, sa.handler, sa.mask, mctx.ss.pc, 1);
             return;
         }
         let mut buf = [0u8; 80];
