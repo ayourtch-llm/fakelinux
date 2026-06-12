@@ -640,3 +640,94 @@ which macOS happily maps. Plus a do_mmap branch that assumed
 Three fixes, three failing tests written first, 406 green. vpp now
 sails through svm init and stops at /run/vpp/stats.sock — an AF_UNIX
 socket away from a CLI prompt.
+
+## Session 12: the prompt appears (2026-06-12, afternoon)
+
+"An AF_UNIX socket away from a CLI prompt" — turns out it was four
+bugs away, each one yielding to the next like nesting dolls.
+
+The socket itself first. VPP's stats.sock is SOCK_SEQPACKET, which
+macOS flatly refuses for AF_UNIX. But VPP only uses it to hand one fd
+per connection across — SOCK_STREAM is a faithful stand-in. Then
+SO_PASSCRED (no macOS equivalent; VPP hard-fails if it errors — now a
+no-op success). Then the realization that bind("/run/vpp/stats.sock")
+had been landing on the HOST filesystem all along — sun_path was never
+rootfs-translated. And finally the deep one: Linux and macOS disagree
+on the cmsg header layout (16 bytes/8-aligned vs 12/4-aligned, and
+SOL_SOCKET is 1 vs 0xffff) — our raw passthrough meant SCM_RIGHTS fd
+passing had NEVER actually worked. A socketpair test now pushes a real
+fd through the real kernel in Linux clothing.
+
+Relaunched: no socket error... and a SIGSEGV in vlib_file_poll,
+deterministic, a wild pointer into the brk zone. Symbolized it,
+read the source: the pointer comes from epoll event.data, which holds
+a pool index. And there it was, a one-line comment in the kernel
+headers we'd never needed before: struct epoll_event is packed ONLY
+on x86_64. On aarch64 it's 16 bytes with data at offset 8. Our 12-byte
+writes had been feeding every aarch64 epoll user garbage data and a
+wrong stride — everything before VPP just happened to survive it.
+
+Relaunch again and — the banner. The fish. DBGvpp#. A real VPP CLI
+prompt inside a Linux userland inside macOS. show version answers:
+"vpp v26.10-rc0 built by root on fakelinux."
+
+But ping said "unknown input" — zero plugins loaded, and the plugin
+path on screen was a HOST path. /proc/self/exe was leaking it: we
+stripped the rootfs prefix before absolutizing, and a relative launch
+path slips through that order. Strip after absolutizing; plugins load.
+
+Then ping aborted vpp outright: the "NUMA noise" syscalls weren't
+noise. getcpu's ENOSYS left vm->numa_node as stack garbage, and the
+buffer-pool assert caught it on the first packet. getcpu now reports
+cpu 0 / node 0 like the virtual sysfs says. After that: ping runs the
+whole graph and the packets die in ip4-local as "spoofed
+local-address" — which is VPP working CORRECTLY (self-ping protection).
+
+The closer: vppctl show version from a SECOND process, over cli.sock,
+through the seqpacket-as-stream socket — answered. Cross-process VPP
+control plane on macOS.
+
+Still open: vpp_get_stats receives the memfd via SCM_RIGHTS (that part
+works now!) but reads zeros — file-backed mmap is anon+pread with no
+writeback, so the server's writes never reach the file. The fix wants
+a dedicated mmap thread (file-backed mmap deadlocks in signal
+context). That's tomorrow's doll.
+
+415 tests green. Four commits: a24e921, 664763a, 406cd18, 4362c31.
+
+## Session 12, part two: live counters (2026-06-12, late afternoon)
+
+vpp_get_stats was the last holdout — it connected, it received the
+memfd over SCM_RIGHTS (newly possible!), it mapped it... and read
+zeros. Because our file-backed mmap was always a private snapshot:
+anon pages plus one pread. The server's counter writes never touched
+the backing file. Shared memory that doesn't share.
+
+First half of the fix: map file-backed MAP_SHARED natively when the
+alignment allows. The client immediately started mapping for real. But
+the server still snapshotted — the trace showed VPP demanding
+MAP_FIXED at 0x10b8c5000. Aligned to 4K. Misaligned to 16K. And that's
+checkmate for any mapping trick: you cannot put file offset zero at an
+address whose low 14 bits aren't zero when the hardware page is 16K.
+
+The misalignment wasn't random. clib_mem_vm_reserve takes a 16K-aligned
+region from mmap and returns base + one "system page" — a 4K guard —
+so every VPP shared segment lands exactly 4K past alignment, every
+time, by design. The system page size comes from sysconf, which comes
+from glibc, which comes from AT_PAGESZ... which comes from us.
+
+So: FAKELINUX_PAGESZ=16384. Tell the guest the truth, more or less —
+16K pages are perfectly real on Linux arm64, every Asahi user runs
+them. VPP dutifully computed 16K-aligned segments, the native shared
+mapping clicked into place on both sides, and:
+
+    $ vpp_get_stats dump /sys/heartbeat
+    3.00 /sys/heartbeat
+    ... six seconds later ...
+    6.00 /sys/heartbeat
+
+A heartbeat. Shared memory, beating, between two Linux processes that
+think they're on Linux, on a Mac that knows they're not.
+
+417 tests green. python3 and gcc smoke-tested clean on the default
+path. Commits 76e40f7, b26d455.

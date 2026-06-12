@@ -1,8 +1,62 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-12 ~14:45 (session 11, refresh #18). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~16:30 (session 12, refresh #19). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #18 STATUS — read this first (supersedes #17 below)
+## REFRESH #19 STATUS — read this first (supersedes #18 below)
+
+**🎉🎉 VPP RUNS. Banner + DBGvpp# CLI + plugins + ping + CROSS-PROCESS
+vppctl AND vpp_get_stats with LIVE shared-memory counters.**
+417 tests green. Six commits on `testing` (a24e921 → b26d455):
+
+1. a24e921 **AF_UNIX server support**: SEQPACKET→STREAM (macOS has no
+   unix seqpacket; VPP passes 1 fd/conn via SCM_RIGHTS — stream is
+   enough), SO_PASSCRED no-op success, sun_path rootfs rebase in
+   bind/connect/sendmsg, and **cmsg Linux↔macOS rebuild** in
+   sendmsg/recvmsg (hdr 16B/8-align vs 12B/4-align, SOL_SOCKET 1 vs
+   0xffff) — SCM_RIGHTS fd passing NEVER worked before this.
+2. 664763a **epoll_event is NOT packed on aarch64**: 16 bytes, data@8
+   (packed-12 is x86_64-only). Garbage event.data = wild pool pointer
+   in vlib_file_poll. Every epoll guest was affected.
+3. 406cd18 **/proc/self/exe host-path leak** when launch path is
+   relative (strip rootfs prefix AFTER absolutizing) — fixed
+   zero-plugins-loaded + clib_elf_parse_file ENOENT.
+4. 4362c31 **NUMA syscalls 168/236/237/239**: getcpu is LOAD-BEARING —
+   vm->numa_node garbage tripped VLIB_BUFFER_MAX_NUMA_NODES assert on
+   first buffer alloc (ping → abort). Now cpu 0 / node 0.
+5. 76e40f7 **native MAP_SHARED** for file-backed maps when 16K-aligned
+   + non-exec (else snapshot emulation as before). No signal-context
+   deadlock observed for plain data maps; exec stays anon+pread.
+6. b26d455 **FAKELINUX_PAGESZ=16384**: clib_mem_vm_reserve returns
+   base+sys_page_sz (guard page) → with 4K AT_PAGESZ every VPP shared
+   segment is 16K-MISALIGNED (unfixable: intra-page offset). 16K
+   AT_PAGESZ (real on Asahi arm64) → segments align → native sharing.
+   Default stays 4096; python3/gcc smoke-tested clean under default.
+
+**THE RUN COMMAND (tttt pty-7, needs real tty):**
+`FAKELINUX_PAGESZ=16384 FAKELINUX_ROOT=$PWD/ubuntu-rootfs
+./target/release/fakelinux --container
+ubuntu-rootfs/root/vpp/build-root/install-vpp_debug-native/vpp/bin/vpp
+'unix { nodaemon interactive cli-listen /run/vpp/cli.sock } plugins {
+plugin dpdk_plugin.so { disable } }'`
+Then from host shell (same env minus PAGESZ ok): vppctl <cmd>,
+vpp_get_stats ls|dump. Verified live: /sys/heartbeat advances across
+separate client runs. `scripts/vpp-clean.sh` between runs.
+
+**Verified in-CLI:** show version, create loopback, set int state/ip,
+ping (3 sent → ip4-local "spoofed local-address" drop = CORRECT VPP
+self-ping behavior), show errors, show plugins (all load).
+
+**NEXT IDEAS (north star reached — these are gravy):**
+- vpp api segment clients: vat/papi (api.sock + vpe-api shm — same
+  machinery now in place, may just work; test `vpp_api_test`).
+- Interfaces with real traffic: af_packet/tap need /dev/net/tun +
+  AF_PACKET — likely new emulation territory. Or memif between two
+  vpp instances (pure shm+unix-socket = everything now works!).
+- make test (VPP's python test framework) — ambitious.
+- Side quests queued: Rust in container, Claude Code in container.
+- Residual island fetch-fault mystery (#18), FAKELINUX_QUIET wishlist.
+
+## REFRESH #18 STATUS (older)
 
 **VPP RUN PROGRESS — 3 startup blockers fixed (all TDD'd, 406 tests green,
 committed on `testing`: 1282f7f sysfs, + /dev/shm commit, + mmap/VA commit):**
