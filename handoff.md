@@ -1,8 +1,43 @@
 # Handoff — start here next session
 
-_Last update: 2026-06-12 ~09:30 (session 10, refresh #16). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
+_Last update: 2026-06-12 ~13:20 (session 11, refresh #17). Narrative in `history.md` (keep appending for the user!), full story in `docs/diary.md`._
 
-## REFRESH #16 STATUS — read this first (supersedes #15 below)
+## REFRESH #17 STATUS — read this first (supersedes #16 below)
+
+**🎉 VPP BUILD COMPLETE — DONE_RC=0 (2026-06-12 ~13:10, ext8.log).**
+`make build` finished: vpp + all plugins/drivers/crypto engines built,
+linked AND installed to build-root/install-vpp_debug-native/vpp/.
+THE NORTH STAR (clone + build VPP inside fakelinux) IS REACHED.
+
+**PERF OVERHAUL this session (~100x compile speedup, 50s → 0.47s/file):**
+commits 019846b (patch-site cache), c07574b (TLS trampolines + dynamic
+scratch regs + near-code islands), 56785d7 + 0a44381 + 3c12485 (island
+placement fixes + SIGBUS recovery). See memory project_perf_session.md.
+KEY RULES LEARNED:
+- Islands must NEVER be placed in guest MAP_FIXED territory: zones
+  0x500000000 (PIE+brk), 0x600000000 (interp), 0x700000000 (ET_EXEC)
+  → alloc only BELOW the zone base (x18_trampoline.rs alloc_near).
+- Patch-site cache: /tmp/fakelinux-patch-cache-<uid>/, keyed
+  dev/ino/mtime/size+offset/len; validates before applying; atomic
+  tmp+rename; FAKELINUX_NO_PATCH_CACHE to disable.
+- FAKELINUX_TRAP_STATS=1 = trap histogram dumped at exit (new tool).
+- RESIDUAL mystery (non-fatal, self-healing): rare island fetch faults
+  with prot=7 (rwx!) on first TLS touch in some processes — per-thread
+  JIT write-mode + fork COW probed and EXCLUDED (see /tmp/jitforktest).
+  Recovery path emulates + rewrites site to UDF; ~40 lines per build.
+  Suspect: icache/COW staleness on first fetch. Investigate someday.
+
+**NEXT: `make run` / running vpp.** First smoke test
+(`vpp "unix { nodaemon } plugins { plugin dpdk_plugin.so { disable } }"`)
+shows vpp STARTS, inits, allocates main heap; issues found:
+1. unimplemented syscall 236 (get_mempolicy) + 168 (getcpu) — NUMA.
+2. clib_elf_parse_file gets HOST path for /proc/self/exe-ish lookup →
+   double-rooted ENOENT (known host-path-leak bug shape — fix like the
+   /proc/self/fd/N readlink strip in 1227b91).
+3. HUGE MMAP len=0x400002000 (16GB main heap) — watch it.
+vpp survived 60s+ without crashing. x18 fallbacks now ~0-18 per proc.
+
+## REFRESH #16 STATUS (older)
 
 **ext-deps COMPLETE!** ext5b.log: PKG_RC=0 (xdp-tools built with fixed gcc —
 the fcf612a cc1 fix CONFIRMED in the real build), INSTALLDEB_RC=0
