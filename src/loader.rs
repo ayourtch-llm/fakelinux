@@ -1216,6 +1216,25 @@ fn reserve_va_top_page() -> bool {
     true
 }
 
+/// Page size reported to the guest via AT_PAGESZ (→ glibc sysconf
+/// _SC_PAGESIZE). Default 4096 — what Ubuntu arm64 userland expects.
+/// FAKELINUX_PAGESZ=16384 makes guests compute 16K-aligned addresses
+/// (16K pages are real on Linux arm64 — Asahi — so glibc handles it).
+/// Why: VPP's clib_mem_vm_reserve returns base + sys_page_sz (a guard
+/// page), so with a 4K guest page size every shared segment lands
+/// 16K-MISALIGNED and can never be a native MAP_SHARED on 16K-page
+/// macOS — multi-process stats/svm clients then read snapshots.
+pub fn guest_page_size() -> u64 {
+    parse_guest_pagesz(std::env::var("FAKELINUX_PAGESZ").ok().as_deref())
+}
+
+fn parse_guest_pagesz(v: Option<&str>) -> u64 {
+    match v.and_then(|v| v.parse::<u64>().ok()) {
+        Some(sz) if sz.is_power_of_two() && (4096..=65536).contains(&sz) => sz,
+        _ => 4096,
+    }
+}
+
 fn setup_stack(
     elf: &Elf,
     base_offset: u64,
@@ -1326,7 +1345,7 @@ fn setup_stack(
         (AT_PHDR, phdr_addr),
         (AT_PHENT, elf.header.e_phentsize as u64),
         (AT_PHNUM, elf.header.e_phnum as u64),
-        (AT_PAGESZ, 4096),
+        (AT_PAGESZ, guest_page_size()),
         (AT_ENTRY, base_offset + elf.header.e_entry),
         (AT_UID, unsafe { libc::getuid() as u64 }),
         (AT_EUID, unsafe { libc::geteuid() as u64 }),
@@ -2157,6 +2176,18 @@ mod tests {
     use std::ffi::CString;
 
     fn c(s: &[u8]) -> CString { CString::new(s).unwrap() }
+
+    #[test]
+    fn guest_pagesz_parses_and_clamps() {
+        assert_eq!(parse_guest_pagesz(None), 4096);
+        assert_eq!(parse_guest_pagesz(Some("16384")), 16384);
+        assert_eq!(parse_guest_pagesz(Some("4096")), 4096);
+        // Rejected: not a power of two, out of range, garbage.
+        assert_eq!(parse_guest_pagesz(Some("12345")), 4096);
+        assert_eq!(parse_guest_pagesz(Some("2048")), 4096);
+        assert_eq!(parse_guest_pagesz(Some("131072")), 4096);
+        assert_eq!(parse_guest_pagesz(Some("banana")), 4096);
+    }
 
     // ── VA-top reservation (VA-bits detection by guests) ─────────────────
 
