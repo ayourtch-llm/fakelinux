@@ -427,6 +427,7 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/stat" => Some(generate_proc_stat()),
         "/proc/loadavg" => Some(generate_loadavg()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
+        _ if path.starts_with("/sys/") => sysfs_content(path, host_ncpus()),
         _ => {
             // Check if this is /proc/<vpid>/stat or /proc/<vpid>/status for
             // another process in the container
@@ -543,7 +544,11 @@ pub fn snapshot_maps() -> Vec<u8> {
 fn generate_maps() -> Vec<u8> {
     with(|pfs| {
         let mut out = String::new();
-        for m in &pfs.mappings {
+        // Real /proc/self/maps is sorted by address; guests rely on it (VPP's
+        // VA-bits sniffer takes the END of the LAST line).
+        let mut sorted: Vec<&MemMapping> = pfs.mappings.iter().collect();
+        sorted.sort_by_key(|m| m.start);
+        for m in sorted {
             let r = if m.prot & libc::PROT_READ != 0 { 'r' } else { '-' };
             let w = if m.prot & libc::PROT_WRITE != 0 { 'w' } else { '-' };
             let x = if m.prot & libc::PROT_EXEC != 0 { 'x' } else { '-' };
@@ -611,22 +616,55 @@ fn generate_cmdline() -> Vec<u8> {
     })
 }
 
-fn generate_cpuinfo() -> Vec<u8> {
-    let ncpus = {
-        let mut n: libc::c_int = 1;
-        let mut len = std::mem::size_of::<libc::c_int>();
-        let name = b"hw.ncpu\0";
-        unsafe {
-            libc::sysctlbyname(
-                name.as_ptr() as *const i8,
-                &mut n as *mut _ as *mut _,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            );
-        }
-        n.max(1) as u32
+fn host_ncpus() -> u32 {
+    let mut n: libc::c_int = 1;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let name = b"hw.ncpu\0";
+    unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut n as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+    n.max(1) as u32
+}
+
+/// Virtual sysfs CPU/NUMA topology: one node (node0) holding all host cpus.
+/// VPP's vlib_thread_init reads these via clib_sysfs_read_bitmap at startup;
+/// without them it sees 0 online cpus and dies with "skip-core value greater
+/// or equal to available cpus". Pure function of (path, ncpus) for testing.
+fn sysfs_content(path: &str, ncpus: u32) -> Option<Vec<u8>> {
+    let cpu_range = || {
+        if ncpus == 1 { b"0\n".to_vec() } else { format!("0-{}\n", ncpus - 1).into_bytes() }
     };
+    match path {
+        "/sys/devices/system/cpu/online"
+        | "/sys/devices/system/cpu/possible"
+        | "/sys/devices/system/cpu/present" => Some(cpu_range()),
+        "/sys/devices/system/node/online"
+        | "/sys/devices/system/node/has_memory"
+        | "/sys/devices/system/node/has_cpu" => Some(b"0\n".to_vec()),
+        "/sys/devices/system/node/node0/cpulist" => Some(cpu_range()),
+        _ => {
+            // /sys/devices/system/cpu/cpu<N>/topology/{core_id,physical_package_id}
+            let rest = path.strip_prefix("/sys/devices/system/cpu/cpu")?;
+            let slash = rest.find('/')?;
+            let cpu: u32 = rest[..slash].parse().ok()?;
+            if cpu >= ncpus { return None; }
+            match &rest[slash..] {
+                "/topology/core_id" => Some(format!("{}\n", cpu).into_bytes()),
+                "/topology/physical_package_id" => Some(b"0\n".to_vec()),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn generate_cpuinfo() -> Vec<u8> {
+    let ncpus = host_ncpus();
 
     let mut out = String::new();
     for i in 0..ncpus {
@@ -1110,6 +1148,46 @@ mod tests {
     fn loadavg_format_matches_linux() {
         let s = format_loadavg([1.5, 0.75, 0.25], 12, 4242);
         assert_eq!(s, "1.50 0.75 0.25 1/12 4242\n");
+    }
+
+    #[test]
+    fn sysfs_cpu_topology_serves_vpp_startup_files() {
+        // VPP's vlib_thread_init reads /sys/devices/system/cpu/online via
+        // clib_sysfs_read_bitmap; an empty bitmap → 0 cpus → fatal
+        // "skip-core value greater or equal to available cpus".
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/online", 10),
+                   Some(b"0-9\n".to_vec()));
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/possible", 10),
+                   Some(b"0-9\n".to_vec()));
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/present", 10),
+                   Some(b"0-9\n".to_vec()));
+        // Single-cpu range has no dash
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/online", 1),
+                   Some(b"0\n".to_vec()));
+        // Fake single NUMA node 0 holding all cpus
+        assert_eq!(sysfs_content("/sys/devices/system/node/online", 10),
+                   Some(b"0\n".to_vec()));
+        assert_eq!(sysfs_content("/sys/devices/system/node/has_memory", 10),
+                   Some(b"0\n".to_vec()));
+        assert_eq!(sysfs_content("/sys/devices/system/node/node0/cpulist", 10),
+                   Some(b"0-9\n".to_vec()));
+        // Per-cpu topology: core_id = cpu index, all on package 0
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/cpu3/topology/core_id", 10),
+                   Some(b"3\n".to_vec()));
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/cpu3/topology/physical_package_id", 10),
+                   Some(b"0\n".to_vec()));
+        // Out-of-range cpu and unknown paths are not served
+        assert_eq!(sysfs_content("/sys/devices/system/cpu/cpu10/topology/core_id", 10), None);
+        assert_eq!(sysfs_content("/sys/devices/system/node/node1/cpulist", 10), None);
+        assert_eq!(sysfs_content("/sys/kernel/mm/whatever", 10), None);
+    }
+
+    #[test]
+    fn generate_content_serves_sysfs_cpu_online() {
+        // End-to-end through the virtual-file dispatcher (host ncpus >= 1)
+        let c = generate_content("/sys/devices/system/cpu/online").expect("served");
+        let s = String::from_utf8(c).unwrap();
+        assert!(s == "0\n" || (s.starts_with("0-") && s.ends_with('\n')), "{s}");
     }
 
     #[test]
