@@ -160,21 +160,25 @@ impl CodeIsland {
             16 * MB, -16 * MB, 32 * MB, -32 * MB, 48 * MB, -48 * MB,
             64 * MB, -64 * MB, 96 * MB, -96 * MB, 112 * MB, -112 * MB,
         ];
-        // ET_EXEC images are relocated to 0x700400000+ and brk grows above
-        // the image — both use MAP_FIXED at addresses computed by the
-        // loader/guest, NOT by the kernel. An island placed in a temporary
-        // hole there gets silently clobbered (zeroed) by a later fixed map:
-        // cc1's data PT_LOAD destroyed a live island → SIGBUS storms in gcc.
-        // For pcs in that territory, only use the arena BELOW 0x700000000,
+        // Guest-fixed territory: addresses there are computed by the
+        // loader/guest and written with MAP_FIXED — an island placed in a
+        // temporary hole gets silently clobbered (zeroed) later:
+        //  - 0x500000000+: PIE main binary, and brk grows up from image end
+        //    (clobbered binutils-ld islands → permanent emulation storm);
+        //  - 0x600000000+: interpreter (ld-linux) zone;
+        //  - 0x700000000+: relocated ET_EXEC images + their brk
+        //    (cc1's data PT_LOAD zeroed a live island → gcc SIGBUS).
+        // For pcs in any such zone, only use the arena BELOW the zone base,
         // which the guest never fixed-maps.
-        const ET_EXEC_ZONE: u64 = 0x7_0000_0000;
         let sz = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        if near_pc >= ET_EXEC_ZONE {
+        let zone_base = [0x7_0000_0000u64, 0x6_0000_0000, 0x5_0000_0000]
+            .iter().copied().find(|&z| near_pc >= z);
+        if let Some(ceiling) = zone_base {
             for &d in &DELTAS {
                 if d <= 0 { continue; }
-                let hint = (ET_EXEC_ZONE - d as u64) & !(PAGE_SIZE as u64 - 1);
+                let hint = (ceiling - d as u64) & !(PAGE_SIZE as u64 - 1);
                 if let Some(island) = Self::alloc_at_hint(sz, hint) {
-                    if island.base + (sz as u64) <= ET_EXEC_ZONE
+                    if island.base + (sz as u64) <= ceiling
                         && encode_b(near_pc, island.base).is_some()
                         && encode_b(near_pc, island.base + sz as u64 - 4).is_some() {
                         return Some(island);
