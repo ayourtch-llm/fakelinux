@@ -805,6 +805,7 @@ fn do_close(fd: i32) -> u64 {
     epoll::on_close(fd);
     procfs::on_close(fd);
     if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
+    clear_fd_seals(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -1313,6 +1314,24 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
         if linux_cmd == translate::LINUX_F_DUPFD_CLOEXEC {
             let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32) };
             return if ret < 0 { translate::linux_errno() } else { ret as u64 };
+        }
+        // memfd seals (F_ADD_SEALS=1033 / F_GET_SEALS=1034): our memfds are
+        // unlinked temp files, so seals can't be enforced — track them per
+        // fd and report them back. VPP's stats segment aborts startup if
+        // F_ADD_SEALS(F_SEAL_SHRINK) fails (clib_mem_vm_create_fd).
+        const LINUX_F_ADD_SEALS: i32 = 1033;
+        const LINUX_F_GET_SEALS: i32 = 1034;
+        if linux_cmd == LINUX_F_ADD_SEALS {
+            if fd >= 0 && (fd as usize) < FD_SEALS.len() {
+                FD_SEALS[fd as usize].fetch_or(arg as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+            return 0;
+        }
+        if linux_cmd == LINUX_F_GET_SEALS {
+            if fd >= 0 && (fd as usize) < FD_SEALS.len() {
+                return FD_SEALS[fd as usize].load(std::sync::atomic::Ordering::Relaxed) as u64;
+            }
+            return 0;
         }
         return (-22_i64) as u64; // -EINVAL
     }
@@ -2174,6 +2193,23 @@ fn do_brk(addr: u64) -> u64 {
     addr
 }
 
+/// Make [pg_start, pg_start+len) readable+writable, creating anonymous pages
+/// where the range isn't mapped yet. mprotect on macOS fails with ENOMEM if
+/// ANY page in the range is unmapped — fall back to mmap MAP_FIXED then.
+/// (The anon MAP_FIXED would zero pre-existing content, so try mprotect
+/// first to preserve the already-mapped common case.)
+fn ensure_pages_writable(pg_start: u64, len: u64) -> bool {
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    if unsafe { libc::mprotect(pg_start as *mut _, len as usize, rw) } == 0 {
+        return true;
+    }
+    let ret = unsafe {
+        libc::mmap(pg_start as *mut _, len as usize, rw,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
+    };
+    ret != libc::MAP_FAILED
+}
+
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
     // Diagnostic: a length near the ET_EXEC relocation offset (0x700000000)
     // means someone computed size = relocated_ptr - unrelocated_ptr. Catch
@@ -2238,24 +2274,27 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
             // Ensure the containing pages are writable, zero the memory.
             let pg_start = addr & !(page - 1);
             let pg_end = (addr + length + page - 1) & !(page - 1);
+            if !ensure_pages_writable(pg_start, pg_end - pg_start) {
+                return translate::linux_errno();
+            }
             unsafe {
-                libc::mprotect(pg_start as *mut _, (pg_end - pg_start) as usize,
-                    libc::PROT_READ | libc::PROT_WRITE);
                 std::ptr::write_bytes(addr as *mut u8, 0, length as usize);
             }
             return addr;
         }
         // File-backed MAP_FIXED at sub-page address: we can't use mmap.
-        // The address space is already mapped (anonymous — we never create
-        // file-backed pages). Make the containing pages writable, pread
-        // the data, then patch if executable. All safe in signal context
-        // because pages are anonymous.
+        // Usually the address space is already mapped (anonymous — we never
+        // create file-backed pages), but a guest may also MAP_FIXED into
+        // FRESH territory at 4K alignment (VPP's svm regions use a
+        // 4K-randomized baseva) — then the containing pages must be created
+        // first or the pread silently fails and the guest SIGBUSes later.
+        // Make the containing pages writable, pread the data, then patch if
+        // executable. Safe in signal context because pages are anonymous.
         if fd >= 0 {
             let pg_start = addr & !(page - 1);
             let pg_end = (addr + length + page - 1) & !(page - 1);
-            unsafe {
-                libc::mprotect(pg_start as *mut _, (pg_end - pg_start) as usize,
-                    libc::PROT_READ | libc::PROT_WRITE);
+            if !ensure_pages_writable(pg_start, pg_end - pg_start) {
+                return translate::linux_errno();
             }
             let read_len = file_read_len(fd, offset, length);
             if read_len > 0 {
@@ -3504,6 +3543,17 @@ fn do_renameat2(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags:
     }
 }
 
+/// Per-fd memfd seal bits (F_ADD_SEALS/F_GET_SEALS bookkeeping only — no
+/// enforcement). Cleared when the fd is closed.
+static FD_SEALS: [std::sync::atomic::AtomicU32; 4096] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 4096];
+
+pub(crate) fn clear_fd_seals(fd: i32) {
+    if fd >= 0 && (fd as usize) < FD_SEALS.len() {
+        FD_SEALS[fd as usize].store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn do_memfd_create(name: u64, flags: u32) -> u64 {
     // macOS doesn't have memfd_create. Emulate with a temp file, unlinked immediately.
     // shm_open doesn't auto-extend on write, so use a real tmpfile instead.
@@ -3652,6 +3702,42 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    // ── file-backed MAP_FIXED at 4K-aligned (not 16K) fresh address ──────
+
+    /// VPP's svm maps its shared region MAP_FIXED at a 4K-randomized baseva
+    /// (e.g. 0x1ffff8006000) that is NOT 16K-aligned and NOT previously
+    /// mapped. The sub-page branch used to assume the containing pages
+    /// already existed — mprotect failed silently, pread hit unmapped
+    /// memory, do_mmap "succeeded", and the guest SIGBUSed on first store.
+    #[test]
+    fn file_map_fixed_subpage_fresh_address() {
+        // Fresh, never-mapped, 4K-but-not-16K-aligned address — same shape
+        // as VPP's 47-bit baseva 0x1ffff8006000 (must be OUTSIDE the macOS
+        // dead zone [0xfc0000000, 0x7000000000), which nobody can map).
+        let addr: u64 = 0x1fff_f800_2000;
+        let mut content = vec![0u8; 0x8000];
+        for (i, b) in content.iter_mut().enumerate() { *b = (i % 251) as u8; }
+        let mut tmp: Vec<u8> = b"/tmp/fakelinux-mapfixed-test-XXXXXX\0".to_vec();
+        let fd = unsafe { libc::mkstemp(tmp.as_mut_ptr() as *mut i8) };
+        assert!(fd >= 0);
+        unsafe {
+            libc::unlink(tmp.as_ptr() as *const i8);
+            assert_eq!(libc::write(fd, content.as_ptr() as *const _, content.len()),
+                       content.len() as isize);
+        }
+        // MAP_SHARED|MAP_FIXED, PROT_READ|WRITE — like svm_map_region
+        let ret = do_mmap(addr, content.len() as u64, 0x3, 0x11, fd, 0);
+        assert_eq!(ret, addr, "do_mmap failed: {:#x}", ret);
+        let got = unsafe { std::slice::from_raw_parts(addr as *const u8, content.len()) };
+        assert_eq!(got, &content[..], "file content must be readable at addr");
+        // First store must not SIGBUS
+        unsafe { std::ptr::write_volatile(addr as *mut u8, 0xAB); }
+        unsafe {
+            libc::munmap((addr & !16383) as *mut _, 0x10000);
+            libc::close(fd);
+        }
     }
 
     // ── pty master termios ioctls (Linux semantics) ──────────────────────

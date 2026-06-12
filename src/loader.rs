@@ -1183,6 +1183,39 @@ fn extract_code_ranges_via_phdrs(data: &[u8], base_addr: u64, len: u64) -> Vec<(
     code_ranges
 }
 
+/// Reserve one PROT_NONE page at the top of macOS's usable user VA and
+/// publish it in /proc/self/maps. Guests sniff their VA-space size from the
+/// highest maps entry (VPP's svm_get_global_region_base_va) and then MAP_FIXED
+/// at 2^(bits-2). macOS cannot map [0xfc0000000, 0x7000000000), so the 39 bits
+/// implied by our 0x7ff0000000 guest stack yields an unmappable baseva; the
+/// reservation ends at 2^47 → 47 bits → baseva 0x200000000000, which works.
+fn reserve_va_top_page() -> bool {
+    // Highest MAP_FIXED-able page on macOS arm64 (probed; just under 2^47).
+    // end-1 = 0x7ffffdffffff still has 47 significant bits.
+    const VA_TOP_PAGE: u64 = 0x7FFF_FDFF_C000;
+    const PAGE: u64 = 16384;
+    let ret = unsafe {
+        libc::mmap(VA_TOP_PAGE as *mut _, PAGE as usize, libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
+    };
+    if ret == libc::MAP_FAILED {
+        return false;
+    }
+    // Idempotent registration (re-exec re-inits procfs, but tests call twice)
+    let already = procfs::with(|pfs| pfs.mappings.iter().any(|m| m.start == VA_TOP_PAGE));
+    if !already {
+        procfs::add_mapping(procfs::MemMapping {
+            start: VA_TOP_PAGE,
+            end: VA_TOP_PAGE + PAGE,
+            prot: libc::PROT_NONE,
+            flags: libc::MAP_PRIVATE,
+            offset: 0,
+            name: String::new(),
+        });
+    }
+    true
+}
+
 fn setup_stack(
     elf: &Elf,
     base_offset: u64,
@@ -1211,6 +1244,9 @@ fn setup_stack(
     if stack_base == libc::MAP_FAILED {
         return Err(ElfError("failed to allocate guest stack".into()));
     }
+
+    // VA-top marker so guests detect a usable VA-space size (see fn docs)
+    reserve_va_top_page();
 
     // Record stack mapping
     procfs::add_mapping(procfs::MemMapping {
@@ -2121,6 +2157,36 @@ mod tests {
     use std::ffi::CString;
 
     fn c(s: &[u8]) -> CString { CString::new(s).unwrap() }
+
+    // ── VA-top reservation (VA-bits detection by guests) ─────────────────
+
+    #[test]
+    fn va_top_reservation_maps_and_registers() {
+        // VPP (svm_get_global_region_base_va) derives the VA size from the
+        // highest end address in /proc/self/maps and MAP_FIXEDs its shared
+        // region at 2^(bits-2). Without a high entry it derives 39 bits →
+        // baseva 0x1ff8000000, inside the macOS dead zone [0xfc0000000,
+        // 0x7000000000) → ENOMEM. The reservation makes the top entry end at
+        // 2^47 → 47 bits → baseva 0x200000000000, which macOS CAN map.
+        crate::procfs::init("/test/exe");
+        assert!(reserve_va_top_page());
+        assert!(reserve_va_top_page()); // idempotent
+        let maps = String::from_utf8(crate::procfs::snapshot_maps()).unwrap();
+        assert!(maps.contains("7ffffdffc000-7ffffe000000"), "{maps}");
+        // Maps are sorted, so the reservation must be the LAST line — VPP's
+        // parser takes the end address of the last line, not the max.
+        let last = maps.lines().last().unwrap();
+        assert!(last.starts_with("7ffffdffc000-7ffffe000000"), "{last}");
+        // And the baseva VPP will derive from it must be host-mappable.
+        let baseva = 0x2000_0000_0000_u64; // 2^(47-2)
+        let p = unsafe {
+            libc::mmap(baseva as *mut _, 0x400_0000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
+        };
+        assert_ne!(p, libc::MAP_FAILED, "baseva 2^45 must be mappable");
+        unsafe { libc::munmap(p, 0x400_0000) };
+    }
 
     // ── patch-site cache (encode/parse/filename) ────────────────────────
 
