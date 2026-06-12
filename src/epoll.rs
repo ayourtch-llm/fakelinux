@@ -69,12 +69,14 @@ pub fn do_epoll_create1(flags: i32) -> u64 {
 
 /// epoll_ctl(epfd, op, fd, event_ptr) → 0 or -errno
 pub fn do_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> u64 {
-    // Read the packed Linux epoll_event: u32 events + u64 data (12 bytes, packed)
+    // Read the Linux epoll_event. struct epoll_event is packed (12 bytes,
+    // data at offset 4) ONLY on x86_64; on aarch64 it has natural alignment:
+    // { u32 events; u64 data; } = 16 bytes, data at offset 8.
     let (events, data) = if event_ptr != 0 {
         unsafe {
             let ptr = event_ptr as *const u8;
             let ev = (ptr as *const u32).read_unaligned();
-            let d = (ptr.add(4) as *const u64).read_unaligned();
+            let d = (ptr.add(8) as *const u64).read_unaligned();
             (ev, d)
         }
     } else {
@@ -232,12 +234,13 @@ pub fn do_epoll_pwait(
             epoll_events |= EPOLLERR;
         }
 
-        // Write packed Linux epoll_event: u32 events + u64 data (12 bytes)
-        let offset = count as usize * 12;
+        // Write the Linux aarch64 epoll_event: { u32 events; u64 data; },
+        // 16 bytes with data at offset 8 (packed 12-byte layout is x86_64-only).
+        let offset = count as usize * 16;
         unsafe {
             let ptr = out.add(offset);
             (ptr as *mut u32).write_unaligned(epoll_events);
-            (ptr.add(4) as *mut u64).write_unaligned(user_data);
+            (ptr.add(8) as *mut u64).write_unaligned(user_data);
         }
         count += 1;
     }
@@ -349,5 +352,58 @@ fn remove_kevents(kq: i32, fd: i32, events: u32) {
                 std::ptr::null(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoll_event_uses_aarch64_layout() {
+        // Linux struct epoll_event is __attribute__((packed)) ONLY on x86_64.
+        // On aarch64 it has natural alignment: { u32 events; u64 data; } =
+        // 16 bytes, data at offset 8. Using the packed 12-byte layout fed
+        // VPP's vlib_file_poll garbage pool indices via event.data → wild
+        // pointer SIGSEGV in the brk zone.
+        let ep = do_epoll_create1(0) as i32;
+        assert!(ep >= 0);
+        let mut p1 = [0i32; 2];
+        let mut p2 = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(p1.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(p2.as_mut_ptr()) }, 0);
+
+        // Register both read ends with magic u64 data at aarch64 offset 8.
+        for (rfd, magic) in [(p1[0], 0xdead_beef_cafe_f00du64), (p2[0], 0x1122_3344_5566_7788u64)] {
+            let mut ev = [0u8; 16];
+            ev[0..4].copy_from_slice(&EPOLLIN.to_le_bytes());
+            ev[8..16].copy_from_slice(&magic.to_le_bytes());
+            assert_eq!(do_epoll_ctl(ep, EPOLL_CTL_ADD, rfd, ev.as_ptr() as u64), 0);
+        }
+        // Make both readable.
+        assert_eq!(unsafe { libc::write(p1[1], b"a".as_ptr() as *const _, 1) }, 1);
+        assert_eq!(unsafe { libc::write(p2[1], b"b".as_ptr() as *const _, 1) }, 1);
+
+        // Poison the output buffer to catch stale bytes at wrong offsets.
+        let mut out = [0xAAu8; 32];
+        let n = do_epoll_pwait(ep, out.as_mut_ptr() as u64, 2, 1000, 0);
+        assert_eq!(n, 2, "expected both fds ready, got {}", n as i64);
+
+        let mut datas = Vec::new();
+        for i in 0..2 {
+            let base = i * 16; // 16-byte stride on aarch64
+            let events = u32::from_le_bytes(out[base..base + 4].try_into().unwrap());
+            assert!(events & EPOLLIN != 0, "entry {} missing EPOLLIN: {:#x}", i, events);
+            datas.push(u64::from_le_bytes(out[base + 8..base + 16].try_into().unwrap()));
+        }
+        datas.sort();
+        assert_eq!(datas, vec![0x1122_3344_5566_7788, 0xdead_beef_cafe_f00d]);
+
+        unsafe {
+            libc::close(p1[0]); libc::close(p1[1]);
+            libc::close(p2[0]); libc::close(p2[1]);
+            libc::close(ep);
+        }
+        on_close(ep);
     }
 }
