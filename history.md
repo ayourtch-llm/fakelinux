@@ -567,3 +567,47 @@ Five fixes, one commit (1227b91), 389 tests green, and
 resumed: dpkg --configure -a healed the wounded package database,
 make install-dep completed — and for the first time, `make build` is
 actually building VPP itself.
+
+## Session 11 (2026-06-12 afternoon): the 100x day — and VPP builds
+
+The user asked a simple question while the build ground along at six
+hours of ETA: "want to profile it and see where the slowness comes
+from?" One `sample` later, the answer was embarrassing in the best way:
+93% of every clang's CPU was spent in patch_new_code — fakelinux was
+re-scanning libLLVM's ~30 million instructions on every single process
+spawn, thousands of times per build. The emulation we'd always blamed
+was fourteen samples out of four thousand.
+
+Three commits followed, each peeling an order of magnitude:
+
+1. **Patch-site cache** (019846b): scan once per file identity, cache
+   the offsets in /tmp, re-apply with validation. 24.6s → 0.86s of user
+   CPU per compile, outputs bit-identical.
+2. **Trampoline coverage** (c07574b): the new FAKELINUX_TRAP_STATS tool
+   counted 1.08M SIGILL traps per compile — 658k x18 fallbacks (islands
+   out of B-range; scratch-reg conflicts) and 422k TLS accesses. Dynamic
+   scratch-register selection, islands allocated near the code they
+   serve, and TPIDR trampolines (TLS reads become three island
+   instructions, no signal at all) took both to ~zero.
+3. **The hard bug** (56785d7, 0a44381): the deploy broke the build —
+   1-in-1600 compiles died with SIGBUS inside a trampoline. The
+   diagnostics-first approach paid off: islands placed "near code" were
+   landing in holes inside guest MAP_FIXED territory (ET_EXEC images,
+   brk growth), and the guest's own loader was zeroing them. gcc broke
+   deterministically — which made it the perfect reproducer. Islands
+   now stay strictly below the guest's fixed zones, carry per-slot
+   recovery metadata, and a SIGBUS in an island degrades to emulation
+   instead of death.
+
+One VPP compile: 50 seconds in the morning, 0.47 seconds by lunch.
+
+Then the watcher fired: **DONE_RC=0**. The remaining ~1500 ninja
+targets — compiles, links, the works — finished in eight minutes. VPP,
+all of it, plugins and drivers and crypto engines, built and installed
+inside a Linux that is actually a Rust program lying to it on macOS.
+
+The first `vpp "unix { nodaemon }"` smoke test starts, initializes,
+maps its 16GB main heap, and keeps running. It wants get_mempolicy and
+getcpu, and clib_elf_parse_file trips over a leaked host path — next
+session's shopping list. The north star is no longer a star; it's a
+binary that runs.
