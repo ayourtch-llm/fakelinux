@@ -38,9 +38,14 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
 
 # VPP's build pulls in Linux kernel headers (linux-libc-dev) whose filenames
-# collide under macOS's default case-insensitive APFS, so the rootfs lives on a
-# case-sensitive volume (roots-cs/) that this script sets up automatically.
-ROOTFS="${ROOTFS:-roots-cs/ubuntu}"
+# collide under macOS's default case-insensitive APFS. We use fakelinux's
+# case-fold support (FAKELINUX_CASEFOLD) so they coexist on the normal roots/
+# volume — no case-sensitive disk image needed.
+#
+# (Point ROOTFS at roots-cs/<name> instead to use a dedicated case-sensitive
+# APFS volume, which this script will then create automatically.)
+ROOTFS="${ROOTFS:-roots/ubuntu}"
+export FAKELINUX_CASEFOLD=1
 VPP_REPO="${VPP_REPO:-https://github.com/FDio/vpp.git}"
 VPP_REF="${VPP_REF:-master}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
@@ -61,13 +66,18 @@ guest() {
 ensure_prereqs() {
   [ -x "$FAKELINUX_BIN" ] || { note "building fakelinux..."; cargo build --release; }
 
-  # Ensure the volume that holds ROOTFS is case-sensitive (required for kernel
-  # headers). If ROOTFS sits under a dedicated dir (e.g. roots-cs/), set up a
-  # case-sensitive APFS image there; if it's already case-sensitive, this no-ops.
-  local roots_dir vol_mount
-  roots_dir="$(dirname "$ROOTFS")"          # e.g. roots-cs
-  vol_mount="$REPO_DIR/$roots_dir"
-  scripts/make-case-sensitive-volume.sh "$vol_mount"
+  local roots_dir
+  roots_dir="$(dirname "$ROOTFS")"          # e.g. roots or roots-cs
+
+  # Case-only-colliding kernel headers are handled by FAKELINUX_CASEFOLD on the
+  # normal volume. Only set up a dedicated case-sensitive APFS image when the
+  # user explicitly puts ROOTFS under roots-cs/.
+  if [ "$(basename "$roots_dir")" = "roots-cs" ]; then
+    note "using a case-sensitive volume for $roots_dir"
+    scripts/make-case-sensitive-volume.sh "$REPO_DIR/$roots_dir"
+  else
+    note "using FAKELINUX_CASEFOLD on $roots_dir (no case-sensitive volume)"
+  fi
 
   if [ ! -d "$ROOTFS/usr/bin" ]; then
     note "no rootfs at $ROOTFS — fetching ubuntu:24.04..."

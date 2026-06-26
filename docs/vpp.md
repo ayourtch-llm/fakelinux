@@ -9,17 +9,18 @@ hugepage-style shared memory, epoll, AF_UNIX, netlink, and more.
 ## TL;DR
 
 ```sh
-scripts/build-vpp.sh        # set up rootfs + case-sensitive volume, build, then run
+scripts/build-vpp.sh        # set up rootfs, build, then verify it runs
 ```
 
 That single command:
 
 1. builds `fakelinux` (release) if needed;
-2. creates a **case-sensitive** APFS volume at `roots-cs/` (see below) and pulls
-   `ubuntu:24.04` into `roots-cs/ubuntu`;
+2. pulls `ubuntu:24.04` into `roots/ubuntu` and runs the build with
+   `FAKELINUX_CASEFOLD=1` so case-only-colliding filenames work on macOS's normal
+   case-insensitive volume — **no disk image needed** (see below);
 3. inside the guest: `apt-get` installs the toolchain, clones VPP, runs
    `make install-dep` and `make build`;
-4. launches the resulting `vpp` binary on its interactive CLI.
+4. smoke-tests the resulting `vpp` binary (boots it and checks it responds).
 
 Steps can also be run individually:
 
@@ -56,39 +57,47 @@ loop0 (up):
 This also exercises fakelinux's AF_UNIX cross-process support (the two processes
 share the guest's `/run/vpp/cli.sock`).
 
-## Why a case-sensitive volume?
+## The case-sensitivity problem (and how it's solved)
 
-macOS's default APFS is **case-insensitive**. The Linux kernel headers shipped by
-`linux-libc-dev` (a transitive dependency of `build-essential`) include files
-whose names differ only in case — e.g. `netfilter/xt_CONNMARK.h` vs
-`netfilter/xt_connmark.h`. On a case-insensitive filesystem these collide and
-`dpkg` fails to unpack the package:
+macOS's default APFS is **case-insensitive**. Several Linux packages ship files
+or directories whose names differ only in case, which then collapse onto one
+host entry. `linux-libc-dev` (pulled in by `build-essential`) has the kernel
+headers `netfilter/xt_CONNMARK.h` vs `xt_connmark.h` (and `xt_DSCP`/`xt_dscp`,
+`xt_MARK`/`xt_mark`, …); `perl` ships both `pod/` and `Pod/`, `sys/` and `Sys/`.
+On a case-insensitive filesystem `dpkg` fails to unpack them:
 
 ```
 unable to install new version of '/usr/include/linux/netfilter/xt_connmark.h'
 ```
 
-So any guest tree that installs kernel headers must live on a case-sensitive
-filesystem. `build-vpp.sh` handles this automatically via:
+**`build-vpp.sh` solves this with `FAKELINUX_CASEFOLD=1`** (set automatically). In
+case-fold mode fakelinux stores the second of two case-fold siblings under a
+sentinel-prefixed, case-injective host name and decodes it on `readdir`, so both
+coexist on the normal `roots/` volume — **no disk image required**. For example
+the headers above end up on disk as:
 
-```sh
-scripts/make-case-sensitive-volume.sh roots-cs
+```
+xt_CONNMARK.h               (verbatim)
+~~NAMECASE~~xt_connmark.h   (encoded sibling — decoded back on readdir)
 ```
 
-which creates a case-sensitive APFS **sparse** disk image (nominal 40 GB, but it
-only consumes the space actually used) and mounts it at `roots-cs/`. It is
-idempotent and a no-op if the target is already case-sensitive. To detach it
-later: `hdiutil detach roots-cs`.
+This applies to every path component, so colliding *directories* (perl's
+`pod`/`Pod`) work too. See `FAKELINUX_CASEFOLD` in the top-level README.
 
-> Simple guests that don't install kernel headers (e.g. Alpine, or just running
-> a prebuilt binary) work fine on the normal case-insensitive `roots/` — the
-> case-sensitive volume is only needed for from-source builds like this one.
+### Alternative: a case-sensitive volume
 
-**Alternative (no volume):** set `FAKELINUX_CASEFOLD=1` to let case-only-colliding
-filenames coexist on a normal case-insensitive volume — fakelinux stores the
-second sibling under a sentinel-encoded name (`~~NAMECASE~~…`) and decodes it on
-readdir. This avoids the disk image entirely. `build-vpp.sh` uses the
-case-sensitive volume by default (well-tested); the casefold path is newer.
+If you'd rather use a real case-sensitive filesystem, point `ROOTFS` under
+`roots-cs/` and `build-vpp.sh` will create one for you:
+
+```sh
+ROOTFS=roots-cs/ubuntu scripts/build-vpp.sh
+# uses scripts/make-case-sensitive-volume.sh to mount a case-sensitive APFS
+# sparse image (nominal 40 GB, only uses what's needed) at roots-cs/.
+# Detach later with: hdiutil detach roots-cs
+```
+
+> Simple guests that don't install case-colliding files (e.g. Alpine, or just
+> running a prebuilt binary) need neither — the normal `roots/` is fine.
 
 ## What the build needs (and how fakelinux provides it)
 
@@ -111,9 +120,9 @@ scripts/run-vpp.sh            # interactive VPP CLI
 which is equivalent to running the binary directly:
 
 ```sh
-FAKELINUX_ROOT=roots-cs/ubuntu FAKELINUX_PAGESZ=16384 \
+FAKELINUX_ROOT=roots/ubuntu FAKELINUX_PAGESZ=16384 \
   ./target/release/fakelinux --container \
-  roots-cs/ubuntu/root/vpp/build-root/install-vpp_debug-native/vpp/bin/vpp \
+  roots/ubuntu/root/vpp/build-root/install-vpp_debug-native/vpp/bin/vpp \
   'unix { nodaemon interactive cli-listen /run/vpp/cli.sock } plugins { plugin dpdk_plugin.so { disable } }'
 ```
 
