@@ -158,7 +158,7 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
     let mut interp_entry: u64 = 0;
 
     if let Some(interp_path) = get_interp(elf, data) {
-        eprintln!("fakelinux: interpreter: {}", interp_path);
+        crate::vlog!("fakelinux: interpreter: {}", interp_path);
 
         // Look for the interpreter in order: FAKELINUX_ROOT, sysroot, bare path
         let root = crate::rootfs::get_root();
@@ -198,7 +198,7 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         load_segments(&interp_elf, &interp_data, interp_base, &mut _interp_brk, &mut _interp_phdr, "ld-linux")?;
 
         interp_entry = interp_base + interp_elf.header.e_entry;
-        eprintln!("fakelinux: interpreter loaded at {:#x}, entry={:#x}", interp_base, interp_entry);
+        crate::vlog!("fakelinux: interpreter loaded at {:#x}, entry={:#x}", interp_base, interp_entry);
     }
 
     // Create fork and patch trampoline pages after the last segment
@@ -281,7 +281,7 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         base_offset + elf.header.e_entry
     };
 
-    eprintln!("fakelinux: entry={:#x} sp={:#x} brk={:#x}", entry, stack_ptr, brk_start);
+    crate::vlog!("fakelinux: entry={:#x} sp={:#x} brk={:#x}", entry, stack_ptr, brk_start);
 
     Ok(LoadedElf {
         entry,
@@ -615,13 +615,13 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
     }
     crate::x18_trampoline::flush_all_islands();
     if svc_patched > 0 {
-        eprintln!("fakelinux: patched {} SVC→UDF instructions", svc_patched);
+        crate::vlog!("fakelinux: patched {} SVC→UDF instructions", svc_patched);
     }
     if tpidr_patched > 0 {
-        eprintln!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
+        crate::vlog!("fakelinux: patched {} MSR/MRS tpidr_el0 instructions", tpidr_patched);
     }
     if x18_patched > 0 {
-        eprintln!("fakelinux: patched {} x18 instructions", x18_patched);
+        crate::vlog!("fakelinux: patched {} x18 instructions", x18_patched);
     }
 }
 
@@ -847,7 +847,7 @@ fn try_patch_from_cache(start: u64, len: u64, fd: i32, offset: u64) -> bool {
     }
     crate::x18_trampoline::flush_all_islands();
     if !sites.is_empty() {
-        eprintln!("fakelinux: runtime patch at {:#x}+{:#x}: {} sites (cached)",
+        crate::vlog!("fakelinux: runtime patch at {:#x}+{:#x}: {} sites (cached)",
             start, len, sites.len());
     }
     true
@@ -1516,7 +1516,7 @@ fn fixup_exec_pointers_skip_dynamic(elf: &Elf, base_offset: u64) {
         }
     }
     if fixed > 0 || skipped_rela > 0 {
-        eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data ({} skipped, RELA-covered)",
+        crate::vlog!("fakelinux: fixed up {} absolute pointers in ET_EXEC data ({} skipped, RELA-covered)",
                   fixed, skipped_rela);
     }
 }
@@ -1772,7 +1772,7 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
         exclusions.sort_unstable();
         if std::env::var("FAKELINUX_TRACE_TABLES").is_ok() {
             for &(s, e) in &exclusions {
-                eprintln!("fakelinux: table exclusion {:#x}..{:#x} ({} bytes)", s, e, e - s);
+                crate::vlog!("fakelinux: table exclusion {:#x}..{:#x} ({} bytes)", s, e, e - s);
             }
         }
         let start = base_offset + sh_addr;
@@ -1821,7 +1821,7 @@ fn fixup_exec_rodata_pointers(elf: &Elf, data: &[u8], base_offset: u64, orig_lo:
             pg += page;
         }
         if fixed > 0 {
-            eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC .rodata ({} lookup-table candidates skipped)",
+            crate::vlog!("fakelinux: fixed up {} absolute pointers in ET_EXEC .rodata ({} lookup-table candidates skipped)",
                       fixed, skipped_tables);
         }
     }
@@ -1868,7 +1868,7 @@ fn fixup_exec_pointers(elf: &Elf, base_offset: u64) {
         }
     }
     if fixed > 0 {
-        eprintln!("fakelinux: fixed up {} absolute pointers in ET_EXEC data", fixed);
+        crate::vlog!("fakelinux: fixed up {} absolute pointers in ET_EXEC data", fixed);
     }
 }
 
@@ -1921,7 +1921,7 @@ fn apply_relocations_from_memory(elf: &Elf, base_offset: u64) {
     }
 
     if applied > 0 {
-        eprintln!("fakelinux: applied {} RELA relocations for ET_EXEC", applied);
+        crate::vlog!("fakelinux: applied {} RELA relocations for ET_EXEC", applied);
     }
 }
 
@@ -2004,7 +2004,7 @@ fn apply_relocations(elf: &Elf, data: &[u8], base: u64) -> Result<(), ElfError> 
     }
 
     if applied > 0 {
-        eprintln!("fakelinux: applied {} R_AARCH64_RELATIVE relocations", applied);
+        crate::vlog!("fakelinux: applied {} R_AARCH64_RELATIVE relocations", applied);
     }
 
     Ok(())

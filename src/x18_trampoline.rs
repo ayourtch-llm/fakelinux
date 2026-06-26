@@ -553,7 +553,7 @@ pub fn flush_all_islands() {
     let t = TRAMP_COUNT.load(Ordering::Relaxed);
     let f = FALLBACK_COUNT.load(Ordering::Relaxed);
     if t > 0 || f > 0 {
-        eprintln!("fakelinux: x18 trampolines: {} ok, {} fallback to UDF", t, f);
+        crate::vlog!("fakelinux: x18 trampolines: {} ok, {} fallback to UDF", t, f);
     }
 }
 

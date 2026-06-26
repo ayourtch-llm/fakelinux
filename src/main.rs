@@ -1,3 +1,5 @@
+#[macro_use]
+mod diag;
 mod creds;
 mod decoder;
 mod elf;
@@ -21,17 +23,28 @@ mod x18_trampoline;
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
 
-    // Parse --container flag (must come before the ELF path)
+    // Verbose mode: print fakelinux's own diagnostics (load banners, patch
+    // counts, …). Off by default so guest output isn't polluted. Enable with
+    // FAKELINUX_VERBOSE=1 or a leading -v/--verbose flag.
+    let mut verbose = std::env::var_os("FAKELINUX_VERBOSE").is_some();
+
+    // Parse leading flags (must come before the ELF path).
     let mut container_mode = false;
     let mut guest_arg_start = 1;
-    if args.len() > 1 && (args[1] == "--container" || args[1] == "--init") {
-        container_mode = true;
-        guest_arg_start = 2;
+    while args.len() > guest_arg_start {
+        match args[guest_arg_start].as_str() {
+            "--container" | "--init" => container_mode = true,
+            "-v" | "--verbose" => verbose = true,
+            _ => break,
+        }
+        guest_arg_start += 1;
     }
+    diag::set_verbose(verbose);
 
     if args.len() <= guest_arg_start {
-        eprintln!("Usage: fakelinux [--container] <aarch64-linux-elf> [args...]");
+        eprintln!("Usage: fakelinux [--container] [-v] <aarch64-linux-elf> [args...]");
         eprintln!("  --container  Run in container mode (virtual PID namespace, PID 1)");
+        eprintln!("  -v, --verbose  Print fakelinux's own diagnostics (or set FAKELINUX_VERBOSE=1)");
         eprintln!("  Set FAKELINUX_SYSROOT to an aarch64 Linux rootfs for dynamic binaries.");
         std::process::exit(1);
     }
@@ -92,13 +105,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    eprintln!(
+    vlog!(
         "fakelinux: loading {} (type={} entry={:#x} phdrs={})",
         elf_path, elf.header.e_type, elf.header.e_entry, elf.header.e_phnum
     );
 
     // Strip rootfs prefix from the binary path so the guest sees guest paths
-    // (e.g., "/Users/.../ubuntu-rootfs/bin/dash" → "/bin/dash").
+    // (e.g., "/Users/.../roots/ubuntu/bin/dash" → "/bin/dash").
     // The ELF file has already been read above using the original host path.
     if rootfs::in_full_rootfs_mode() {
         if let Some(guest_path) = rootfs::strip_root_prefix(args[guest_arg_start].as_bytes()) {
@@ -167,7 +180,7 @@ fn main() {
     // FAKELINUX_CONTAINER env var attaches to existing namespace (child after execve)
     if container_mode {
         pidns::init_container();
-        eprintln!("fakelinux: container mode (--container), virtual PID 1");
+        vlog!("fakelinux: container mode (--container), virtual PID 1");
         // A container starts at /. If the host cwd is outside the rootfs the
         // guest inherits a path that doesn't exist in its world (dpkg's
         // "cannot stat initial working directory for /Users/..."). Host cwds
