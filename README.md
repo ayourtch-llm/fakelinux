@@ -69,13 +69,16 @@ hand-tuned bit masks.
 
 ## Build
 
-First, install the ARM A64 ISA XML into `data/encoding/` (one-time, not bundled —
-see [`data/encoding/README.md`](data/encoding/README.md)). Then:
+First, install the ARM A64 ISA XML into `data/encoding/` (one-time, not bundled).
+The helper script fetches it from ARM automatically:
 
 ```sh
-cargo build --release
-# binary at target/release/fakelinux
+scripts/fetch-arm-isa-xml.sh      # downloads the latest A64 ISA XML from ARM
+cargo build --release             # binary at target/release/fakelinux
 ```
+
+See [`data/encoding/README.md`](data/encoding/README.md) if you'd rather install
+it manually or the download needs nudging.
 
 ## Usage
 

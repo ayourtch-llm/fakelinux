@@ -21,9 +21,34 @@ and shared files that ship alongside them. fakelinux was developed against the
 
 ## How to obtain it
 
+Use the helper script. With no arguments it queries ARM's download manifest,
+finds the newest A64 ISA XML release, downloads it, and installs the files:
+
+```sh
+scripts/fetch-arm-isa-xml.sh
+```
+
+It can also take an explicit source — a direct link, a tarball you already
+downloaded, or an already-extracted directory:
+
+```sh
+scripts/fetch-arm-isa-xml.sh '<copied-link-url>'
+scripts/fetch-arm-isa-xml.sh ~/Downloads/ISA_A64_xml_A_profile-2026-03.tar.gz
+scripts/fetch-arm-isa-xml.sh ~/Downloads/ISA_A64_xml_A_profile-2026-03/
+```
+
+ARM's download page is JavaScript-driven and rotates its CDN paths per release,
+so the script resolves the URL from ARM's layout-service JSON at run time rather
+than hardcoding it. If that ever breaks, the script prints manual instructions.
+
+Doing it by hand instead:
+
 1. Download the **A64 ISA XML for A-profile architecture** release from ARM's
-   exploration tools page:
-   <https://developer.arm.com/downloads/-/exploration-tools>
+   A-Profile architecture downloads (under "Downloads"):
+   <https://developer.arm.com/Architectures/A-Profile%20Architecture> — or the
+   exploration tools page <https://developer.arm.com/downloads/-/exploration-tools>.
+   You want the per-instruction **ISA XML** package, *not* the
+   "AARCHMRS Features.json" feature model.
 2. Extract the archive. It contains a directory of per-instruction `*.xml`
    files (and `*.dtd` schema files).
 3. Copy those `*.xml` files into this directory (`data/encoding/`):
