@@ -204,9 +204,16 @@ fn linux_sockaddr_to_mac(addr_ptr: u64, addrlen: u32) -> u8 {
 }
 
 /// Patch a macOS sockaddr buffer in-place back to Linux format after kernel call.
-fn mac_sockaddr_to_linux(addr_ptr: u64, addrlen: u32) {
+/// Convert a macOS sockaddr in the guest buffer to Linux layout, and for AF_UNIX
+/// reverse-translate the sun_path from the host back to the guest view (strip the
+/// rootfs prefix). Returns the (possibly shortened) address length so the caller
+/// can update the guest's addrlen. Without the reverse translation, getsockname/
+/// getpeername/accept leak the host rootfs path to the guest — e.g. Python
+/// multiprocessing reads its listener address via getsockname and then can't
+/// connect to it.
+fn mac_sockaddr_to_linux(addr_ptr: u64, addrlen: u32) -> u32 {
     if addr_ptr == 0 || addrlen < 2 {
-        return;
+        return addrlen;
     }
     unsafe {
         let p = addr_ptr as *mut u8;
@@ -215,7 +222,24 @@ fn mac_sockaddr_to_linux(addr_ptr: u64, addrlen: u32) {
         // Linux: offset 0 = sa_family as u16 LE
         *p = mac_af_to_linux(family);
         *p.add(1) = 0;
+
+        // AF_UNIX pathname sockets: map the host sun_path back to the guest path.
+        if family == libc::AF_UNIX as u8 && addrlen > 2 {
+            let region = std::slice::from_raw_parts(p.add(2), (addrlen - 2) as usize);
+            let end = region.iter().position(|&b| b == 0).unwrap_or(region.len());
+            let host = &region[..end];
+            if !host.is_empty() {
+                if let Some(guest) = crate::rootfs::strip_root_prefix(host) {
+                    if 2 + guest.len() + 1 <= addrlen as usize {
+                        std::ptr::copy_nonoverlapping(guest.as_ptr(), p.add(2), guest.len());
+                        *p.add(2 + guest.len()) = 0;
+                        return 2 + guest.len() as u32 + 1;
+                    }
+                }
+            }
+        }
     }
+    addrlen
 }
 
 /// Extract base socket type and apply SOCK_NONBLOCK/SOCK_CLOEXEC after creation.
@@ -317,7 +341,8 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
     // Convert returned macOS sockaddr to Linux format
     if addr_ptr != 0 && addrlen_ptr != 0 {
         let alen = unsafe { *(addrlen_ptr as *const u32) };
-        mac_sockaddr_to_linux(addr_ptr, alen);
+        let new_len = mac_sockaddr_to_linux(addr_ptr, alen);
+        unsafe { *(addrlen_ptr as *mut u32) = new_len; }
     }
     let nonblock = flags & LINUX_SOCK_NONBLOCK != 0;
     let cloexec = flags & LINUX_SOCK_CLOEXEC != 0;
@@ -417,7 +442,8 @@ pub fn do_recvfrom(
         // Convert returned macOS sockaddr to Linux format
         if src_addr != 0 && addrlen_ptr != 0 {
             let alen = unsafe { *(addrlen_ptr as *const u32) };
-            mac_sockaddr_to_linux(src_addr, alen);
+            let new_len = mac_sockaddr_to_linux(src_addr, alen);
+            unsafe { *(addrlen_ptr as *mut u32) = new_len; }
         }
         ret as u64
     }
@@ -496,7 +522,8 @@ pub fn do_getsockname(fd: i32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     } else {
         if addr_ptr != 0 && addrlen_ptr != 0 {
             let alen = unsafe { *(addrlen_ptr as *const u32) };
-            mac_sockaddr_to_linux(addr_ptr, alen);
+            let new_len = mac_sockaddr_to_linux(addr_ptr, alen);
+            unsafe { *(addrlen_ptr as *mut u32) = new_len; }
         }
         0
     }
@@ -515,7 +542,8 @@ pub fn do_getpeername(fd: i32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     } else {
         if addr_ptr != 0 && addrlen_ptr != 0 {
             let alen = unsafe { *(addrlen_ptr as *const u32) };
-            mac_sockaddr_to_linux(addr_ptr, alen);
+            let new_len = mac_sockaddr_to_linux(addr_ptr, alen);
+            unsafe { *(addrlen_ptr as *mut u32) = new_len; }
         }
         0
     }
