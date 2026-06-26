@@ -112,6 +112,9 @@ FAKELINUX_ROOT=roots/ubuntu \
   ./target/release/fakelinux --container roots/ubuntu/bin/bash -c "uname -a && apt-get update"
 ```
 
+For an interactive poke-around, `scripts/rootfs-shell.sh` opens a shell inside a
+rootfs (`ROOTFS=roots/alpine scripts/rootfs-shell.sh`, default `roots/ubuntu`).
+
 Pass the guest binary as a **host path that includes the `roots/<name>` prefix**
 (e.g. `roots/ubuntu/bin/bash`); fakelinux strips the prefix to derive the guest's
 own view of the path. See [`roots/README.md`](roots/README.md) for other distros
