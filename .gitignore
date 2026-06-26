@@ -23,3 +23,7 @@
 
 # macOS
 .DS_Store
+
+# ARM ISA XML — not bundled (ARM-licensed); see data/encoding/README.md
+data/encoding/*.xml
+data/encoding/*.dtd

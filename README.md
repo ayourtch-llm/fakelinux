@@ -48,11 +48,16 @@ A few things also get virtualized via the same trap mechanism:
 ### The instruction decoder is generated from ARM's official spec
 
 The decoder is not hand-written. `build.rs` parses ARM's machine-readable
-**A64 ISA XML** (vendored under [`data/encoding/`](data/encoding/)) and generates
-a `(mask, value, register-fields, emulation-class)` table at build time. This
-makes the decoder a faithful, single-source-of-truth reflection of the
-architecture rather than a pile of hand-tuned bit masks. See
-[`data/encoding/README.md`](data/encoding/README.md) for provenance.
+**A64 ISA XML** and generates a `(mask, value, register-fields,
+emulation-class)` table at build time. This makes the decoder a faithful,
+single-source-of-truth reflection of the architecture rather than a pile of
+hand-tuned bit masks.
+
+> ⚠️ **The ARM ISA XML is not bundled** (it is ARM's copyrighted material under
+> ARM's own license). Before building you must download it from ARM and drop it
+> into `data/encoding/` — see
+> [`data/encoding/README.md`](data/encoding/README.md) for step-by-step
+> instructions. Without it, fakelinux compiles but emulates nothing.
 
 ## Requirements
 
@@ -63,6 +68,9 @@ architecture rather than a pile of hand-tuned bit masks. See
   programs (see below). None is bundled.
 
 ## Build
+
+First, install the ARM A64 ISA XML into `data/encoding/` (one-time, not bundled —
+see [`data/encoding/README.md`](data/encoding/README.md)). Then:
 
 ```sh
 cargo build --release
