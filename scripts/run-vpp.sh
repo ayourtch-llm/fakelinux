@@ -7,7 +7,7 @@
 #                                 # vppctl over cli.sock, check it responds
 #   scripts/run-vpp.sh vppctl ... # run a single vppctl command against a running VPP
 #
-# Env: ROOTFS (default roots-cs/ubuntu).
+# Env: ROOTFS (default roots/ubuntu).
 #
 # VPP's interactive CLI needs a real terminal, so automated testing instead runs
 # VPP as a service (cli-listen on a Unix socket) and talks to it with vppctl from
@@ -19,8 +19,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
+# shellcheck source=scripts/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
-ROOTFS="${ROOTFS:-roots-cs/ubuntu}"
+ROOTFS="${ROOTFS:-roots/ubuntu}"
+# Match casefold to the rootfs's filesystem (so files built under casefold are
+# found at runtime). No-op on a case-sensitive volume.
+fl_autodetect_casefold "$REPO_DIR/$ROOTFS"
 FAKELINUX_BIN="target/release/fakelinux"
 VPP_BINDIR="root/vpp/build-root/install-vpp_debug-native/vpp/bin"
 VPP_REL="$VPP_BINDIR/vpp"

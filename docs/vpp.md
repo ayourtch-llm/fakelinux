@@ -86,13 +86,16 @@ This applies to every path component, so colliding *directories* (perl's
 
 ### Alternative: a case-sensitive volume
 
-If you'd rather use a real case-sensitive filesystem, point `ROOTFS` under
-`roots-cs/` and `build-vpp.sh` will create one for you:
+The scripts **autodetect** the rootfs's filesystem and enable casefold only when
+it's case-insensitive (so if your whole checkout already lives on a case-sensitive
+volume, casefold stays off automatically). To use a real case-sensitive
+filesystem instead, create one and point `ROOTFS` at it:
 
 ```sh
-ROOTFS=roots-cs/ubuntu scripts/build-vpp.sh
-# uses scripts/make-case-sensitive-volume.sh to mount a case-sensitive APFS
-# sparse image (nominal 40 GB, only uses what's needed) at roots-cs/.
+scripts/make-case-sensitive-volume.sh roots-cs   # mount a case-sensitive APFS
+                                                  # sparse image at roots-cs/
+ROOTFS=roots-cs/ubuntu scripts/build-vpp.sh       # autodetected as case-sensitive
+                                                  # -> casefold left off
 # Detach later with: hdiutil detach roots-cs
 ```
 

@@ -9,15 +9,20 @@
 #   scripts/vpp-shell.sh              # interactive shell in /root/vpp
 #   scripts/vpp-shell.sh make build   # run a single command in /root/vpp, then exit
 #
-# Env: ROOTFS (default roots-cs/ubuntu).
+# Env: ROOTFS (default roots/ubuntu).
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
+# shellcheck source=scripts/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
-ROOTFS="${ROOTFS:-roots-cs/ubuntu}"
+ROOTFS="${ROOTFS:-roots/ubuntu}"
+# Enable casefold if the rootfs is case-insensitive, so `make build` and other
+# tools that touch case-colliding files work. No-op on a case-sensitive volume.
+fl_autodetect_casefold "$REPO_DIR/$ROOTFS"
 FAKELINUX_BIN="target/release/fakelinux"
 
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }

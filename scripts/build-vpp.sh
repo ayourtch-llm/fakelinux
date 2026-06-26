@@ -36,16 +36,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
+# shellcheck source=scripts/lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
 # VPP's build pulls in Linux kernel headers (linux-libc-dev) whose filenames
-# collide under macOS's default case-insensitive APFS. We use fakelinux's
-# case-fold support (FAKELINUX_CASEFOLD) so they coexist on the normal roots/
-# volume — no case-sensitive disk image needed.
-#
-# (Point ROOTFS at roots-cs/<name> instead to use a dedicated case-sensitive
-# APFS volume, which this script will then create automatically.)
+# collide under macOS's default case-insensitive APFS. fakelinux's case-fold
+# support (FAKELINUX_CASEFOLD) makes them coexist on the normal roots/ volume —
+# no disk image needed. It is enabled automatically when ROOTFS turns out to be
+# on a case-insensitive filesystem (see fl_autodetect_casefold). If you'd rather
+# use a real case-sensitive volume, create one with make-case-sensitive-volume.sh
+# and point ROOTFS at it; autodetection will then leave casefold off.
 ROOTFS="${ROOTFS:-roots/ubuntu}"
-export FAKELINUX_CASEFOLD=1
 VPP_REPO="${VPP_REPO:-https://github.com/FDio/vpp.git}"
 VPP_REF="${VPP_REF:-master}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
@@ -66,22 +67,19 @@ guest() {
 ensure_prereqs() {
   [ -x "$FAKELINUX_BIN" ] || { note "building fakelinux..."; cargo build --release; }
 
-  local roots_dir
-  roots_dir="$(dirname "$ROOTFS")"          # e.g. roots or roots-cs
-
-  # Case-only-colliding kernel headers are handled by FAKELINUX_CASEFOLD on the
-  # normal volume. Only set up a dedicated case-sensitive APFS image when the
-  # user explicitly puts ROOTFS under roots-cs/.
-  if [ "$(basename "$roots_dir")" = "roots-cs" ]; then
-    note "using a case-sensitive volume for $roots_dir"
-    scripts/make-case-sensitive-volume.sh "$REPO_DIR/$roots_dir"
-  else
-    note "using FAKELINUX_CASEFOLD on $roots_dir (no case-sensitive volume)"
-  fi
-
   if [ ! -d "$ROOTFS/usr/bin" ]; then
     note "no rootfs at $ROOTFS — fetching ubuntu:24.04..."
-    ROOTS_DIR="$roots_dir" scripts/fetch-rootfs.sh "$(basename "$ROOTFS")" ubuntu:24.04
+    ROOTS_DIR="$(dirname "$ROOTFS")" scripts/fetch-rootfs.sh "$(basename "$ROOTFS")" ubuntu:24.04
+  fi
+
+  # Enable case-fold automatically when ROOTFS is on a case-insensitive volume
+  # (so the colliding kernel headers / perl dirs coexist). On a real
+  # case-sensitive filesystem it stays off.
+  fl_autodetect_casefold "$REPO_DIR/$ROOTFS"
+  if [ -n "${FAKELINUX_CASEFOLD:-}" ]; then
+    note "$ROOTFS is case-insensitive — using FAKELINUX_CASEFOLD (no disk image)"
+  else
+    note "$ROOTFS is on a case-sensitive filesystem — casefold not needed"
   fi
 }
 
