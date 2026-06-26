@@ -1,8 +1,9 @@
 /// Generates a minimal static aarch64 Linux ELF binary that prints "Hello, world!\n" and exits.
 /// No cross-compiler needed — we emit raw bytes.
 ///
-/// Usage: cargo run --bin gen_test_elf > hello
-///        chmod +x hello
+/// Usage: cargo run --bin gen_test_elf > hello/hello_min
+///        chmod +x hello/hello_min
+///        (or just run hello/build.sh, which does this plus the cross-compiles)
 
 fn main() {
     let base: u64 = match std::env::args().nth(1) {
