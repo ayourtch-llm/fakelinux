@@ -430,6 +430,22 @@ fn pipe_content(content: &[u8]) -> i32 {
     read_fd
 }
 
+/// /proc/net/dev — per-interface counters. We have no real netdevs under
+/// emulation, so expose just the loopback with zero counters. The two header
+/// lines are the fixed Linux format.
+fn generate_net_dev() -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str("Inter-|   Receive                                                |  Transmit\n");
+    s.push_str(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    s.push_str("    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n");
+    s.into_bytes()
+}
+
+/// /proc/net/route — IPv4 routing table. Header line only (empty table).
+fn generate_net_route() -> Vec<u8> {
+    b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n".to_vec()
+}
+
 fn generate_content(path: &str) -> Option<Vec<u8>> {
     // Normalize /proc/<pid>/... to /proc/self/... when <pid> matches our PID
     let normalized = normalize_proc_path(path);
@@ -456,6 +472,11 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         // Default Linux core dump pattern. VPP's test framework reads this to
         // locate core files after a crash (test/util.py get_core_pattern).
         "/proc/sys/kernel/core_pattern" => Some(b"core\n".to_vec()),
+        // Minimal but valid network tables. Tools (VPP's test framework, scapy)
+        // read these to enumerate interfaces / routes; we expose a loopback and
+        // an empty routing table so they don't choke (we have no real netdevs).
+        "/proc/net/dev" => Some(generate_net_dev()),
+        "/proc/net/route" => Some(generate_net_route()),
         _ if path.starts_with("/sys/") => sysfs_content(path, host_ncpus()),
         _ => {
             // Check if this is /proc/<vpid>/stat or /proc/<vpid>/status for
