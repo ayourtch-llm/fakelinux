@@ -1782,8 +1782,13 @@ fn do_getdents64(fd: i32, buf: u64, bufsize: u64) -> u64 {
         }
         let d_name = &mac_buf[in_pos + 21..in_pos + 21 + d_namlen];
 
+        // Decode a case-folded host name (~~NAMECASE~~…) back to the guest name.
+        let decoded = rootfs::casefold_decode_leaf(d_name);
+        let eff_name: &[u8] = decoded.as_deref().unwrap_or(d_name);
+        let eff_namlen = eff_name.len();
+
         // Linux dirent64: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name + null
-        let linux_reclen = (19 + d_namlen + 1 + 7) & !7;
+        let linux_reclen = (19 + eff_namlen + 1 + 7) & !7;
 
         if out_pos + linux_reclen > bufsize as usize {
             break;
@@ -1796,7 +1801,7 @@ fn do_getdents64(fd: i32, buf: u64, bufsize: u64) -> u64 {
             (out.add(8) as *mut i64).write_unaligned((out_pos + linux_reclen) as i64);
             (out.add(16) as *mut u16).write_unaligned(linux_reclen as u16);
             *out.add(18) = d_type;
-            std::ptr::copy_nonoverlapping(d_name.as_ptr(), out.add(19), d_namlen);
+            std::ptr::copy_nonoverlapping(eff_name.as_ptr(), out.add(19), eff_namlen);
         }
 
         out_pos += linux_reclen;

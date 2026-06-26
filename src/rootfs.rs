@@ -85,7 +85,7 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     if let Some(root) = ROOT.get() {
         if !root.is_empty() {
             let resolved = resolve_in_rootfs(root.as_bytes(), path);
-            let mut result = resolved;
+            let mut result = casefold_host_leaf(resolved);
             if !result.ends_with(&[0]) {
                 result.push(0);
             }
@@ -323,6 +323,7 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
     }
     let mut full = translated_parent;
     full.extend_from_slice(basename);
+    let mut full = casefold_host_leaf(full);
     full.push(0);
     Some(full)
 }
@@ -332,6 +333,140 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
 /// /etc/alternatives/vim → roots/ubuntu/usr/bin/vim.basic). Returns the
 /// path unchanged if no rootfs is configured or the path is outside it.
 /// Requires rootfs::init() to have run.
+// ── Case-fold support ───────────────────────────────────────────────────────
+//
+// macOS's default volume is case-insensitive, but some Linux trees ship files
+// whose names differ only in case — e.g. the kernel headers in linux-libc-dev:
+// netfilter/xt_CONNMARK.h vs xt_connmark.h. They'd collapse onto one host file.
+//
+// When FAKELINUX_CASEFOLD=1, the *second* of two case-fold siblings is stored on
+// the host under a sentinel-prefixed, case-injective name, so both coexist:
+//   xt_connmark.h            (created first)  -> stored verbatim
+//   xt_CONNMARK.h            (would collide)  -> "~~NAMECASE~~xt_^connmark.h"
+// readdir decodes the sentinel names back to what the guest expects.
+//
+// Scope: leaf (final path component) only — directory names that collide only by
+// case are not handled (vanishingly rare in practice). Off by default; one extra
+// getattrlist() per path resolution when enabled.
+
+use std::sync::atomic::{AtomicBool, Ordering as CfOrdering};
+static CASEFOLD: AtomicBool = AtomicBool::new(false);
+pub fn set_casefold(on: bool) { CASEFOLD.store(on, CfOrdering::Relaxed); }
+pub fn casefold_enabled() -> bool { CASEFOLD.load(CfOrdering::Relaxed) }
+
+pub const CASEFOLD_SENTINEL: &[u8] = b"~~NAMECASE~~";
+
+/// Case-injective escape: uppercase `X` -> `^x`, literal `^` -> `^^`. The output
+/// contains no uppercase, so it is stable under the host's case-folding.
+fn caret_escape(name: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len() + 4);
+    for &b in name {
+        match b {
+            b'A'..=b'Z' => { out.push(b'^'); out.push(b - b'A' + b'a'); }
+            b'^' => { out.push(b'^'); out.push(b'^'); }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+fn caret_unescape(esc: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(esc.len());
+    let mut i = 0;
+    while i < esc.len() {
+        if esc[i] == b'^' && i + 1 < esc.len() {
+            let n = esc[i + 1];
+            if n == b'^' { out.push(b'^'); }
+            else if n.is_ascii_lowercase() { out.push(n - b'a' + b'A'); }
+            else { out.push(b'^'); out.push(n); }
+            i += 2;
+        } else {
+            out.push(esc[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Host leaf name for a guest leaf stored case-folded.
+pub fn casefold_encode_leaf(name: &[u8]) -> Vec<u8> {
+    let mut v = CASEFOLD_SENTINEL.to_vec();
+    v.extend_from_slice(&caret_escape(name));
+    v
+}
+/// If a host leaf is a case-folded name, return the original guest leaf.
+pub fn casefold_decode_leaf(host_leaf: &[u8]) -> Option<Vec<u8>> {
+    host_leaf.strip_prefix(CASEFOLD_SENTINEL).map(caret_unescape)
+}
+
+/// The actual on-disk leaf name of `path` (the host's real casing), or None if
+/// it doesn't exist. Does not follow a final symlink.
+fn host_actual_leaf(path: &[u8]) -> Option<Vec<u8>> {
+    #[repr(C)]
+    struct Attrlist {
+        bitmapcount: u16, reserved: u16,
+        commonattr: u32, volattr: u32, dirattr: u32, fileattr: u32, forkattr: u32,
+    }
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_CMN_NAME: u32 = 0x0000_0001;
+    const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+    extern "C" {
+        fn getattrlist(path: *const libc::c_char, attr_list: *const Attrlist,
+                       attr_buf: *mut libc::c_void, attr_buf_size: libc::size_t,
+                       options: libc::c_ulong) -> libc::c_int;
+    }
+    let cpath = std::ffi::CString::new(path).ok()?;
+    let al = Attrlist { bitmapcount: ATTR_BIT_MAP_COUNT, reserved: 0,
+                        commonattr: ATTR_CMN_NAME, volattr: 0, dirattr: 0,
+                        fileattr: 0, forkattr: 0 };
+    let mut buf = [0u8; 1024];
+    let rc = unsafe {
+        getattrlist(cpath.as_ptr(), &al, buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(), FSOPT_NOFOLLOW as libc::c_ulong)
+    };
+    if rc != 0 { return None; }
+    // Layout: [u32 returned_len][attrreference_t{ i32 dataoffset, u32 length }][name...]
+    // dataoffset is relative to the attrreference (at offset 4).
+    let dataoffset = i32::from_ne_bytes(buf[4..8].try_into().ok()?) as isize;
+    let namelen = u32::from_ne_bytes(buf[8..12].try_into().ok()?) as usize;
+    let start = (4isize + dataoffset) as usize;
+    if namelen == 0 || start + namelen > buf.len() { return None; }
+    // name includes a trailing NUL.
+    Some(buf[start..start + namelen - 1].to_vec())
+}
+
+/// Map the leaf of an already-rebased host path to its case-folded storage name,
+/// when needed. Single deterministic rule that works for both lookup and create:
+///   - verbatim exists with the exact requested case  -> use it
+///   - verbatim exists but the on-disk case differs    -> a sibling occupies it;
+///     the real file lives at the encoded name          -> use encoded
+///   - verbatim absent but encoded present (sibling was deleted) -> use encoded
+///   - otherwise                                        -> verbatim
+fn casefold_host_leaf(host: Vec<u8>) -> Vec<u8> {
+    if !casefold_enabled() { return host; }
+    let Some(slash) = host.iter().rposition(|&b| b == b'/') else { return host; };
+    let leaf = &host[slash + 1..];
+    if leaf.is_empty() || leaf == b"." || leaf == b".." || leaf.starts_with(CASEFOLD_SENTINEL) {
+        return host;
+    }
+    let encoded = || {
+        let mut v = host[..=slash].to_vec();
+        v.extend_from_slice(&casefold_encode_leaf(leaf));
+        v
+    };
+    match host_actual_leaf(&host) {
+        Some(actual) if actual == leaf => host,
+        Some(_) => encoded(),                       // case-fold sibling occupies verbatim
+        None => {
+            let enc = encoded();
+            let exists = std::ffi::CString::new(enc.clone()).ok().map_or(false, |c| {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                unsafe { libc::lstat(c.as_ptr(), &mut st) == 0 }
+            });
+            if exists { enc } else { host }
+        }
+    }
+}
+
 pub fn resolve_host_path(host_path: &str) -> String {
     let Some(root) = get_root() else {
         return host_path.to_string();
@@ -343,6 +478,7 @@ pub fn resolve_host_path(host_path: &str) -> String {
         return host_path.to_string();
     };
     let resolved = resolve_in_rootfs(root.as_bytes(), &guest);
+    let resolved = casefold_host_leaf(resolved);
     String::from_utf8_lossy(&resolved).to_string()
 }
 
@@ -560,5 +696,39 @@ mod tests {
         assert_eq!(join_guest_relative(b"/usr", b"./x/../y"), b"/usr/y");
         assert_eq!(join_guest_relative(b"/", b"."), b"/");
         assert_eq!(join_guest_relative(b"/a//b/", b"c/.."), b"/a/b");
+    }
+
+    #[test]
+    fn test_casefold_encode_decode_roundtrip() {
+        for name in [
+            &b"xt_CONNMARK.h"[..], b"xt_connmark.h", b"README", b"Makefile",
+            b"ABC", b"abc", b"a^b", b"^weird^", b"MixedCase.TXT", b"123",
+        ] {
+            let enc = casefold_encode_leaf(name);
+            assert!(enc.starts_with(CASEFOLD_SENTINEL));
+            // The encoded body must contain no uppercase (case-fold stable).
+            let body = &enc[CASEFOLD_SENTINEL.len()..];
+            assert!(!body.iter().any(|b| b.is_ascii_uppercase()), "encoded {:?} has uppercase", name);
+            assert_eq!(casefold_decode_leaf(&enc).as_deref(), Some(&name[..]));
+        }
+        // Non-sentinel names decode to None.
+        assert_eq!(casefold_decode_leaf(b"xt_connmark.h"), None);
+    }
+
+    #[test]
+    fn test_casefold_injective_across_case_variants() {
+        // Names differing only in case must produce distinct, case-fold-stable
+        // host names (so they can coexist on a case-insensitive volume).
+        let variants: [&[u8]; 3] = [b"abc.h", b"Abc.h", b"ABC.h"];
+        let encoded: Vec<Vec<u8>> = variants.iter().map(|n| casefold_encode_leaf(n)).collect();
+        for e in &encoded {
+            let lower: Vec<u8> = e.iter().map(|b| b.to_ascii_lowercase()).collect();
+            // Compare lowercased forms: still distinct => no collision when folded.
+            let others = encoded.iter().filter(|x| *x != e)
+                .map(|x| x.iter().map(|b| b.to_ascii_lowercase()).collect::<Vec<u8>>());
+            for o in others {
+                assert_ne!(lower, o, "case variants collide after folding");
+            }
+        }
     }
 }

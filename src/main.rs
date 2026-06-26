@@ -41,6 +41,11 @@ fn main() {
     }
     diag::set_verbose(verbose);
 
+    // Case-fold mode: let case-only-colliding filenames (e.g. Linux kernel
+    // headers xt_CONNMARK.h vs xt_connmark.h) coexist on a case-insensitive
+    // host, avoiding the need for a case-sensitive volume. Off by default.
+    rootfs::set_casefold(std::env::var_os("FAKELINUX_CASEFOLD").is_some());
+
     if args.len() <= guest_arg_start {
         eprintln!("Usage: fakelinux [--container] [-v] <aarch64-linux-elf> [args...]");
         eprintln!("  --container  Run in container mode (virtual PID namespace, PID 1)");

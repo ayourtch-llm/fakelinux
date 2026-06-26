@@ -84,6 +84,12 @@ later: `hdiutil detach roots-cs`.
 > a prebuilt binary) work fine on the normal case-insensitive `roots/` — the
 > case-sensitive volume is only needed for from-source builds like this one.
 
+**Alternative (no volume):** set `FAKELINUX_CASEFOLD=1` to let case-only-colliding
+filenames coexist on a normal case-insensitive volume — fakelinux stores the
+second sibling under a sentinel-encoded name (`~~NAMECASE~~…`) and decodes it on
+readdir. This avoids the disk image entirely. `build-vpp.sh` uses the
+case-sensitive volume by default (well-tested); the casefold path is newer.
+
 ## What the build needs (and how fakelinux provides it)
 
 - **Networking / DNS.** OCI images ship no `/etc/resolv.conf`; `fetch-rootfs.sh`

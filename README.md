@@ -124,6 +124,8 @@ and details.
 | `FAKELINUX_ROOT`     | Path to the guest root filesystem (sets sysroot too).            |
 | `FAKELINUX_SYSROOT`  | Sysroot for resolving the dynamic loader / shared libraries.     |
 | `FAKELINUX_PAGESZ`   | Override the guest page size (e.g. `16384` for VPP).             |
+| `FAKELINUX_CASEFOLD` | Let case-only-colliding filenames coexist on macOS's case-insensitive FS (avoids needing a case-sensitive volume). |
+| `FAKELINUX_VERBOSE`  | Print fakelinux's own diagnostics (same as `-v`).                |
 | `FAKELINUX_TRACE`    | Trace every emulated syscall to stderr.                          |
 | `FAKELINUX_TRAP_STATS` | Print trap/emulation statistics on exit.                       |
 | `FAKELINUX_WATCH`    | Software watchpoint helper for debugging guest memory.           |
