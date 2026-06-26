@@ -21,16 +21,40 @@ That single command:
    `make install-dep` and `make build`;
 4. launches the resulting `vpp` binary on its interactive CLI.
 
-Build and run can be done separately:
+Steps can also be run individually:
 
 ```sh
-scripts/build-vpp.sh build      # just compile
-scripts/build-vpp.sh run        # just run what was built
-scripts/build-vpp.sh shell      # interactive guest shell in the rootfs
+scripts/build-vpp.sh build      # just compile (fetch rootfs/deps as needed)
+scripts/build-vpp.sh verify     # smoke-test the built VPP (same as run-vpp.sh test)
+
+scripts/run-vpp.sh              # run VPP with its interactive CLI (needs a TTY)
+scripts/run-vpp.sh test        # automated smoke test (boot + vppctl over cli.sock)
+scripts/run-vpp.sh vppctl show version    # one-off vppctl command
+
+scripts/vpp-shell.sh           # interactive shell in /root/vpp (the build env)
+scripts/vpp-shell.sh make build           # run one command in /root/vpp
 ```
 
 The first build is long (it compiles all of VPP under emulation). Re-builds are
 incremental and ccache-backed, so iterating is fast.
+
+### How the smoke test works
+
+VPP's interactive CLI needs a real terminal, so `run-vpp.sh test` instead boots
+VPP as a service (`cli-listen /run/vpp/cli.sock`, no `interactive`) and drives it
+with `vppctl` from a *separate* fakelinux process over the Unix socket. It checks
+the version banner, then creates a loopback interface and assigns it an address,
+confirming the dataplane responds:
+
+```
+vpp v26.10-rc0~179-g... built by root on fakelinux at ...
+loop0 (up):
+  L3 10.10.10.1/24
+==> VPP smoke test PASSED
+```
+
+This also exercises fakelinux's AF_UNIX cross-process support (the two processes
+share the guest's `/run/vpp/cli.sock`).
 
 ## Why a case-sensitive volume?
 
@@ -71,6 +95,14 @@ later: `hdiutil detach roots-cs`.
   `dpkg --configure -a`.
 
 ## Running it
+
+Easiest:
+
+```sh
+scripts/run-vpp.sh            # interactive VPP CLI
+```
+
+which is equivalent to running the binary directly:
 
 ```sh
 FAKELINUX_ROOT=roots-cs/ubuntu FAKELINUX_PAGESZ=16384 \

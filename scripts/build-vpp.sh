@@ -58,19 +58,6 @@ guest() {
     "./$FAKELINUX_BIN" --container "$ROOTFS/usr/bin/bash" -lc "$1"
 }
 
-# Run a command with a wall-clock limit. Uses timeout/gtimeout if present,
-# otherwise a portable perl alarm fallback (perl ships with macOS). stdin is
-# inherited so we can feed the guest commands.
-run_timeout() {
-  local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
-  else perl -e 'my $s=shift; my $p=fork; if(!$p){exec @ARGV or exit 127}
-                local $SIG{ALRM}=sub{kill 9,$p; exit 124}; alarm $s;
-                waitpid($p,0); exit($?>>8)' "$secs" "$@"
-  fi
-}
-
 ensure_prereqs() {
   [ -x "$FAKELINUX_BIN" ] || { note "building fakelinux..."; cargo build --release; }
 
@@ -118,9 +105,14 @@ dpkg --configure -a || true
 cd /root
 if [ ! -d vpp/.git ]; then
   echo "### cloning VPP ($VPP_REPO @ $VPP_REF)"
-  git clone --depth 1 --branch "$VPP_REF" "$VPP_REPO" vpp
+  git clone --branch "$VPP_REF" "$VPP_REPO" vpp
 fi
 cd vpp
+# VPP derives its version from \`git describe\`, which needs tags AND the history
+# back to the nearest tag. A shallow/tagless clone makes scripts/version empty,
+# which breaks cmake (string(REPLACE) with too few args). Ensure full history+tags.
+if [ -f "\$(git rev-parse --git-dir)/shallow" ]; then git fetch --unshallow || true; fi
+git fetch --tags || true
 echo "### make install-dep (VPP's apt dependency set)"
 for t in 1 2 3; do make UNATTENDED=yes install-dep && break; echo "### install-dep retry \$t"; dpkg --configure -a || true; done
 echo "### make build (debug); ccache-backed on re-runs"
@@ -146,40 +138,10 @@ do_build() {
   note "VPP binary: $ROOTFS/$VPP_BIN_REL"
 }
 
-VPP_CONF='unix { nodaemon interactive cli-listen /run/vpp/cli.sock } plugins { plugin dpdk_plugin.so { disable } }'
-
-reset_runtime() {
-  rm -f "$ROOTFS"/dev/shm/* 2>/dev/null || true
-  mkdir -p "$ROOTFS/run/vpp"
-}
-
-do_run() {
-  [ -x "$ROOTFS/$VPP_BIN_REL" ] || die "VPP not built yet — run: scripts/build-vpp.sh build"
-  reset_runtime
-  note "starting VPP (interactive CLI; Ctrl-D / 'quit' to exit)..."
-  FAKELINUX_ROOT="$REPO_DIR/$ROOTFS" FAKELINUX_PAGESZ=16384 \
-    "./$FAKELINUX_BIN" --container "$ROOTFS/$VPP_BIN_REL" "$VPP_CONF"
-}
-
-# Boot VPP non-interactively, feed it a couple of CLI commands, and confirm it
-# actually came up by checking for the version banner. Fully automated.
-do_verify() {
-  [ -x "$ROOTFS/$VPP_BIN_REL" ] || die "VPP not built yet — run: scripts/build-vpp.sh build"
-  reset_runtime
-  note "verifying VPP boots and responds on its CLI..."
-  local out
-  out="$(printf 'show version\nshow threads\nshow cpu\nquit\n' | \
-    FAKELINUX_ROOT="$REPO_DIR/$ROOTFS" FAKELINUX_PAGESZ=16384 \
-    run_timeout 180 "./$FAKELINUX_BIN" --container "$ROOTFS/$VPP_BIN_REL" "$VPP_CONF" 2>&1 || true)"
-  echo "$out" | grep -aiE 'vpp v[0-9]|Version:|vpp#' | head -5
-  if echo "$out" | grep -qaiE 'vpp v[0-9]'; then
-    note "VPP RAN: version banner observed. VERIFIED."
-  else
-    echo "--- last lines of VPP output ---"
-    echo "$out" | grep -avE 'fakelinux:' | tail -25
-    die "VPP did not produce a version banner — see output above."
-  fi
-}
+# Running and verifying VPP live in run-vpp.sh (interactive CLI needs a TTY;
+# the smoke test drives VPP via vppctl over cli.sock). Delegate to it.
+do_run()    { ROOTFS="$ROOTFS" scripts/run-vpp.sh run; }
+do_verify() { ROOTFS="$ROOTFS" scripts/run-vpp.sh test; }
 
 case "${1:-all}" in
   build)  do_build ;;
