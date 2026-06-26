@@ -1,12 +1,10 @@
 # Rust build output
 /target
 
-# Guest root filesystems (provide your own — see README)
-/alpine-rootfs
-/python-rootfs
-/ubuntu-rootfs
-/tttt-root
-/sysroot
+# Guest root filesystems live under roots/ (fetch with scripts/fetch-rootfs.sh).
+# The directory's README is tracked; the downloaded trees are not.
+/roots/*
+!/roots/README.md
 
 # Scratch / runtime artifacts
 /tmp

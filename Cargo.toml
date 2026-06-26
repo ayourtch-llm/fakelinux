@@ -2,7 +2,7 @@
 name = "fakelinux"
 version = "0.1.0"
 edition = "2021"
-exclude = ["alpine-rootfs", "sysroot", "busybox", "hello_*", "test_*", "docs"]
+exclude = ["roots", "busybox", "hello_*", "test_*", "docs"]
 
 [dependencies]
 libc = "0.2"

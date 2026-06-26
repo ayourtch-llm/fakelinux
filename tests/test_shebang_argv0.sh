@@ -5,10 +5,10 @@
 # it to /usr/bin/python3.12 breaks venv detection (PEP 668 error during
 # VPP's dpdk meson-venv pip install).
 #
-# Usage: tests/test_shebang_argv0.sh [path-to-ubuntu-rootfs]
+# Usage: tests/test_shebang_argv0.sh [path-to-rootfs]
 set -e
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ROOTFS="${1:-$PROJECT_DIR/ubuntu-rootfs}"
+ROOTFS="${1:-$PROJECT_DIR/roots/ubuntu}"
 FAKELINUX="$PROJECT_DIR/target/release/fakelinux"
 
 [ -x "$FAKELINUX" ] || { echo "SKIP: build target/release/fakelinux first"; exit 0; }

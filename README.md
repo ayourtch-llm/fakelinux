@@ -99,18 +99,23 @@ cargo build --release
 ./target/release/fakelinux ./my-static-aarch64-binary
 ```
 
-Run something from a Linux root filesystem (dynamic binaries, full userland).
-Point `FAKELINUX_ROOT` at an aarch64 rootfs — e.g. an extracted Ubuntu/Debian or
-Alpine image — and use `--container` to get a virtual PID namespace (the guest
-runs as PID 1, virtual root):
+Run something from a full Linux userland (dynamic binaries). Fetch an aarch64
+root filesystem into `roots/` (no Docker needed — it uses the bundled
+`fakelinux-pull` to pull the `linux/arm64` image and extract it), then point
+`FAKELINUX_ROOT` at it and use `--container` to get a virtual PID namespace (the
+guest runs as PID 1, virtual root):
 
 ```sh
-# Get a rootfs, for example:
-#   docker export "$(docker create --platform linux/arm64 ubuntu)" | tar -x -C ./ubuntu-rootfs
+scripts/fetch-rootfs.sh ubuntu        # ubuntu:24.04 -> roots/ubuntu
 
-FAKELINUX_ROOT=./ubuntu-rootfs \
-  ./target/release/fakelinux --container /bin/bash -c "uname -a && apt-get update"
+FAKELINUX_ROOT=roots/ubuntu \
+  ./target/release/fakelinux --container roots/ubuntu/bin/bash -c "uname -a && apt-get update"
 ```
+
+Pass the guest binary as a **host path that includes the `roots/<name>` prefix**
+(e.g. `roots/ubuntu/bin/bash`); fakelinux strips the prefix to derive the guest's
+own view of the path. See [`roots/README.md`](roots/README.md) for other distros
+and details.
 
 ### Key environment variables
 
@@ -160,7 +165,9 @@ src/
   creds.rs        virtual uid/gid (unshare -r semantics)
   ...
 build.rs          parses ARM A64 ISA XML → generates the decode table
-data/encoding/    vendored ARM A64 ISA spec (decoder source of truth)
+data/encoding/    ARM A64 ISA spec (only needed to regenerate the decoder)
+roots/            guest root filesystems (fetched on demand; gitignored)
+scripts/          helper scripts (fetch-rootfs.sh, fetch-arm-isa-xml.sh, …)
 tests/            C integration tests + run_tests.sh
 docs/             design notes, roadmap, known issues
 docs/devlog/      development journal (the messy, honest story)

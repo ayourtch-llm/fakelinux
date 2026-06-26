@@ -1814,7 +1814,7 @@ fn do_getcwd(buf: u64, size: u64) -> u64 {
     let cwd = unsafe { std::ffi::CStr::from_ptr(ret).to_bytes() };
 
     // In full rootfs mode, strip the rootfs prefix so the guest sees
-    // "/var/lib/apt" instead of "/Users/foo/ubuntu-rootfs/var/lib/apt"
+    // "/var/lib/apt" instead of "/Users/foo/roots/ubuntu/var/lib/apt"
     if let Some(guest_path) = rootfs::strip_root_prefix(cwd) {
         let needed = guest_path.len() + 1; // +1 for null terminator
         if needed > size as usize {

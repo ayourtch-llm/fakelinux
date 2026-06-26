@@ -119,7 +119,7 @@ else
 fi
 
 # ─── Optional: Alpine rootfs test (FAKELINUX_ROOT only) ─────────────────────
-ALPINE_ROOT="$PROJECT_DIR/alpine-rootfs"
+ALPINE_ROOT="$PROJECT_DIR/roots/alpine"
 if [ -d "$ALPINE_ROOT" ] && [ -f "$ALPINE_ROOT/bin/busybox" ]; then
     echo
     echo "=== Alpine rootfs test (FAKELINUX_ROOT only, no FAKELINUX_SYSROOT) ==="
@@ -130,16 +130,16 @@ if [ -d "$ALPINE_ROOT" ] && [ -f "$ALPINE_ROOT/bin/busybox" ]; then
         echo "$output"
         # Check output contains a version number (e.g. 3.21.0)
         if echo "$output" | grep -qE '[0-9]+\.[0-9]+'; then
-            echo "PASS alpine-rootfs cat /etc/alpine-release"
+            echo "PASS roots/alpine cat /etc/alpine-release"
         else
-            echo "FAIL alpine-rootfs: output does not contain a version number"
+            echo "FAIL roots/alpine: output does not contain a version number"
             echo "Output: $output"
         fi
     else
         echo "$output"
-        echo "FAIL alpine-rootfs cat /etc/alpine-release (exit code $?)"
+        echo "FAIL roots/alpine cat /etc/alpine-release (exit code $?)"
     fi
 else
     echo
-    echo "=== Skipping Alpine rootfs test (no alpine-rootfs/bin/busybox) ==="
+    echo "=== Skipping Alpine rootfs test (no roots/alpine/bin/busybox) ==="
 fi

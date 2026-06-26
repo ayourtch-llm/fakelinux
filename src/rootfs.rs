@@ -328,8 +328,8 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Resolve a HOST path that may point inside the rootfs, following absolute
-/// symlinks within the rootfs (e.g. ubuntu-rootfs/usr/bin/vim →
-/// /etc/alternatives/vim → ubuntu-rootfs/usr/bin/vim.basic). Returns the
+/// symlinks within the rootfs (e.g. roots/ubuntu/usr/bin/vim →
+/// /etc/alternatives/vim → roots/ubuntu/usr/bin/vim.basic). Returns the
 /// path unchanged if no rootfs is configured or the path is outside it.
 /// Requires rootfs::init() to have run.
 pub fn resolve_host_path(host_path: &str) -> String {

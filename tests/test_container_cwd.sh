@@ -5,10 +5,10 @@
 # "cannot stat initial working directory for /Users/...").  A container
 # starts at /.  A host cwd INSIDE the rootfs is preserved (guest-relative).
 #
-# Usage: tests/test_container_cwd.sh [path-to-ubuntu-rootfs]
+# Usage: tests/test_container_cwd.sh [path-to-rootfs]
 set -e
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ROOTFS="${1:-$PROJECT_DIR/ubuntu-rootfs}"
+ROOTFS="${1:-$PROJECT_DIR/roots/ubuntu}"
 FAKELINUX="$PROJECT_DIR/target/release/fakelinux"
 
 [ -x "$FAKELINUX" ] || { echo "SKIP: build target/release/fakelinux first"; exit 0; }

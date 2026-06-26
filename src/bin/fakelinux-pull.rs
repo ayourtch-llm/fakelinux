@@ -15,8 +15,8 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
         eprintln!("Usage: {} <image:tag> <output-dir>", args[0]);
-        eprintln!("Example: {} python:3.12-alpine ./python-rootfs", args[0]);
-        eprintln!("         {} ghcr.io/owner/repo:tag ./rootfs", args[0]);
+        eprintln!("Example: {} python:3.12-alpine roots/python", args[0]);
+        eprintln!("         {} ghcr.io/owner/repo:tag roots/myimage", args[0]);
         std::process::exit(1);
     }
 

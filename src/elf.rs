@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_eh_frame_on_libzstd() {
         // Test against the real libzstd binary in the ubuntu rootfs.
-        let path = "ubuntu-rootfs/lib/aarch64-linux-gnu/libzstd.so.1.5.5";
+        let path = "roots/ubuntu/lib/aarch64-linux-gnu/libzstd.so.1.5.5";
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => { eprintln!("skipping test: {} not found", path); return; }
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_eh_frame_on_libcrypto() {
-        let path = "ubuntu-rootfs/lib/aarch64-linux-gnu/libcrypto.so.3";
+        let path = "roots/ubuntu/lib/aarch64-linux-gnu/libcrypto.so.3";
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => { eprintln!("skipping test: {} not found", path); return; }
@@ -624,7 +624,7 @@ mod tests {
         // segment", and x18 false-positive patches corrupted nettle's
         // SHA-256/512 K constant tables in .rodata (same R-X LOAD) —
         // breaking every gnutls TLS handshake ("Decryption has failed").
-        let path = "ubuntu-rootfs/usr/lib/aarch64-linux-gnu/libnettle.so.8.8";
+        let path = "roots/ubuntu/usr/lib/aarch64-linux-gnu/libnettle.so.8.8";
         let mut data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => { eprintln!("skipping test: {} not found", path); return; }
