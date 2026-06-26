@@ -472,6 +472,7 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         // Default Linux core dump pattern. VPP's test framework reads this to
         // locate core files after a crash (test/util.py get_core_pattern).
         "/proc/sys/kernel/core_pattern" => Some(b"core\n".to_vec()),
+        "/proc/sys/kernel/core_uses_pid" => Some(b"0\n".to_vec()),
         // Minimal but valid network tables. Tools (VPP's test framework, scapy)
         // read these to enumerate interfaces / routes; we expose a loopback and
         // an empty routing table so they don't choke (we have no real netdevs).
