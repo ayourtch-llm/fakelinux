@@ -1,10 +1,25 @@
+# Rust build output
 /target
+
+# Guest root filesystems (provide your own — see README)
 /alpine-rootfs
 /python-rootfs
+/ubuntu-rootfs
+/tttt-root
 /sysroot
+
+# Scratch / runtime artifacts
 /tmp
 /.apchat-large-outputs
 *.o
-busybox
-hello_*
-test_suite
+*.log
+*.swp
+
+# Prebuilt guest test binaries (regenerate from tests/)
+/busybox
+/hello_*
+/test_suite
+/test_pipe_*
+
+# macOS
+.DS_Store
