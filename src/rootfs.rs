@@ -249,7 +249,7 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
                     }
                     k += 1;
                 }
-                return resolved;
+                return follow_trailing_symlinks(root, resolved);
             } else {
                 // Relative symlink target → resolve relative to parent directory
                 if let Some(slash_pos) = resolved.iter().rposition(|&b| b == b'/') {
@@ -263,6 +263,60 @@ fn resolve_in_rootfs(root: &[u8], guest_path: &[u8]) -> Vec<u8> {
             }
         }
         i += 1;
+    }
+    follow_trailing_symlinks(root, resolved)
+}
+
+/// Resolve a trailing symlink chain on an already-rebased host path.
+///
+/// The per-component walk in `resolve_in_rootfs` can leave the FINAL component
+/// as an unresolved symlink — e.g. a relative symlink to a sibling that is itself
+/// an absolute symlink (`venv/bin/python -> python3 -> /usr/bin/python3`). Left
+/// unresolved, an absolute target then escapes to the macOS host. Here we follow
+/// the chain, re-rooting absolute targets inside the rootfs (with the usual
+/// /proc, /dev, /tmp passthrough exceptions), until the path is no longer a link.
+fn follow_trailing_symlinks(root: &[u8], mut resolved: Vec<u8>) -> Vec<u8> {
+    let mut link_buf = [0u8; 4096];
+    for _ in 0..40 {
+        let c = match std::ffi::CString::new(resolved.clone()) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+            break;
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+            break;
+        }
+        let n = unsafe {
+            libc::readlink(c.as_ptr(), link_buf.as_mut_ptr() as *mut i8, link_buf.len())
+        };
+        if n <= 0 {
+            break;
+        }
+        let target = &link_buf[..n as usize];
+        if target.starts_with(b"/") {
+            // Absolute target: leave host-handled paths alone, else re-root.
+            if target.starts_with(b"/proc") || dev_passes_through(target) {
+                break;
+            }
+            if target.starts_with(b"/tmp") && !in_full_rootfs_mode() {
+                break;
+            }
+            let mut next = root.to_vec();
+            next.extend_from_slice(target);
+            resolved = next;
+        } else {
+            // Relative target: replace the final path component.
+            if let Some(p) = resolved.iter().rposition(|&b| b == b'/') {
+                resolved.truncate(p);
+            }
+            if !resolved.ends_with(b"/") {
+                resolved.push(b'/');
+            }
+            resolved.extend_from_slice(target);
+        }
     }
     resolved
 }
