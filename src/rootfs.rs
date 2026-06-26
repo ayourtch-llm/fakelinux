@@ -85,7 +85,7 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     if let Some(root) = ROOT.get() {
         if !root.is_empty() {
             let resolved = resolve_in_rootfs(root.as_bytes(), path);
-            let mut result = casefold_host_leaf(resolved);
+            let mut result = casefold_full_path(root.as_bytes().len(), resolved);
             if !result.ends_with(&[0]) {
                 result.push(0);
             }
@@ -321,9 +321,10 @@ pub fn translate_path_nofollow(path: &[u8]) -> Option<Vec<u8>> {
     if !translated_parent.ends_with(b"/") {
         translated_parent.push(b'/');
     }
+    // Parent is already fully case-folded by translate_path; map just the leaf.
+    let picked = casefold_pick(&translated_parent, basename);
     let mut full = translated_parent;
-    full.extend_from_slice(basename);
-    let mut full = casefold_host_leaf(full);
+    full.extend_from_slice(&picked);
     full.push(0);
     Some(full)
 }
@@ -434,37 +435,53 @@ fn host_actual_leaf(path: &[u8]) -> Option<Vec<u8>> {
     Some(buf[start..start + namelen - 1].to_vec())
 }
 
-/// Map the leaf of an already-rebased host path to its case-folded storage name,
-/// when needed. Single deterministic rule that works for both lookup and create:
+/// Pick the on-disk name for one path component `comp` inside host dir `dir`.
+/// Single deterministic rule that works for both lookup and create:
 ///   - verbatim exists with the exact requested case  -> use it
 ///   - verbatim exists but the on-disk case differs    -> a sibling occupies it;
-///     the real file lives at the encoded name          -> use encoded
+///     the real entry lives at the encoded name         -> use encoded
 ///   - verbatim absent but encoded present (sibling was deleted) -> use encoded
 ///   - otherwise                                        -> verbatim
-fn casefold_host_leaf(host: Vec<u8>) -> Vec<u8> {
-    if !casefold_enabled() { return host; }
-    let Some(slash) = host.iter().rposition(|&b| b == b'/') else { return host; };
-    let leaf = &host[slash + 1..];
-    if leaf.is_empty() || leaf == b"." || leaf == b".." || leaf.starts_with(CASEFOLD_SENTINEL) {
-        return host;
+fn casefold_pick(dir: &[u8], comp: &[u8]) -> Vec<u8> {
+    if !casefold_enabled() || comp == b"." || comp == b".." || comp.starts_with(CASEFOLD_SENTINEL) {
+        return comp.to_vec();
     }
-    let encoded = || {
-        let mut v = host[..=slash].to_vec();
-        v.extend_from_slice(&casefold_encode_leaf(leaf));
-        v
-    };
-    match host_actual_leaf(&host) {
-        Some(actual) if actual == leaf => host,
-        Some(_) => encoded(),                       // case-fold sibling occupies verbatim
+    let mut cand = dir.to_vec();
+    if !cand.ends_with(b"/") { cand.push(b'/'); }
+    cand.extend_from_slice(comp);
+    match host_actual_leaf(&cand) {
+        Some(actual) if actual == comp => comp.to_vec(),
+        Some(_) => casefold_encode_leaf(comp),    // case-fold sibling occupies verbatim
         None => {
-            let enc = encoded();
-            let exists = std::ffi::CString::new(enc.clone()).ok().map_or(false, |c| {
+            let mut enc_path = dir.to_vec();
+            if !enc_path.ends_with(b"/") { enc_path.push(b'/'); }
+            let enc = casefold_encode_leaf(comp);
+            enc_path.extend_from_slice(&enc);
+            let exists = std::ffi::CString::new(enc_path).ok().map_or(false, |c| {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 unsafe { libc::lstat(c.as_ptr(), &mut st) == 0 }
             });
-            if exists { enc } else { host }
+            if exists { enc } else { comp.to_vec() }
         }
     }
+}
+
+/// Apply case-fold mapping to EVERY component of an already-rebased host path
+/// below the rootfs root (`root_len` bytes of prefix kept verbatim). This handles
+/// directory-name collisions (e.g. perl's `pod` vs `Pod`, `sys` vs `Sys`), not
+/// just the final filename.
+fn casefold_full_path(root_len: usize, host: Vec<u8>) -> Vec<u8> {
+    if !casefold_enabled() || host.len() <= root_len {
+        return host;
+    }
+    let mut out = host[..root_len].to_vec();
+    for comp in host[root_len..].split(|&b| b == b'/') {
+        if comp.is_empty() { continue; }
+        let picked = casefold_pick(&out, comp);
+        if !out.ends_with(b"/") { out.push(b'/'); }
+        out.extend_from_slice(&picked);
+    }
+    out
 }
 
 pub fn resolve_host_path(host_path: &str) -> String {
@@ -478,7 +495,7 @@ pub fn resolve_host_path(host_path: &str) -> String {
         return host_path.to_string();
     };
     let resolved = resolve_in_rootfs(root.as_bytes(), &guest);
-    let resolved = casefold_host_leaf(resolved);
+    let resolved = casefold_full_path(root.as_bytes().len(), resolved);
     String::from_utf8_lossy(&resolved).to_string()
 }
 
