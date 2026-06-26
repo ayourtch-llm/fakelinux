@@ -1031,8 +1031,8 @@ fn parse_timeout(timeout_ptr: u64) -> Option<Duration> {
 pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64, val3: u32) -> u64 {
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
-    // Trace futex ops from fork children
-    if IS_FORK_CHILD.load(Ordering::Relaxed) {
+    // Trace futex ops from fork children (verbose only — very noisy).
+    if crate::diag::verbose() && IS_FORK_CHILD.load(Ordering::Relaxed) {
         let pid = unsafe { libc::getpid() };
         let tid = unsafe { libc::pthread_self() } as u64;
         let cur_val = unsafe { (uaddr as *const i32).read_volatile() };
