@@ -53,11 +53,10 @@ emulation-class)` table at build time. This makes the decoder a faithful,
 single-source-of-truth reflection of the architecture rather than a pile of
 hand-tuned bit masks.
 
-> ⚠️ **The ARM ISA XML is not bundled** (it is ARM's copyrighted material under
-> ARM's own license). Before building you must download it from ARM and drop it
-> into `data/encoding/` — see
-> [`data/encoding/README.md`](data/encoding/README.md) for step-by-step
-> instructions. Without it, fakelinux compiles but emulates nothing.
+> The **generated** table is committed under `src/generated/`, so you don't need
+> the ARM XML to build or run fakelinux. The XML itself is *not* bundled (it is
+> ARM's copyrighted material under ARM's own license); you only need it to
+> regenerate the table. See [`data/encoding/README.md`](data/encoding/README.md).
 
 ## Requirements
 
@@ -69,16 +68,23 @@ hand-tuned bit masks.
 
 ## Build
 
-First, install the ARM A64 ISA XML into `data/encoding/` (one-time, not bundled).
-The helper script fetches it from ARM automatically:
+The generated decode table is committed under `src/generated/`, so the emulator
+builds and runs out of the box — **no ARM spec download required**:
 
 ```sh
-scripts/fetch-arm-isa-xml.sh      # downloads the latest A64 ISA XML from ARM
 cargo build --release             # binary at target/release/fakelinux
 ```
 
-See [`data/encoding/README.md`](data/encoding/README.md) if you'd rather install
-it manually or the download needs nudging.
+You only need ARM's ISA XML if you want to *regenerate* that table (e.g. to pick
+up a newer architecture release). Fetch the spec and rebuild with the
+regeneration flag set:
+
+```sh
+scripts/fetch-arm-isa-xml.sh                 # downloads the latest A64 ISA XML
+FAKELINUX_REGEN_DECODER=1 cargo build        # rewrites src/generated/ from the spec
+```
+
+See [`data/encoding/README.md`](data/encoding/README.md) for details.
 
 ## Usage
 

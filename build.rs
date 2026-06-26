@@ -4,8 +4,8 @@
 //! and generates a Rust source file with a decode table for `references_x18()`.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 /// A GPR register field found in an instruction encoding.
@@ -87,14 +87,41 @@ const GPR_FIELD_NAMES: &[&str] = &["Rd", "Rn", "Rm", "Rt", "Rt2", "Ra", "Rs"];
 fn main() {
     println!("cargo:rerun-if-changed=data/encoding/");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=FAKELINUX_REGEN_DECODER");
 
+    // The decode table is committed under src/generated/, so the emulator builds
+    // and works out of the box without the ARM spec. Regeneration is opt-in: it
+    // happens only when FAKELINUX_REGEN_DECODER is set AND the ARM A64 ISA XML is
+    // present in data/encoding/ (install it with scripts/fetch-arm-isa-xml.sh).
+    // Otherwise the committed table is used as-is.
+    let table_path = Path::new("src/generated/x18_table.rs");
+    let tests_path = Path::new("src/generated/x18_tests.rs");
 
-    let encoding_dir = Path::new("data/encoding");
-    if !encoding_dir.exists() {
-        eprintln!("Warning: data/encoding/ not found, skipping table generation");
-        write_empty_table();
+    let regen = std::env::var_os("FAKELINUX_REGEN_DECODER").is_some();
+    if !regen {
+        if !table_path.exists() {
+            eprintln!("Warning: no committed decode table found; writing an empty one. \
+                       Set FAKELINUX_REGEN_DECODER=1 with data/encoding/ populated to generate it.");
+            write_empty_table(table_path, tests_path);
+        }
         return;
     }
+
+    let encoding_dir = Path::new("data/encoding");
+    let have_xml = encoding_dir.exists()
+        && fs::read_dir(encoding_dir).map_or(false, |rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map_or(false, |x| x == "xml"))
+        });
+    if !have_xml {
+        eprintln!("Warning: FAKELINUX_REGEN_DECODER is set but data/encoding/ has no XML. \
+                   Run scripts/fetch-arm-isa-xml.sh first. Keeping the committed table.");
+        if !table_path.exists() {
+            write_empty_table(table_path, tests_path);
+        }
+        return;
+    }
+    eprintln!("build.rs: FAKELINUX_REGEN_DECODER set — regenerating decode table from data/encoding/");
 
     let mut all_encodings: Vec<ParsedEncoding> = Vec::new();
     let mut files_parsed = 0u32;
@@ -347,8 +374,26 @@ fn main() {
         files_skipped
     );
 
-    write_generated_table(&all_encodings);
-    write_generated_tests(&all_encodings);
+    if all_encodings.is_empty() {
+        eprintln!("Warning: parsed 0 encodings from data/encoding/; keeping committed table");
+        return;
+    }
+    write_generated_table(&all_encodings, table_path);
+    write_generated_tests(&all_encodings, tests_path);
+}
+
+/// Write `content` to `path` only if it differs from what's already there.
+/// Avoids rebuild loops and needless git churn when regeneration is a no-op.
+fn write_if_changed(path: &Path, content: &str) {
+    if fs::read_to_string(path).ok().as_deref() == Some(content) {
+        eprintln!("build.rs: {} unchanged", path.display());
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("cannot create generated dir");
+    }
+    fs::write(path, content).expect("cannot write generated file");
+    eprintln!("build.rs: wrote {}", path.display());
 }
 
 /// Parse a <regdiagram> element to extract (mask, value, fields).
@@ -550,18 +595,17 @@ fn get_docvar(node: &roxmltree::Node, key: &str) -> Option<String> {
     None
 }
 
-/// Write the generated table to OUT_DIR.
-fn write_generated_table(encodings: &[ParsedEncoding]) {
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("generated_x18_table.rs");
-    let mut f = fs::File::create(&dest_path).expect("cannot create generated file");
+/// Generate the decode table source and write it to `dest_path` (committed file).
+fn write_generated_table(encodings: &[ParsedEncoding], dest_path: &Path) {
+    let mut f = String::new();
+    let f = &mut f;
 
     writeln!(
         f,
-        "// Auto-generated from ARM A64 ISA XML spec (2026-03)."
+        "// Auto-generated from the ARM A64 ISA XML spec."
     )
     .unwrap();
-    writeln!(f, "// DO NOT EDIT — regenerate by running `cargo build`.").unwrap();
+    writeln!(f, "// DO NOT EDIT — regenerate with FAKELINUX_REGEN_DECODER=1 (see data/encoding/README.md).").unwrap();
     writeln!(f, "//").unwrap();
     writeln!(f, "// {} entries", encodings.len()).unwrap();
     writeln!(f).unwrap();
@@ -613,16 +657,15 @@ fn write_generated_table(encodings: &[ParsedEncoding]) {
 
     writeln!(f, "];").unwrap();
 
-    eprintln!("build.rs: wrote {}", dest_path.display());
+    write_if_changed(dest_path, f);
 }
 
-/// Write generated spot-check tests to OUT_DIR.
-fn write_generated_tests(encodings: &[ParsedEncoding]) {
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("generated_x18_tests.rs");
-    let mut f = fs::File::create(&dest_path).expect("cannot create generated test file");
+/// Generate spot-check tests and write them to `dest_path` (committed file).
+fn write_generated_tests(encodings: &[ParsedEncoding], dest_path: &Path) {
+    let mut f = String::new();
+    let f = &mut f;
 
-    writeln!(f, "// Auto-generated spot-check tests from ARM XML spec.").unwrap();
+    writeln!(f, "// Auto-generated spot-check tests from the ARM A64 ISA XML spec.").unwrap();
     writeln!(f, "// DO NOT EDIT.").unwrap();
     writeln!(f).unwrap();
 
@@ -716,24 +759,17 @@ fn write_generated_tests(encodings: &[ParsedEncoding]) {
         test_count += 1;
     }
 
-    eprintln!(
-        "build.rs: wrote {} spot-check tests to {}",
-        test_count,
-        dest_path.display()
-    );
+    write_if_changed(dest_path, f);
 }
 
-/// Write an empty table (fallback when data/encoding/ is missing).
-fn write_empty_table() {
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("generated_x18_table.rs");
-    let mut f = fs::File::create(&dest_path).expect("cannot create generated file");
-    writeln!(f, "// Empty table — data/encoding/ not found").unwrap();
-    writeln!(f, "#[derive(Debug, Clone, Copy)]").unwrap();
-    writeln!(f, "pub struct GenEntry {{ pub mask: u32, pub value: u32, pub gpr_lsbs: [u8; 5], pub emul_class: u8, pub name: &'static str }}").unwrap();
-    writeln!(f, "pub static GEN_TABLE: &[GenEntry] = &[];").unwrap();
+/// Write an empty table + tests (fallback when no committed table and no spec).
+fn write_empty_table(table_path: &Path, tests_path: &Path) {
+    let mut t = String::new();
+    writeln!(t, "// Empty table — no ARM spec available at build time.").unwrap();
+    writeln!(t, "#[derive(Debug, Clone, Copy)]").unwrap();
+    writeln!(t, "pub struct GenEntry {{ pub mask: u32, pub value: u32, pub gpr_lsbs: [u8; 5], pub emul_class: u8, pub name: &'static str }}").unwrap();
+    writeln!(t, "pub static GEN_TABLE: &[GenEntry] = &[];").unwrap();
+    write_if_changed(table_path, &t);
 
-    let test_path = Path::new(&out_dir).join("generated_x18_tests.rs");
-    let mut f = fs::File::create(&test_path).expect("cannot create generated test file");
-    writeln!(f, "// No tests — data/encoding/ not found").unwrap();
+    write_if_changed(tests_path, "// No tests — no ARM spec available at build time.\n");
 }

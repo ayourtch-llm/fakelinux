@@ -1,10 +1,13 @@
-# ARM A64 ISA encoding XML (not bundled)
+# ARM A64 ISA encoding XML (not bundled — only needed to regenerate the decoder)
 
-The instruction decoder is generated at build time from ARM's machine-readable
-**A64 instruction-set architecture specification**. Those XML files are **not
-vendored in this repository** because they are ARM's copyrighted material under
-ARM's own license — see "Licensing" below. You need to drop them into this
-directory yourself before building the decoder.
+The instruction decoder is generated from ARM's machine-readable **A64
+instruction-set architecture specification**. The *generated* table is committed
+under [`src/generated/`](../../src/generated/), so **fakelinux builds and runs
+without these XML files**. You only need them if you want to regenerate the
+table — for example to track a newer ARM architecture release.
+
+The XML is **not vendored in this repository** because it is ARM's copyrighted
+material under ARM's own license — see "Licensing" below.
 
 ## What goes here
 
@@ -19,7 +22,21 @@ and shared files that ship alongside them. fakelinux was developed against the
 `(mask, value, GPR-field positions, emulation class)` decode table consumed by
 `src/decoder.rs` and `src/trap.rs`.
 
-## How to obtain it
+## Regenerating the decode table
+
+Regeneration is opt-in. `build.rs` rewrites `src/generated/` **only** when the
+`FAKELINUX_REGEN_DECODER` environment variable is set *and* this directory
+contains the XML:
+
+```sh
+scripts/fetch-arm-isa-xml.sh            # install the spec (see below)
+FAKELINUX_REGEN_DECODER=1 cargo build   # regenerate src/generated/ then build
+```
+
+A normal `cargo build` never reads this directory or touches `src/generated/`.
+After regenerating, review and commit the updated files under `src/generated/`.
+
+## How to obtain the XML
 
 Use the helper script. With no arguments it queries ARM's download manifest,
 finds the newest A64 ISA XML release, downloads it, and installs the files:
