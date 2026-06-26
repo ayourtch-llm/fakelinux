@@ -443,7 +443,9 @@ fn host_actual_leaf(path: &[u8]) -> Option<Vec<u8>> {
 ///   - verbatim absent but encoded present (sibling was deleted) -> use encoded
 ///   - otherwise                                        -> verbatim
 fn casefold_pick(dir: &[u8], comp: &[u8]) -> Vec<u8> {
-    if !casefold_enabled() || comp == b"." || comp == b".." || comp.starts_with(CASEFOLD_SENTINEL) {
+    if !casefold_enabled() || comp.is_empty() || comp == b"." || comp == b".."
+        || comp.starts_with(CASEFOLD_SENTINEL)
+    {
         return comp.to_vec();
     }
     let mut cand = dir.to_vec();
