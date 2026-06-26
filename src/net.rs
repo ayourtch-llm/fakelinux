@@ -142,6 +142,19 @@ fn mac_sockaddr_un(host_path: &[u8]) -> Result<(libc::sockaddr_un, libc::socklen
     Ok((sa, len))
 }
 
+/// A short, deterministic host path under /tmp for an AF_UNIX socket whose
+/// re-rooted path is too long for macOS's 104-byte sun_path. Both peers are
+/// fakelinux processes sharing the same rootfs, so they hash the same re-rooted
+/// path to the same rendezvous path and still connect. (FNV-1a 64-bit.)
+fn short_rendezvous_path(host: &[u8]) -> Vec<u8> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in host {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("/tmp/flx-{:016x}.s", h).into_bytes() // 27 bytes, always fits
+}
+
 /// Convert an inbound guest sockaddr for the kernel, re-rooting AF_UNIX
 /// sun_path through the rootfs (bind("/run/vpp/stats.sock") must land inside
 /// FAKELINUX_ROOT, not on the host filesystem). Returns the macOS sockaddr
@@ -154,7 +167,12 @@ fn sockaddr_for_kernel(addr_ptr: u64, addrlen: u32) -> Result<(libc::sockaddr_st
                 if host.ends_with(&[0]) {
                     host.pop();
                 }
-                let (un, len) = mac_sockaddr_un(&host)?;
+                let (un, len) = match mac_sockaddr_un(&host) {
+                    Ok(v) => v,
+                    // Re-rooted path won't fit sun_path — use a short rendezvous
+                    // path under /tmp that both peers derive identically.
+                    Err(_) => mac_sockaddr_un(&short_rendezvous_path(&host))?,
+                };
                 let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -869,6 +887,18 @@ mod tests {
         // Host path too long for macOS's 104-byte sun_path → ENAMETOOLONG.
         let long = vec![b'a'; 200];
         assert_eq!(mac_sockaddr_un(&long).unwrap_err(), 36);
+    }
+
+    #[test]
+    fn short_rendezvous_path_is_deterministic_and_fits() {
+        let long = vec![b'a'; 200];
+        let r1 = short_rendezvous_path(&long);
+        let r2 = short_rendezvous_path(&long);
+        assert_eq!(r1, r2, "must be deterministic so peers agree");
+        assert!(r1.starts_with(b"/tmp/flx-"));
+        assert!(mac_sockaddr_un(&r1).is_ok(), "rendezvous path must fit sun_path");
+        // Different inputs → (almost surely) different paths.
+        assert_ne!(short_rendezvous_path(b"/a/b"), short_rendezvous_path(b"/a/c"));
     }
 
     #[test]
