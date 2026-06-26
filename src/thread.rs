@@ -1104,7 +1104,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
     }
 
     // Wait
-    let guard = waiter.mutex.lock().unwrap();
+    let mut guard = waiter.mutex.lock().unwrap();
     if *guard {
         // Already woken
         return 0;
@@ -1123,32 +1123,37 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
             0
         }
         None => {
-            // Diagnostic: use a 3-second timeout to detect deadlocks.
-            // A single-threaded forked child with an infinite futex_wait
-            // will NEVER be woken — detect and log this.
-            let result = waiter.condvar.wait_timeout(guard, Duration::from_secs(3)).unwrap();
-            if result.1.timed_out() && !*result.0 {
-                let pid = unsafe { libc::getpid() };
-                let cur_val = current.load(Ordering::SeqCst);
-                let guest_pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
-                let mut buf = [0u8; 250];
-                let n = {
-                    use std::io::Write;
-                    let mut c = std::io::Cursor::new(&mut buf[..]);
-                    let _ = c.write_fmt(format_args!(
-                        "fakelinux: [{}] FUTEX_DEADLOCK uaddr={:#x} val={} cur={} pc={:#x} — aborting wait\n",
-                        pid, uaddr, val, cur_val, guest_pc
-                    ));
-                    c.position() as usize
-                };
-                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
-                // Remove ourselves from waiter list
-                if let Ok(mut waiters) = entry.waiters.lock() {
-                    waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+            // No timeout: wait indefinitely until woken — that's the Linux
+            // contract. We loop wait_timeout (rather than a bare wait) only so a
+            // genuinely stuck wait can be reported under verbose; we never abort,
+            // since returning a spurious -EAGAIN breaks legitimate long blocks
+            // (timers, idle worker threads) and busy-loops the guest.
+            loop {
+                if *guard {
+                    return 0;
                 }
-                return (-11_i64) as u64; // -EAGAIN to break out
+                let result = waiter.condvar.wait_timeout(guard, Duration::from_secs(30)).unwrap();
+                guard = result.0;
+                if *guard {
+                    return 0;
+                }
+                if crate::diag::verbose() && result.1.timed_out() {
+                    let pid = unsafe { libc::getpid() };
+                    let cur_val = current.load(Ordering::SeqCst);
+                    let guest_pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
+                    let mut buf = [0u8; 250];
+                    let n = {
+                        use std::io::Write;
+                        let mut c = std::io::Cursor::new(&mut buf[..]);
+                        let _ = c.write_fmt(format_args!(
+                            "fakelinux: [{}] FUTEX_LONGWAIT uaddr={:#x} val={} cur={} pc={:#x} — still waiting\n",
+                            pid, uaddr, val, cur_val, guest_pc
+                        ));
+                        c.position() as usize
+                    };
+                    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                }
             }
-            0
         }
     }
 }
