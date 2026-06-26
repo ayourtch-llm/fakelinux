@@ -87,7 +87,7 @@ EOF
 
 ARG="${1:-${ARM_ISA_XML_URL:-}}"
 if [ -z "$ARG" ]; then
-  note "No source given — querying ARM's download manifest for the latest A64 ISA XML…"
+  note "No source given — querying ARM's download manifest for the latest A64 ISA XML..."
   if ARG="$(resolve_arm_url)" && [ -n "$ARG" ]; then
     note "Resolved: $ARG"
   else
@@ -141,7 +141,7 @@ EOF
       exit 1
     fi
   fi
-  note "Extracting…"
+  note "Extracting..."
   tar -xf "$TARBALL" -C "$WORK"
   SRC_DIR="$WORK"
 fi
@@ -159,7 +159,7 @@ if ! find "$SRC_DIR" -name 'encodingindex.xml' | grep -q . \
 fi
 
 mkdir -p "$DEST"
-note "Copying $xml_count XML files (and any .dtd schemas) into data/encoding/ …"
+note "Copying $xml_count XML files (and any .dtd schemas) into data/encoding/ ..."
 find "$SRC_DIR" \( -name '*.xml' -o -name '*.dtd' \) -exec cp -f {} "$DEST"/ \;
 
 final="$(find "$DEST" -maxdepth 1 -name '*.xml' | wc -l | tr -d ' ')"

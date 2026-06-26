@@ -9,10 +9,14 @@
 # macOS, with only syscalls emulated.
 #
 # Usage:
+#   scripts/build-vpp.sh all        # build, then verify it boots  (default)
 #   scripts/build-vpp.sh build      # fetch rootfs (if needed), deps, clone, compile
+#   scripts/build-vpp.sh verify     # boot VPP non-interactively, check it runs
 #   scripts/build-vpp.sh run        # launch the built VPP (interactive CLI)
-#   scripts/build-vpp.sh all        # build, then run  (default)
 #   scripts/build-vpp.sh shell      # drop into a guest shell in the rootfs
+#
+# Fully scripted end to end: from nothing it creates a case-sensitive volume,
+# pulls ubuntu:24.04, installs deps, clones+builds VPP, and verifies it runs.
 #
 # Tunables (environment):
 #   ROOTFS     guest tree to use            (default: roots/ubuntu)
@@ -54,8 +58,21 @@ guest() {
     "./$FAKELINUX_BIN" --container "$ROOTFS/usr/bin/bash" -lc "$1"
 }
 
+# Run a command with a wall-clock limit. Uses timeout/gtimeout if present,
+# otherwise a portable perl alarm fallback (perl ships with macOS). stdin is
+# inherited so we can feed the guest commands.
+run_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  else perl -e 'my $s=shift; my $p=fork; if(!$p){exec @ARGV or exit 127}
+                local $SIG{ALRM}=sub{kill 9,$p; exit 124}; alarm $s;
+                waitpid($p,0); exit($?>>8)' "$secs" "$@"
+  fi
+}
+
 ensure_prereqs() {
-  [ -x "$FAKELINUX_BIN" ] || { note "building fakelinux…"; cargo build --release; }
+  [ -x "$FAKELINUX_BIN" ] || { note "building fakelinux..."; cargo build --release; }
 
   # Ensure the volume that holds ROOTFS is case-sensitive (required for kernel
   # headers). If ROOTFS sits under a dedicated dir (e.g. roots-cs/), set up a
@@ -66,7 +83,7 @@ ensure_prereqs() {
   scripts/make-case-sensitive-volume.sh "$vol_mount"
 
   if [ ! -d "$ROOTFS/usr/bin" ]; then
-    note "no rootfs at $ROOTFS — fetching ubuntu:24.04…"
+    note "no rootfs at $ROOTFS — fetching ubuntu:24.04..."
     ROOTS_DIR="$roots_dir" scripts/fetch-rootfs.sh "$(basename "$ROOTFS")" ubuntu:24.04
   fi
 }
@@ -129,21 +146,46 @@ do_build() {
   note "VPP binary: $ROOTFS/$VPP_BIN_REL"
 }
 
-do_run() {
-  [ -x "$ROOTFS/$VPP_BIN_REL" ] || die "VPP not built yet — run: scripts/build-vpp.sh build"
-  # Reset stale runtime state from any previous run.
+VPP_CONF='unix { nodaemon interactive cli-listen /run/vpp/cli.sock } plugins { plugin dpdk_plugin.so { disable } }'
+
+reset_runtime() {
   rm -f "$ROOTFS"/dev/shm/* 2>/dev/null || true
   mkdir -p "$ROOTFS/run/vpp"
-  note "starting VPP (interactive CLI; Ctrl-D / 'quit' to exit)…"
+}
+
+do_run() {
+  [ -x "$ROOTFS/$VPP_BIN_REL" ] || die "VPP not built yet — run: scripts/build-vpp.sh build"
+  reset_runtime
+  note "starting VPP (interactive CLI; Ctrl-D / 'quit' to exit)..."
   FAKELINUX_ROOT="$REPO_DIR/$ROOTFS" FAKELINUX_PAGESZ=16384 \
-    "./$FAKELINUX_BIN" --container "$ROOTFS/$VPP_BIN_REL" \
-    'unix { nodaemon interactive cli-listen /run/vpp/cli.sock } plugins { plugin dpdk_plugin.so { disable } }'
+    "./$FAKELINUX_BIN" --container "$ROOTFS/$VPP_BIN_REL" "$VPP_CONF"
+}
+
+# Boot VPP non-interactively, feed it a couple of CLI commands, and confirm it
+# actually came up by checking for the version banner. Fully automated.
+do_verify() {
+  [ -x "$ROOTFS/$VPP_BIN_REL" ] || die "VPP not built yet — run: scripts/build-vpp.sh build"
+  reset_runtime
+  note "verifying VPP boots and responds on its CLI..."
+  local out
+  out="$(printf 'show version\nshow threads\nshow cpu\nquit\n' | \
+    FAKELINUX_ROOT="$REPO_DIR/$ROOTFS" FAKELINUX_PAGESZ=16384 \
+    run_timeout 180 "./$FAKELINUX_BIN" --container "$ROOTFS/$VPP_BIN_REL" "$VPP_CONF" 2>&1 || true)"
+  echo "$out" | grep -aiE 'vpp v[0-9]|Version:|vpp#' | head -5
+  if echo "$out" | grep -qaiE 'vpp v[0-9]'; then
+    note "VPP RAN: version banner observed. VERIFIED."
+  else
+    echo "--- last lines of VPP output ---"
+    echo "$out" | grep -avE 'fakelinux:' | tail -25
+    die "VPP did not produce a version banner — see output above."
+  fi
 }
 
 case "${1:-all}" in
-  build) do_build ;;
-  run)   do_run ;;
-  all)   do_build; do_run ;;
-  shell) ensure_prereqs; guest "${2:-bash}" ;;
-  *) die "usage: scripts/build-vpp.sh {build|run|all|shell}" ;;
+  build)  do_build ;;
+  run)    do_run ;;
+  verify) do_verify ;;
+  all)    do_build; do_verify ;;
+  shell)  ensure_prereqs; guest "${2:-bash}" ;;
+  *) die "usage: scripts/build-vpp.sh {build|run|verify|all|shell}" ;;
 esac

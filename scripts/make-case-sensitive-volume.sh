@@ -56,12 +56,12 @@ if [ -n "$(ls -A "$MNT" 2>/dev/null)" ]; then
 fi
 
 if [ ! -e "$IMG" ]; then
-  note "creating case-sensitive APFS sparse image at $IMG ($SIZE nominal, sparse)…"
+  note "creating case-sensitive APFS sparse image at $IMG ($SIZE nominal, sparse)..."
   hdiutil create -size "$SIZE" -type SPARSE -fs "Case-sensitive APFS" \
     -volname fakelinux-roots "$IMG" >/dev/null
 fi
 
-note "attaching $IMG at $MNT…"
+note "attaching $IMG at $MNT..."
 hdiutil attach "$IMG" -mountpoint "$MNT" -nobrowse >/dev/null
 
 is_case_sensitive "$MNT" || die "mounted volume is not case-sensitive — unexpected."

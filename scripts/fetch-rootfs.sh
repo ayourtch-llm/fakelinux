@@ -64,7 +64,7 @@ fi
 # Build the puller if needed.
 PULL="$REPO_DIR/target/release/fakelinux-pull"
 if [ ! -x "$PULL" ]; then
-  note "Building fakelinux-pull…"
+  note "Building fakelinux-pull..."
   ( cd "$REPO_DIR" && cargo build --release --bin fakelinux-pull )
 fi
 
@@ -83,7 +83,7 @@ TMP="$REPO_DIR/$ROOTS/.$NAME.partial.$$"
 nuke "$TMP"
 trap 'nuke "$TMP"' EXIT
 
-note "Pulling $IMAGE (linux/arm64) into $ROOTS/$NAME …"
+note "Pulling $IMAGE (linux/arm64) into $ROOTS/$NAME ..."
 "$PULL" "$IMAGE" "$TMP"
 
 nuke "$DEST"
