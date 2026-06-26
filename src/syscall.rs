@@ -1143,8 +1143,63 @@ fn do_ioctl(fd: i32, request: u64, arg: u64) -> u64 {
             unsafe { (arg as *mut u32).write_unaligned(num); }
             0
         }
+        // Network-device ioctls (SIOCGIF*) on a socket. macOS uses different
+        // numbers/structs, and the interfaces don't match anyway, so synthesize
+        // answers for the loopback we advertise in /proc/net/dev. scapy (in VPP's
+        // test framework) enumerates interfaces this way.
+        0x8910..=0x8935 => siocgif(request, arg),
         _ => (-25_i64) as u64, // -ENOTTY
     }
+}
+
+/// Synthesize Linux SIOCGIF* responses for the loopback interface. The argument
+/// is a `struct ifreq`: char ifr_name[16] then a union at offset 16. Returns 0
+/// (and fills the union) for "lo", -ENODEV for any other interface.
+fn siocgif(request: u64, arg: u64) -> u64 {
+    if arg == 0 {
+        return (-14_i64) as u64; // -EFAULT
+    }
+    // ifr_name is NUL-terminated within the first 16 bytes.
+    let name = unsafe { std::slice::from_raw_parts(arg as *const u8, 16) };
+    let end = name.iter().position(|&b| b == 0).unwrap_or(16);
+    if &name[..end] != b"lo" {
+        return (-19_i64) as u64; // -ENODEV
+    }
+    let u = (arg + 16) as *mut u8; // start of the ifr_* union
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    const SIOCGIFADDR: u64 = 0x8915;
+    const SIOCGIFNETMASK: u64 = 0x891b;
+    const SIOCGIFMTU: u64 = 0x8921;
+    const SIOCGIFHWADDR: u64 = 0x8927;
+    const SIOCGIFINDEX: u64 = 0x8933;
+    unsafe {
+        match request {
+            // ifr_flags (short): IFF_UP | IFF_LOOPBACK | IFF_RUNNING.
+            SIOCGIFFLAGS => (u as *mut u16).write_unaligned(0x0001 | 0x0008 | 0x0040),
+            // ifr_ifindex (int): loopback is index 1.
+            SIOCGIFINDEX => (u as *mut i32).write_unaligned(1),
+            // ifr_mtu (int).
+            SIOCGIFMTU => (u as *mut i32).write_unaligned(65536),
+            // ifr_addr / ifr_netmask: sockaddr_in {family, port, addr}.
+            SIOCGIFADDR | SIOCGIFNETMASK => {
+                std::ptr::write_bytes(u, 0, 16);
+                (u as *mut u16).write_unaligned(2); // AF_INET
+                let octets: [u8; 4] = if request == SIOCGIFADDR {
+                    [127, 0, 0, 1]
+                } else {
+                    [255, 0, 0, 0]
+                };
+                std::ptr::copy_nonoverlapping(octets.as_ptr(), u.add(4), 4); // sin_addr
+            }
+            // ifr_hwaddr: sockaddr { family = ARPHRD_LOOPBACK(772), 6-byte zero MAC }.
+            SIOCGIFHWADDR => {
+                std::ptr::write_bytes(u, 0, 16);
+                (u as *mut u16).write_unaligned(772);
+            }
+            _ => return (-25_i64) as u64, // unsupported SIOC* → -ENOTTY
+        }
+    }
+    0
 }
 
 // ─── Termios flag translation (Linux ↔ macOS) ──────────────────────────────
