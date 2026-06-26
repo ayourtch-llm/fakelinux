@@ -453,6 +453,9 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         "/proc/stat" => Some(generate_proc_stat()),
         "/proc/loadavg" => Some(generate_loadavg()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
+        // Default Linux core dump pattern. VPP's test framework reads this to
+        // locate core files after a crash (test/util.py get_core_pattern).
+        "/proc/sys/kernel/core_pattern" => Some(b"core\n".to_vec()),
         _ if path.starts_with("/sys/") => sysfs_content(path, host_ncpus()),
         _ => {
             // Check if this is /proc/<vpid>/stat or /proc/<vpid>/status for
