@@ -22,6 +22,24 @@ is used as the branch scratch register, which is acceptable per AAPCS.
 Replaced posix_spawn with real execve, which preserves the child's exact
 fd table (pipe redirections, dup2'd fds) across exec.
 
+### ~~FUTEX_WAIT_BITSET absolute timeout treated as relative~~ FIXED (5973fac)
+`FUTEX_WAIT_BITSET` (used by Python 3.12's lock-with-timeout, i.e. every
+`threading.Event.wait(t)` / `Condition.wait(t)`) carries an ABSOLUTE
+CLOCK_MONOTONIC deadline, but parse_timeout treated all timeouts as relative —
+so "wait 3s" became "wait ~seconds-since-boot" ≈ forever. Now converted to
+relative by subtracting the current host clock; the timed wait is also
+signal-interruptible. Was: the VPP test harness hung after a passing test class.
+
+### ~~Process-shared futexes don't wake across fork~~ FIXED (1c5de0e)
+A futex without `FUTEX_PRIVATE_FLAG` is process-shared: the wake can come from
+another process (e.g. Python multiprocessing semaphores between a fork parent
+and its `ProcessPoolExecutor` workers). The futex table is per-process, so a
+remote `FUTEX_WAKE` never reached the waiter's condvar and it slept forever —
+deadlocking any `multiprocessing.Pool` workload (e.g. the harness's post-run
+`expand_ppp.py` hexdump expansion). Fix: the futex word lives in fork-shared
+memory, so a shared-futex waiter polls `*uaddr` (10ms) and returns a
+spurious-but-correct wake when a remote waker changes it; the guest re-checks.
+
 ## Medium Priority
 
 ### ~~SA_SIGINFO not supported~~ FIXED (87d26c2)
