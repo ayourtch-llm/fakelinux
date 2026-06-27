@@ -1096,17 +1096,24 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
     }
 
     let realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
+    // A futex WITHOUT FUTEX_PRIVATE_FLAG is process-SHARED: the wake may come
+    // from another process (e.g. multiprocessing semaphores between a fork
+    // parent and its workers). Our futex table is per-process, so a remote
+    // FUTEX_WAKE can't reach our condvar — but the futex word itself lives in
+    // memory shared across the fork, so the waiter detects the change by polling
+    // *uaddr. Tell futex_wait to do that (and poll faster) for shared futexes.
+    let shared = (op & FUTEX_PRIVATE_FLAG) == 0;
     match cmd {
         FUTEX_WAIT => {
             // FUTEX_WAIT always uses a RELATIVE timeout.
-            futex_wait(uaddr, val, timeout_or_val2, FUTEX_BITSET_MATCH_ANY, false, realtime)
+            futex_wait(uaddr, val, timeout_or_val2, FUTEX_BITSET_MATCH_ANY, false, realtime, shared)
         }
         FUTEX_WAKE => {
             futex_wake(uaddr, val, FUTEX_BITSET_MATCH_ANY)
         }
         FUTEX_WAIT_BITSET => {
             // FUTEX_WAIT_BITSET uses an ABSOLUTE deadline.
-            futex_wait(uaddr, val, timeout_or_val2, val3, true, realtime)
+            futex_wait(uaddr, val, timeout_or_val2, val3, true, realtime, shared)
         }
         FUTEX_WAKE_BITSET => {
             futex_wake(uaddr, val, val3)
@@ -1125,12 +1132,19 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
     }
 }
 
-fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool, realtime: bool) -> u64 {
+fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool, realtime: bool, shared: bool) -> u64 {
     // Check if *uaddr == val; if so, sleep until woken
     let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
     if current.load(Ordering::SeqCst) != val as i32 {
         return (-11_i64) as u64; // -EAGAIN (Linux value)
     }
+
+    // Poll interval. For process-shared futexes the wake can only be observed by
+    // re-reading the shared futex word (a remote FUTEX_WAKE never reaches our
+    // per-process condvar), so poll frequently to keep cross-process latency low.
+    // Private futexes get woken directly via the condvar, so a long interval is
+    // fine — it only bounds signal-delivery latency.
+    let poll_ms = if shared { 10 } else { 200 };
 
     let timeout = parse_timeout(timeout_ptr, abstime, realtime);
 
@@ -1170,6 +1184,16 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                 if *guard {
                     return 0;
                 }
+                // Cross-process wake detection: the futex word is shared memory,
+                // so if it no longer holds `val` a remote waker has changed it —
+                // return a (spurious-but-correct) wake; the guest re-checks.
+                if current.load(Ordering::SeqCst) != val as i32 {
+                    drop(guard);
+                    if let Ok(mut waiters) = entry.waiters.lock() {
+                        waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                    }
+                    return 0;
+                }
                 let now = Instant::now();
                 if now >= deadline {
                     if let Ok(mut waiters) = entry.waiters.lock() {
@@ -1184,7 +1208,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                     }
                     return (-4_i64) as u64; // -EINTR
                 }
-                let chunk = (deadline - now).min(Duration::from_millis(200));
+                let chunk = (deadline - now).min(Duration::from_millis(poll_ms));
                 let result = {
                     let _unblock = crate::signal::HostSigUnblock::new();
                     waiter.condvar.wait_timeout(guard, chunk).unwrap()
@@ -1203,6 +1227,16 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                 if *guard {
                     return 0;
                 }
+                // Cross-process wake detection (see the Some(timeout) arm): a
+                // remote FUTEX_WAKE can't reach our condvar, but it changed the
+                // shared futex word, so observe that and return a spurious wake.
+                if current.load(Ordering::SeqCst) != val as i32 {
+                    drop(guard);
+                    if let Ok(mut waiters) = entry.waiters.lock() {
+                        waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                    }
+                    return 0;
+                }
                 if crate::signal::deliverable_pending() != 0 {
                     drop(guard); // release waiter.mutex before taking entry.waiters
                     if let Ok(mut waiters) = entry.waiters.lock() {
@@ -1218,7 +1252,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                     let _unblock = crate::signal::HostSigUnblock::new();
                     waiter
                         .condvar
-                        .wait_timeout(guard, Duration::from_millis(200))
+                        .wait_timeout(guard, Duration::from_millis(poll_ms))
                         .unwrap()
                 };
                 guard = result.0;
