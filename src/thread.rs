@@ -1146,10 +1146,56 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
     }
 }
 
+// Livelock detector: count rapid futex_wait re-entries on the same uaddr.
+// If a thread re-enters futex_wait for the same uaddr within 2ms, bump a
+// counter. Every 200th rapid re-entry, log the details (uaddr, val, cur word,
+// shared, last ret). This catches the StatsClient spin without being noisy.
+static FUTEX_SPIN_LOG: AtomicU64 = AtomicU64::new(0);
+static FUTEX_SPIN_UADDR: AtomicU64 = AtomicU64::new(0);
+static FUTEX_SPIN_TS: AtomicU64 = AtomicU64::new(0);
+
 fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool, realtime: bool, shared: bool) -> u64 {
+    // ── Livelock detector ──
+    let mut ts_now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts_now); }
+    let now = ts_now.tv_sec as u64 * 1_000_000_000 + ts_now.tv_nsec as u64;
+    let prev_addr = FUTEX_SPIN_UADDR.load(Ordering::Relaxed);
+    let prev_ts = FUTEX_SPIN_TS.load(Ordering::Relaxed);
+    let rapid = prev_addr == uaddr && now.saturating_sub(prev_ts) < 2_000_000;
+    FUTEX_SPIN_UADDR.store(uaddr, Ordering::Relaxed);
+    FUTEX_SPIN_TS.store(now, Ordering::Relaxed);
+    if rapid {
+        let n = FUTEX_SPIN_LOG.fetch_add(1, Ordering::Relaxed);
+        if n % 200 == 0 {
+            let cur = unsafe { (uaddr as *const i32).read_volatile() };
+            let pend = crate::signal::deliverable_pending();
+            let pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
+            let pid = unsafe { libc::getpid() };
+            let tid = unsafe { libc::pthread_self() } as u64;
+            let buf = &mut [0u8; 256];
+            let m = crate::trap::raw_fmt(buf, format_args!(
+                "fakelinux: [{}] FUTEX_SPIN #{:#x} uaddr={:#x} val={} cur={} shared={} pend={:#x} tid={:#x} pc={:#x}\n",
+                pid, n, uaddr, val, cur, shared, pend, tid, pc));
+            unsafe { libc::write(2, buf.as_ptr() as *const _, m); }
+        }
+    }
+
     // Check if *uaddr == val; if so, sleep until woken
     let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
     if current.load(Ordering::SeqCst) != val as i32 {
+        // -EAGAIN: the word changed since the caller last checked. On real Linux
+        // this is a ~100ns syscall, but on fakelinux each iteration costs ~5-10μs
+        // (SIGILL trap overhead). A guest lock-contention loop (CAS→futex→-EAGAIN
+        // →retry) burns 100% CPU here vs ~1% on Linux. If rapid re-entries were
+        // seen recently (within 1s), yield the core so whoever holds the lock can
+        // run. This mirrors the implicit scheduling the kernel does on syscall
+        // entry/exit — which the SIGILL trap bypasses.
+        let spin_n = FUTEX_SPIN_LOG.load(Ordering::Relaxed);
+        let spin_ts = FUTEX_SPIN_TS.load(Ordering::Relaxed);
+        let spin_active = spin_n > 200 && now.saturating_sub(spin_ts) < 1_000_000_000;
+        if spin_active {
+            unsafe { libc::sched_yield(); }
+        }
         return (-11_i64) as u64; // -EAGAIN (Linux value)
     }
 
