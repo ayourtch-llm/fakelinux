@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, Arc};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ─── Saved CLOEXEC mask for fork children ──────────────────────────────────
 //
@@ -1040,7 +1040,7 @@ fn get_futex(addr: u64) -> Arc<FutexEntry> {
 }
 
 /// Parse a Linux timespec from guest memory into a Duration.
-fn parse_timeout(timeout_ptr: u64) -> Option<Duration> {
+fn parse_timeout(timeout_ptr: u64, abstime: bool, realtime: bool) -> Option<Duration> {
     if timeout_ptr == 0 {
         return None;
     }
@@ -1050,7 +1050,26 @@ fn parse_timeout(timeout_ptr: u64) -> Option<Duration> {
         if tv_sec < 0 || tv_nsec < 0 {
             return None;
         }
-        Some(Duration::new(tv_sec as u64, tv_nsec as u32))
+        let target = Duration::new(tv_sec as u64, tv_nsec as u32);
+        if !abstime {
+            return Some(target); // FUTEX_WAIT: relative timeout
+        }
+        // FUTEX_WAIT_BITSET: the timespec is an ABSOLUTE deadline against
+        // CLOCK_MONOTONIC (or CLOCK_REALTIME if FUTEX_CLOCK_REALTIME). The guest
+        // reads the same host clock via clock_gettime (1:1), so subtract the
+        // current host clock to recover a relative duration. Treating the
+        // absolute value as relative would wait ~forever (it's seconds-since-boot
+        // or epoch), which is exactly what hangs Python's lock-with-timeout.
+        let clk = if realtime {
+            libc::CLOCK_REALTIME
+        } else {
+            libc::CLOCK_MONOTONIC
+        };
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        libc::clock_gettime(clk, &mut now);
+        let now_d = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+        // saturating: if the deadline already passed, time out immediately.
+        Some(target.saturating_sub(now_d))
     }
 }
 
@@ -1076,15 +1095,18 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
         unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
     }
 
+    let realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
     match cmd {
         FUTEX_WAIT => {
-            futex_wait(uaddr, val, timeout_or_val2, FUTEX_BITSET_MATCH_ANY)
+            // FUTEX_WAIT always uses a RELATIVE timeout.
+            futex_wait(uaddr, val, timeout_or_val2, FUTEX_BITSET_MATCH_ANY, false, realtime)
         }
         FUTEX_WAKE => {
             futex_wake(uaddr, val, FUTEX_BITSET_MATCH_ANY)
         }
         FUTEX_WAIT_BITSET => {
-            futex_wait(uaddr, val, timeout_or_val2, val3)
+            // FUTEX_WAIT_BITSET uses an ABSOLUTE deadline.
+            futex_wait(uaddr, val, timeout_or_val2, val3, true, realtime)
         }
         FUTEX_WAKE_BITSET => {
             futex_wake(uaddr, val, val3)
@@ -1103,14 +1125,14 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
     }
 }
 
-fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
+fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool, realtime: bool) -> u64 {
     // Check if *uaddr == val; if so, sleep until woken
     let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
     if current.load(Ordering::SeqCst) != val as i32 {
         return (-11_i64) as u64; // -EAGAIN (Linux value)
     }
 
-    let timeout = parse_timeout(timeout_ptr);
+    let timeout = parse_timeout(timeout_ptr, abstime, realtime);
 
     let entry = get_futex(uaddr);
     let waiter = Arc::new(FutexWaiter {
@@ -1138,15 +1160,37 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
 
     match timeout {
         Some(dur) => {
-            let result = waiter.condvar.wait_timeout(guard, dur).unwrap();
-            if result.1.timed_out() && !*result.0 {
-                // Remove ourselves from waiter list on timeout
-                if let Ok(mut waiters) = entry.waiters.lock() {
-                    waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+            // Timed wait, but signal-interruptible: chunk the deadline into
+            // short slices and check PENDING_SIGNALS between them, mirroring the
+            // None path. A bare wait_timeout(dur) would ignore signals for the
+            // whole duration (host condvar isn't signal-aware) — on Linux a
+            // FUTEX_WAIT with timeout still returns -EINTR on a delivered signal.
+            let deadline = Instant::now() + dur;
+            loop {
+                if *guard {
+                    return 0;
                 }
-                return (-110_i64) as u64; // -ETIMEDOUT (Linux value)
+                let now = Instant::now();
+                if now >= deadline {
+                    if let Ok(mut waiters) = entry.waiters.lock() {
+                        waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                    }
+                    return (-110_i64) as u64; // -ETIMEDOUT (Linux value)
+                }
+                if crate::signal::deliverable_pending() != 0 {
+                    drop(guard);
+                    if let Ok(mut waiters) = entry.waiters.lock() {
+                        waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                    }
+                    return (-4_i64) as u64; // -EINTR
+                }
+                let chunk = (deadline - now).min(Duration::from_millis(200));
+                let result = {
+                    let _unblock = crate::signal::HostSigUnblock::new();
+                    waiter.condvar.wait_timeout(guard, chunk).unwrap()
+                };
+                guard = result.0;
             }
-            0
         }
         None => {
             // No timeout: wait until woken — the Linux contract. But the wait
