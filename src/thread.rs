@@ -153,6 +153,20 @@ pub fn main_tid() -> i32 {
     MAIN_TID.load(Ordering::SeqCst)
 }
 
+/// Reset guest TID bookkeeping in a fork child.
+///
+/// After fork(), only the calling pthread survives. If the fork was issued by a
+/// non-main guest thread, the inherited MAIN_TID still names a vanished parent
+/// thread. Treating the surviving child thread as non-main makes SYS_EXIT call
+/// pthread_exit(), leaving helper pthreads alive and blocked in process teardown.
+fn reset_main_thread_after_fork() {
+    let tid = alloc_tid();
+    MAIN_TID.store(tid, Ordering::SeqCst);
+    CURRENT_TID.store(tid, Ordering::SeqCst);
+    set_thread_tid(tid);
+    set_clear_tid_ptr(0);
+}
+
 // Global fallback TID (for backward compat, used when pthread key not yet set)
 pub static CURRENT_TID: AtomicI32 = AtomicI32::new(0);
 
@@ -789,6 +803,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // Child: re-initialize signal handling (fresh alt stack, re-install
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
+        reset_main_thread_after_fork();
         IS_FORK_CHILD.store(true, Ordering::Relaxed);
         // A fork child is never vpid 1 — clear the COW-inherited init flag so
         // getpid() returns the child's own pid (not 1), keeping job-control
@@ -1425,6 +1440,28 @@ mod tests {
         // Hard cap: a runaway spin sleeps no more than the cap.
         assert!(c <= 1_000, "backoff must stay bounded");
         assert_eq!(futex_spin_backoff_us(u64::MAX), c, "cap holds at the extreme");
+    }
+
+    #[test]
+    fn fork_child_reset_makes_surviving_thread_main() {
+        let old_main = MAIN_TID.load(Ordering::SeqCst);
+        let old_current = CURRENT_TID.load(Ordering::SeqCst);
+        let old_clear_tid = get_clear_tid_ptr();
+
+        MAIN_TID.store(111, Ordering::SeqCst);
+        CURRENT_TID.store(222, Ordering::SeqCst);
+        set_thread_tid(222);
+        set_clear_tid_ptr(0x1234);
+
+        reset_main_thread_after_fork();
+        assert_eq!(current_tid(), main_tid());
+        assert_ne!(current_tid(), 111);
+        assert_eq!(get_clear_tid_ptr(), 0);
+
+        MAIN_TID.store(old_main, Ordering::SeqCst);
+        CURRENT_TID.store(old_current, Ordering::SeqCst);
+        set_thread_tid(old_current);
+        set_clear_tid_ptr(old_clear_tid);
     }
 
     // Lifecycle of the saved-CLOEXEC mask across fork→(dup2/close)→exec.
