@@ -296,6 +296,36 @@ fn apply_sock_flags(fd: i32, nonblock: bool, cloexec: bool) {
     }
 }
 
+/// Linux's default AF_UNIX socket buffer size (net.core.{r,w}mem_default).
+const LINUX_UNIX_SOCKBUF: libc::c_int = 212992;
+
+/// Raise an AF_UNIX socket's send/recv buffers to Linux's default size.
+///
+/// macOS defaults AF_UNIX stream buffers to 8 KiB (net.local.stream.{send,recv}space)
+/// whereas Linux uses 212992. VPP relies on the larger Linux buffer: its socket-API
+/// replies are sent non-blocking and only drain via an EPOLLOUT round-trip once the
+/// kernel buffer is full. A big reply (e.g. `log_dump` streams >150 KiB of
+/// log_details) fits one send() on Linux, but on macOS's 8 KiB buffer it drip-feeds
+/// ~2 KiB per main-loop poll cycle — so slowly the client gives up with
+/// "VPP API client: read failed". macOS honors SO_SNDBUF/SO_RCVBUF on AF_UNIX up to
+/// kern.ipc.maxsockbuf (8 MiB) with capacity scaling linearly, so 212992 is always
+/// accepted. Only AF_UNIX is touched; AF_INET/INET6 keep the kernel's TCP autotuning.
+fn bump_unix_sockbuf(fd: i32) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let r = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+    if r != 0 || ss.ss_family != libc::AF_UNIX as libc::sa_family_t {
+        return;
+    }
+    let want = LINUX_UNIX_SOCKBUF;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &want as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &want as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+}
+
 pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
     let (mut base_type, nonblock, cloexec) = extract_sock_flags(type_);
     let mac_domain = if domain == 10 { 30 } else { domain }; // Linux AF_INET6=10, macOS=30
@@ -311,6 +341,9 @@ pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
         return translate::linux_errno();
     }
     apply_sock_flags(fd, nonblock, cloexec);
+    if mac_domain == libc::AF_UNIX {
+        bump_unix_sockbuf(fd);
+    }
     fd as u64
 }
 
@@ -403,6 +436,9 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
     let nonblock = flags & LINUX_SOCK_NONBLOCK != 0;
     let cloexec = flags & LINUX_SOCK_CLOEXEC != 0;
     apply_sock_flags(ret, nonblock, cloexec);
+    // Accepted AF_UNIX connections (e.g. VPP's socket-API clients) need Linux-sized
+    // buffers so large replies aren't throttled by macOS's 8 KiB default.
+    bump_unix_sockbuf(ret);
     ret as u64
 }
 
@@ -622,6 +658,10 @@ pub fn do_socketpair(domain: i32, type_: i32, protocol: i32, sv_ptr: u64) -> u64
     let sv = unsafe { std::slice::from_raw_parts(sv_ptr as *const i32, 2) };
     apply_sock_flags(sv[0], nonblock, cloexec);
     apply_sock_flags(sv[1], nonblock, cloexec);
+    if domain == libc::AF_UNIX {
+        bump_unix_sockbuf(sv[0]);
+        bump_unix_sockbuf(sv[1]);
+    }
     0
 }
 
@@ -930,6 +970,42 @@ mod tests {
         let r = do_socket(1, LINUX_SOCK_SEQPACKET, 0);
         assert!((r as i64) >= 0, "AF_UNIX SEQPACKET socket failed: {}", r as i64);
         unsafe { libc::close(r as i32); }
+    }
+
+    #[test]
+    fn unix_sockets_get_linux_sized_buffers() {
+        // macOS defaults AF_UNIX stream buffers to 8 KiB; Linux uses 212992.
+        // VPP's socket-API replies (e.g. log_dump streams >150 KiB) are sent
+        // non-blocking and rely on the big Linux buffer to land in one shot —
+        // with 8 KiB they drip-feed via EPOLLOUT until the client times out
+        // ("VPP API client: read failed"). do_socketpair must raise both ends.
+        let mut sv = [0i32; 2];
+        let r = do_socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr() as u64);
+        assert_eq!(r, 0, "socketpair failed: {}", r as i64);
+        for &fd in &sv {
+            let mut bufsz: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            unsafe {
+                libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                    &mut bufsz as *mut _ as *mut libc::c_void, &mut len);
+            }
+            assert!(bufsz >= LINUX_UNIX_SOCKBUF,
+                "AF_UNIX SO_SNDBUF {} < Linux default {}", bufsz, LINUX_UNIX_SOCKBUF);
+        }
+        // The buffer must actually absorb a large non-blocking write (the real
+        // failure mode: a 150 KiB reply must not block on an 8 KiB buffer).
+        unsafe { libc::fcntl(sv[0], libc::F_SETFL, libc::O_NONBLOCK); }
+        let chunk = [0u8; 4096];
+        let mut written = 0i64;
+        loop {
+            let w = unsafe { libc::write(sv[0], chunk.as_ptr() as *const _, chunk.len()) };
+            if w <= 0 { break; }
+            written += w as i64;
+            if written >= 150 * 1024 { break; }
+        }
+        assert!(written >= 150 * 1024,
+            "AF_UNIX socket only absorbed {} bytes before blocking (need >=150 KiB)", written);
+        unsafe { libc::close(sv[0]); libc::close(sv[1]); }
     }
 
     #[test]
