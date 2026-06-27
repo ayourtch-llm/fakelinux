@@ -914,6 +914,31 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     translate::linux_errno()
 }
 
+fn wake_socket_before_close(fd: i32) {
+    if fd < 0 {
+        return;
+    }
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let is_socket = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0;
+    if is_socket {
+        // Linux close() wakes another thread blocked in recv/send on the same
+        // socket fd. macOS close() alone often does not; shutdown() provides the
+        // wakeup before the descriptor is actually closed.
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+    }
+}
+
 fn do_close(fd: i32) -> u64 {
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && fd <= 10 {
         let pid = unsafe { libc::getpid() };
@@ -925,6 +950,7 @@ fn do_close(fd: i32) -> u64 {
     procfs::on_close(fd);
     if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
     clear_fd_seals(fd);
+    wake_socket_before_close(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -964,6 +990,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 eventfd::on_close(fd_i);
                 epoll::on_close(fd_i);
                 procfs::on_close(fd_i);
+                wake_socket_before_close(fd_i);
                 unsafe { libc::close(fd_i); }
             } else if thread::FORK_SAVED_CLOEXEC.take(fd as usize) {
                 // Had CLOEXEC before fork — restore the flag so exec closes it.
@@ -981,6 +1008,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
             epoll::on_close(fd);
             procfs::on_close(fd);
             thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);
+            wake_socket_before_close(fd);
             unsafe { libc::close(fd); }
         }
     }
@@ -3972,6 +4000,43 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn close_wakes_thread_blocked_in_socket_recv() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+
+        let recv_fd = sv[0];
+        let peer_fd = sv[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut byte = 0u8;
+            let ret = unsafe {
+                libc::recv(
+                    recv_fd,
+                    &mut byte as *mut _ as *mut libc::c_void,
+                    1,
+                    0,
+                )
+            };
+            let _ = tx.send(ret);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(do_close(recv_fd), 0);
+        let ret = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close must wake a peer thread blocked in recv");
+        assert!(
+            ret <= 0,
+            "blocked recv should return EOF or error after close, got {ret}"
+        );
+        handle.join().unwrap();
+        unsafe {
+            libc::close(peer_fd);
+        }
     }
 
     #[test]
