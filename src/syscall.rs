@@ -672,7 +672,38 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     if let Some(r) = procfs::try_read(fd_i32, buf, count) {
         return r;
     }
-    let ret = unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+    // Interruptible read. A blocking read() runs inside the SIGILL trap handler
+    // (sa_mask blocks all host signals) and the host signal forwarders use
+    // SA_RESTART, so a bare blocking read would auto-restart forever and never
+    // wake on a signal — any signal-driven cleanup (e.g. a test runner
+    // interrupting a stuck reader) would stall. Wait for readability in short
+    // chunks with host signals unblocked (so the forwarder can queue PENDING),
+    // and between chunks return -EINTR if a signal with a real handler is
+    // deliverable. Regular files report readable immediately (no added latency).
+    let ret = loop {
+        if signal::deliverable_pending() != 0 {
+            unsafe { *libc::__error() = libc::EINTR; }
+            break -1_isize;
+        }
+        let mut pfd = libc::pollfd { fd: fd_i32, events: libc::POLLIN, revents: 0 };
+        let pr = {
+            let _unblock = signal::HostSigUnblock::new();
+            unsafe { libc::poll(&mut pfd, 1, 100) }
+        };
+        if pr < 0 {
+            let e = unsafe { *libc::__error() };
+            if e == libc::EINTR {
+                continue; // re-check deliverable signals
+            }
+            // poll can't handle this fd — fall back to a plain blocking read.
+            break unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+        }
+        if pr == 0 {
+            continue; // timeout: loop and re-check for deliverable signals
+        }
+        // Readable (data, or HUP/ERR) — the read won't block now.
+        break unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+    };
     // DEBUG: optional per-pid raw-byte dump for read-side pipe tracing.
     // Pair with FAKELINUX_DUMP_WRITE_FD to verify pipe integrity end-to-end.
     if let Ok(dump_fd) = std::env::var("FAKELINUX_DUMP_READ_FD") {
