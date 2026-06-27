@@ -1,17 +1,32 @@
-//! Eventfd emulation using pipe pairs and in-process counters.
+//! Eventfd emulation using pipe pairs.
 //!
-//! Each eventfd is backed by a pipe. The read end is returned as the eventfd fd.
-//! A global counter tracks the accumulated value. When counter > 0, one byte is
-//! kept in the pipe to make it pollable. On read, the counter is returned and
-//! reset to 0, and the pipe is drained.
+//! Each eventfd is backed by a pipe; the read end is returned as the eventfd fd.
+//! macOS has no eventfd, so the VALUE lives entirely in the pipe: every write
+//! appends an 8-byte little-endian record, and a read drains all pending records
+//! and returns their sum (Linux eventfd counter semantics). The pipe is the only
+//! state, so this is CROSS-PROCESS safe: when an eventfd fd is passed to an
+//! unrelated process via SCM_RIGHTS (as VPP does for its svm_msg_q API
+//! notification), that process can poll and read it correctly even though it has
+//! no local HashMap entry — it just reads raw 8-byte records from the shared pipe.
+//!
+//! The earlier per-process-counter design broke cross-process: it only poked the
+//! pipe on a 0->nonzero counter transition, but a remote consumer reading the
+//! pipe directly never reset the owner's counter, so every later write was
+//! suppressed and the consumer's no-timeout poll() blocked forever (the VPP API
+//! "read failed" hang).
 
 use crate::translate;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 struct EventfdState {
-    write_pipe_fd: i32,  // internal write end of the pipe
-    counter: u64,
+    write_pipe_fd: i32, // internal write end of the pipe
+}
+
+/// Append an 8-byte LE record of `val` to an eventfd's pipe (the shared state).
+fn pipe_write_value(write_fd: i32, val: u64) -> i64 {
+    let bytes = val.to_ne_bytes();
+    unsafe { libc::write(write_fd, bytes.as_ptr() as *const _, 8) as i64 }
 }
 
 /// Maps eventfd read_fd → internal state
@@ -58,18 +73,14 @@ pub fn do_eventfd2(initval: u32, flags: i32) -> u64 {
         }
     }
 
-    let counter = initval as u64;
-
-    // If initial value > 0, make the pipe readable
-    if counter > 0 {
-        let byte: u8 = 1;
-        unsafe { libc::write(write_fd, &byte as *const _ as *const _, 1); }
+    // Seed the initial value as a pipe record (makes it pollable + readable).
+    if initval > 0 {
+        pipe_write_value(write_fd, initval as u64);
     }
 
     with_state(|state| {
         state.insert(read_fd, EventfdState {
             write_pipe_fd: write_fd,
-            counter,
         });
     });
 
@@ -82,71 +93,74 @@ pub fn is_eventfd(fd: i32) -> bool {
     guard.as_ref().map_or(false, |s| s.contains_key(&fd))
 }
 
-/// Handle read on an eventfd: returns counter value as u64, resets to 0
+/// Handle read on an eventfd (the OWNER process): drain all pending 8-byte
+/// records from the pipe and return their sum. A cross-process consumer that
+/// received the fd via SCM_RIGHTS is NOT routed here (is_eventfd is false in its
+/// process) — it reads raw 8-byte records straight from the shared pipe, one per
+/// read(), which is exactly correct.
 pub fn do_read(fd: i32, buf: u64, count: u64) -> u64 {
     if count < 8 {
         return (-22_i64) as u64; // -EINVAL: must read exactly 8 bytes
     }
+    // The fd must be a known eventfd in this process.
+    if !is_eventfd(fd) {
+        return (-9_i64) as u64; // -EBADF
+    }
 
-    with_state(|state| {
-        let entry = match state.get_mut(&fd) {
-            Some(e) => e,
-            None => return (-9_i64) as u64, // -EBADF
-        };
-
-        if entry.counter == 0 {
-            // Would block - return EAGAIN (Linux errno 11)
-            return (-11_i64) as u64;
+    // Drain all currently-available records (poll(0) probe before each read so we
+    // never block on the drain, regardless of the fd's blocking mode).
+    let mut sum: u64 = 0;
+    let mut got_any = false;
+    loop {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if pr <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+            break;
         }
-
-        let val = entry.counter;
-        entry.counter = 0;
-
-        // Drain the wake byte from the pipe
-        let mut drain_byte: u8 = 0;
-        unsafe { libc::read(fd, &mut drain_byte as *mut _ as *mut _, 1); }
-
-        // Write the counter value to the user buffer
-        unsafe {
-            (buf as *mut u64).write_unaligned(val);
+        let mut rec = [0u8; 8];
+        let r = unsafe { libc::read(fd, rec.as_mut_ptr() as *mut _, 8) };
+        if r == 8 {
+            sum = sum.saturating_add(u64::from_ne_bytes(rec));
+            got_any = true;
+        } else {
+            break;
         }
+    }
 
-        8u64 // eventfd read always returns 8 bytes
-    })
+    if !got_any {
+        return (-11_i64) as u64; // -EAGAIN (no value; caller polls before reading)
+    }
+    unsafe { (buf as *mut u64).write_unaligned(sum); }
+    8u64 // eventfd read always returns 8 bytes
 }
 
-/// Handle write on an eventfd: add value to counter
+/// Handle write on an eventfd: append the value as a record to the (shared) pipe.
 pub fn do_write(fd: i32, buf: u64, count: u64) -> u64 {
     if count < 8 {
         return (-22_i64) as u64; // -EINVAL: must write exactly 8 bytes
     }
 
     let val = unsafe { (buf as *const u64).read_unaligned() };
-
-    // 0xfffffffffffffffe is the max addable value
     if val == u64::MAX {
-        return (-22_i64) as u64; // -EINVAL
+        return (-22_i64) as u64; // -EINVAL: 0xff..ff is reserved
+    }
+    if val == 0 {
+        return 8u64; // adding 0 is a no-op, no notification
     }
 
-    with_state(|state| {
-        let entry = match state.get_mut(&fd) {
-            Some(e) => e,
-            None => return (-9_i64) as u64, // -EBADF
-        };
+    let write_fd = with_state(|state| match state.get(&fd) {
+        Some(e) => e.write_pipe_fd,
+        None => -1,
+    });
+    if write_fd < 0 {
+        return (-9_i64) as u64; // -EBADF
+    }
 
-        let was_zero = entry.counter == 0;
-        entry.counter = entry.counter.saturating_add(val);
-
-        // If counter went from 0 to non-zero, make the pipe readable
-        if was_zero && entry.counter > 0 {
-            let byte: u8 = 1;
-            unsafe {
-                libc::write(entry.write_pipe_fd, &byte as *const _ as *const _, 1);
-            }
-        }
-
-        8u64 // eventfd write always returns 8 bytes
-    })
+    let w = pipe_write_value(write_fd, val);
+    if w != 8 {
+        return translate::linux_errno(); // pipe full (EFD_NONBLOCK) or error
+    }
+    8u64 // eventfd write always returns 8 bytes
 }
 
 /// Clean up eventfd state when closed
