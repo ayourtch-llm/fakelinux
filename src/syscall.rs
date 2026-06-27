@@ -1549,6 +1549,14 @@ fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigset
             sec * 1000 + nsec / 1_000_000
         }
     };
+    // Occasionally grant a brief delivery window on a non-blocking poll so macOS
+    // can hand a process-directed signal (e.g. SIGTERM) to a handler-capable
+    // thread — a busy-polling guest can otherwise leave it stuck pending forever.
+    let total_ms = if total_ms == 0 && signal::signal_delivery_window_due() {
+        1
+    } else {
+        total_ms
+    };
 
     // Linux ppoll installs the caller's sigmask atomically for the wait.
     // sudo blocks SIGCHLD and relies on ppoll to unblock it — ignoring the
@@ -1565,7 +1573,7 @@ fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigset
         raw_eprintln_fmt(format_args!(
             "fakelinux: [{}] ppoll nfds={} total_ms={} sigmask_ptr={:#x} old_mask={:?} cur_mask={:#x} pending={:#x} deliverable={:#x}\n",
             pid, nfds, total_ms, sigmask_ptr, old_mask,
-            signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst),
+            signal::sigmask_get(),
             signal::PENDING_SIGNALS.load(std::sync::atomic::Ordering::SeqCst),
             signal::deliverable_pending()));
     }
@@ -2105,7 +2113,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                         }
                         if ign_mask != 0 { std::env::set_var("FAKELINUX_SIGIGN", format!("{:#x}", ign_mask)); }
                         else { std::env::remove_var("FAKELINUX_SIGIGN"); }
-                        let sigmask = signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst);
+                        let sigmask = signal::sigmask_get();
                         if sigmask != 0 { std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask)); }
                         else { std::env::remove_var("FAKELINUX_SIGMASK"); }
                     }
@@ -2225,7 +2233,7 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         } else {
             std::env::remove_var("FAKELINUX_SIGIGN");
         }
-        let sigmask = signal::GUEST_SIGMASK.load(std::sync::atomic::Ordering::SeqCst);
+        let sigmask = signal::sigmask_get();
         if sigmask != 0 {
             std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask));
         } else {

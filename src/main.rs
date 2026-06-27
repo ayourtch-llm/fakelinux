@@ -175,7 +175,7 @@ fn main() {
     }
     if let Ok(mask_str) = std::env::var("FAKELINUX_SIGMASK") {
         if let Ok(mask) = u64::from_str_radix(mask_str.trim_start_matches("0x"), 16) {
-            signal::GUEST_SIGMASK.store(mask, std::sync::atomic::Ordering::SeqCst);
+            signal::sigmask_set(mask);
         }
         std::env::remove_var("FAKELINUX_SIGMASK");
     }

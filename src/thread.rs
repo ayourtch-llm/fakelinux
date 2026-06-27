@@ -284,6 +284,8 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
         set_tls,
         clear_tid_ptr,
         guest_x18: crate::trap::get_thread_x18(),
+        // Linux: a new thread inherits the creator's signal mask.
+        parent_sigmask: crate::signal::sigmask_get(),
     });
     let arg_ptr = Box::into_raw(arg) as *mut libc::c_void;
 
@@ -321,6 +323,7 @@ struct CloneArgs {
     set_tls: bool,
     clear_tid_ptr: u64,
     guest_x18: u64,
+    parent_sigmask: u64,
 }
 
 /// Set up a per-thread sigaltstack and install the SIGILL trap handler.
@@ -402,6 +405,13 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
 
     // Propagate parent's guest x18 to this thread's TSD slot
     crate::trap::set_thread_x18(args.guest_x18);
+
+    // Inherit the creator's GUEST signal mask (Linux semantics). The guest mask
+    // is per-thread (thread_local), and a fresh thread starts at 0 (all
+    // unblocked), so without this a thread that should start with some signals
+    // blocked (e.g. a VPP worker the app will later re-block) would briefly
+    // differ — and, more importantly, this keeps the per-thread model faithful.
+    crate::signal::sigmask_set(args.parent_sigmask);
 
     // Set up per-thread sigaltstack
     setup_thread_signal_stack();

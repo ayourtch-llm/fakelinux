@@ -15,6 +15,47 @@ thread_local! {
     static GUEST_ALTSTACK_SP: Cell<u64> = const { Cell::new(0) };
     static GUEST_ALTSTACK_FLAGS: Cell<i32> = const { Cell::new(2) }; // SS_DISABLE
     static GUEST_ALTSTACK_SIZE: Cell<u64> = const { Cell::new(0) };
+    /// Guest signal mask — PER-THREAD, matching Linux (pthread_sigmask affects
+    /// only the calling thread). A const-initialized thread_local is safe to
+    /// touch from the SIGILL trap context (no lazy init / malloc), like the
+    /// altstack cells above. New threads inherit the creator's mask via clone
+    /// (see thread::clone_entry); fork preserves the caller's TLS.
+    static GUEST_SIGMASK_TL: Cell<u64> = const { Cell::new(0) };
+}
+
+#[inline]
+pub fn sigmask_get() -> u64 {
+    GUEST_SIGMASK_TL.with(|m| m.get())
+}
+#[inline]
+pub fn sigmask_set(v: u64) {
+    GUEST_SIGMASK_TL.with(|m| m.set(v));
+}
+#[inline]
+pub fn sigmask_swap(v: u64) -> u64 {
+    GUEST_SIGMASK_TL.with(|m| {
+        let old = m.get();
+        m.set(v);
+        old
+    })
+}
+/// OR bits into the mask; returns the previous value.
+#[inline]
+pub fn sigmask_or(v: u64) -> u64 {
+    GUEST_SIGMASK_TL.with(|m| {
+        let old = m.get();
+        m.set(old | v);
+        old
+    })
+}
+/// AND bits into the mask; returns the previous value.
+#[inline]
+pub fn sigmask_and(v: u64) -> u64 {
+    GUEST_SIGMASK_TL.with(|m| {
+        let old = m.get();
+        m.set(old & v);
+        old
+    })
 }
 
 pub fn get_guest_sigaltstack() -> (u64, i32, u64) {
@@ -99,9 +140,6 @@ pub fn guest_sigaction(linux_sig: usize) -> GuestSigaction {
     GUEST_SIGACTIONS[linux_sig].load()
 }
 
-/// Guest signal mask (bitmask of blocked signals, bit N = Linux signal N).
-pub static GUEST_SIGMASK: AtomicU64 = AtomicU64::new(0);
-
 /// Pending signals (bitmask, bit N = Linux signal N is pending but was blocked).
 pub static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
 
@@ -141,7 +179,7 @@ fn handler_bits() -> u64 {
 pub fn deliverable_pending() -> u64 {
     deliverable_set(
         PENDING_SIGNALS.load(Ordering::SeqCst),
-        GUEST_SIGMASK.load(Ordering::SeqCst),
+        sigmask_get(),
         handler_bits(),
     )
 }
@@ -179,7 +217,7 @@ impl Drop for HostSigUnblock {
 pub fn ppoll_mask_begin(new_mask: u64) -> u64 {
     // Never allow blocking SIGKILL (9) or SIGSTOP (19) — bit (sig-1)
     let protected = (1u64 << 8) | (1u64 << 18);
-    GUEST_SIGMASK.swap(new_mask & !protected, Ordering::SeqCst)
+    sigmask_swap(new_mask & !protected)
 }
 
 /// Undo a ppoll_mask_begin. If a deliverable signal is pending, the handler
@@ -192,7 +230,7 @@ pub fn ppoll_mask_end(old_mask: u64) {
         SWAP_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
     } else {
         SWAP_RESTORE_ACTIVE.store(false, Ordering::SeqCst);
-        GUEST_SIGMASK.store(old_mask, Ordering::SeqCst);
+        sigmask_set(old_mask);
     }
 }
 
@@ -327,7 +365,7 @@ pub unsafe fn build_sigframe_and_redirect(
     let old_sigmask = if SWAP_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {
         SWAP_RESTORE_MASK.load(Ordering::SeqCst)
     } else {
-        GUEST_SIGMASK.load(Ordering::SeqCst)
+        sigmask_get()
     };
 
     // Allocate frame on guest stack (stack grows down)
@@ -398,7 +436,7 @@ pub unsafe fn build_sigframe_and_redirect(
     // Block signals in handler_mask | (1 << linux_sig) during handler execution
     // Linux kernel convention: bit (sig-1) represents signal sig
     let block_mask = handler_mask | (1u64 << (linux_sig - 1) as u64);
-    GUEST_SIGMASK.fetch_or(block_mask, Ordering::SeqCst);
+    sigmask_or(block_mask);
 
     // Get the executable sigreturn trampoline address
     let trampoline_addr = SIGRETURN_TRAMPOLINE.load(Ordering::SeqCst);
@@ -451,7 +489,7 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     crate::trap::set_thread_tpidr(saved_tpidr);
     // Restore sigmask
     let saved_mask = (p.add(288) as *const u64).read_unaligned();
-    GUEST_SIGMASK.store(saved_mask, Ordering::SeqCst);
+    sigmask_set(saved_mask);
 
     // Restore NEON/FP registers q0-q31 into the mcontext.
     // When the signal handler returns, macOS restores these from the mcontext.
@@ -526,7 +564,7 @@ unsafe extern "C" fn signal_forwarder(
     }
 
     // Check if this signal is blocked in the guest signal mask
-    let mask = GUEST_SIGMASK.load(Ordering::SeqCst);
+    let mask = sigmask_get();
     if linux_sig > 0 && linux_sig <= 64 && (mask & (1u64 << (linux_sig - 1) as u64)) != 0 {
         // Signal is blocked -- add to pending set for later delivery.
         PENDING_SIGNALS.fetch_or(1u64 << (linux_sig - 1) as u64, Ordering::SeqCst);
@@ -663,7 +701,7 @@ pub fn do_rt_sigaction(linux_sig: u64, act_ptr: u64, oldact_ptr: u64, _sigsetsiz
 
 /// Handle rt_sigprocmask: SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2.
 pub fn do_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, _sigsetsize: u64) -> u64 {
-    let old_mask = GUEST_SIGMASK.load(Ordering::SeqCst);
+    let old_mask = sigmask_get();
 
     // Return old mask
     if oldset_ptr != 0 {
@@ -681,15 +719,15 @@ pub fn do_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, _sigsetsize: u
         match how {
             0 => {
                 // SIG_BLOCK: add signals
-                GUEST_SIGMASK.fetch_or(new_set & !protected, Ordering::SeqCst);
+                sigmask_or(new_set & !protected);
             }
             1 => {
                 // SIG_UNBLOCK: remove signals
-                GUEST_SIGMASK.fetch_and(!new_set, Ordering::SeqCst);
+                sigmask_and(!new_set);
             }
             2 => {
                 // SIG_SETMASK: replace
-                GUEST_SIGMASK.store(new_set & !protected, Ordering::SeqCst);
+                sigmask_set(new_set & !protected);
             }
             _ => return (-22_i64) as u64, // -EINVAL
         }
@@ -703,11 +741,33 @@ pub fn do_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, _sigsetsize: u
     0
 }
 
+// Counter to occasionally grant a real signal-delivery window in busy
+// (zero-timeout) poll loops — see signal_delivery_window_due().
+use std::sync::atomic::AtomicU32;
+static POLL_WINDOW_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// True roughly once every `PERIOD` zero-timeout poll calls, when the guest has
+/// at least one async signal handler installed. Callers (epoll_pwait/ppoll/etc.)
+/// use this to upgrade a non-blocking poll to a brief (1ms) blocking wait so
+/// macOS gets a window to deliver a process-directed signal (e.g. SIGTERM) to a
+/// thread that can handle it. Without this, a busy-polling multithreaded guest
+/// (VPP) can leave SIGTERM stuck in the process pending set forever — shutdown on
+/// test teardown then hangs and orphans the process. The brief wait only happens
+/// when a handler exists (idle/CPU-bound code without handlers is unaffected) and
+/// only 1-in-PERIOD times, so steady-state poll latency is unchanged.
+pub fn signal_delivery_window_due() -> bool {
+    if handler_bits() == 0 {
+        return false;
+    }
+    const PERIOD: u32 = 512;
+    POLL_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed) % PERIOD == 0
+}
+
 /// Deliver pending signals directly by building sigframes on the guest stack.
 /// Called from the trap handler after clearing IN_TRAP, when we have
 /// the guest's registers in the mcontext.
 pub unsafe fn deliver_pending_to_guest(mctx: &mut crate::trap::MContext64) {
-    let current_mask = GUEST_SIGMASK.load(Ordering::SeqCst);
+    let current_mask = sigmask_get();
     let pending = PENDING_SIGNALS.load(Ordering::SeqCst);
     let deliverable = pending & !current_mask;
     if deliverable == 0 {
@@ -834,7 +894,7 @@ pub fn do_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, _sigset
 
 /// Check for pending signals that are no longer blocked and re-deliver them.
 pub fn deliver_pending_signals() {
-    let current_mask = GUEST_SIGMASK.load(Ordering::SeqCst);
+    let current_mask = sigmask_get();
     let pending = PENDING_SIGNALS.load(Ordering::SeqCst);
 
     // Find signals that are pending AND no longer blocked
@@ -1051,13 +1111,13 @@ mod tests {
     #[test]
     fn ppoll_mask_swap_protects_kill_stop() {
         // SIGKILL(9)/SIGSTOP(19) can never be blocked, even via ppoll's mask
-        let old = GUEST_SIGMASK.load(Ordering::SeqCst);
+        let old = sigmask_get();
         let swapped_old = ppoll_mask_begin(u64::MAX);
         assert_eq!(swapped_old, old);
-        let now = GUEST_SIGMASK.load(Ordering::SeqCst);
+        let now = sigmask_get();
         assert_eq!(now & (1u64 << 8), 0, "SIGKILL must stay unblockable");
         assert_eq!(now & (1u64 << 18), 0, "SIGSTOP must stay unblockable");
         ppoll_mask_end(old);
-        assert_eq!(GUEST_SIGMASK.load(Ordering::SeqCst), old);
+        assert_eq!(sigmask_get(), old);
     }
 }

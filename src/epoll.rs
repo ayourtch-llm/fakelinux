@@ -163,6 +163,16 @@ pub fn do_epoll_pwait(
     let mut kevents: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; maxevents as usize];
 
     const CHUNK_MS: i64 = 100;
+    // Occasionally upgrade a non-blocking (0-timeout) poll to a brief 1ms wait so
+    // macOS gets a window to deliver a process-directed signal (e.g. SIGTERM) to
+    // a handler-capable thread — otherwise a busy-polling guest (VPP) can leave
+    // the signal stuck pending forever and never shut down. See
+    // signal::signal_delivery_window_due().
+    let timeout_ms = if timeout_ms == 0 && crate::signal::signal_delivery_window_due() {
+        1
+    } else {
+        timeout_ms
+    };
     let mut remaining: i64 = timeout_ms as i64;
     let infinite = timeout_ms < 0;
     let n: i64 = loop {
