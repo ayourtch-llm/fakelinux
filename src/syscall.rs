@@ -688,21 +688,51 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
 ///   false → interrupted by a deliverable (real-handler) signal → caller returns -EINTR.
 /// The fast path for a ready/non-blocking fd is poll(timeout=0) + at most one
 /// fcntl — no blocking wait, so non-blocking semantics are preserved.
-pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> bool {
+/// Result of waiting for an fd to become ready.
+pub(crate) enum WaitReady {
+    /// fd is ready (or poll returned an error — let the caller do the op)
+    Ready,
+    /// A deliverable signal interrupted the wait → caller returns -EINTR
+    Interrupted,
+    /// SO_RCVTIMEO expired → caller returns -EAGAIN (Python raises socket.timeout)
+    TimedOut,
+}
+
+pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
+    // SO_RCVTIMEO deadline: if the socket has a receive timeout, enforce it
+    // here so the wait doesn't block forever. The host recvfrom would respect
+    // it natively, but we never reach recvfrom when the fd has no data — this
+    // poll loop gates it. Without this, a socket with SO_RCVTIMEO=5s blocks
+    // indefinitely (e.g. VPP test framework's QUIC teardown deadlock: the
+    // message thread's recv_into never times out, so disconnect's join hangs
+    // for the full 600s test timeout).
+    let deadline = socket_rcvtimeo_deadline(fd);
+
     loop {
         let mut pfd = libc::pollfd { fd, events, revents: 0 };
         let pr = unsafe { libc::poll(&mut pfd, 1, 0) }; // non-blocking probe
         if pr != 0 {
-            return true; // ready, or poll error → let the caller do the op
+            return WaitReady::Ready; // ready, or poll error → let the caller do the op
         }
         // Not ready. If the fd is non-blocking, the op must return EAGAIN itself.
         let fl = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if fl >= 0 && (fl & libc::O_NONBLOCK) != 0 {
-            return true;
+            return WaitReady::Ready;
         }
         // Blocking fd, no data: a deliverable signal interrupts the wait.
         if signal::deliverable_pending() != 0 {
-            return false;
+            return WaitReady::Interrupted;
+        }
+        // SO_RCVTIMEO expired? On Linux a timed-out recv returns -EAGAIN;
+        // Python's socket module raises socket.timeout — which unblocks the
+        // caller (e.g. VPP's message thread, breaking the teardown deadlock).
+        if let Some(dl) = deadline {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+            let now = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+            if now >= dl {
+                return WaitReady::TimedOut;
+            }
         }
         // Sleep for the readiness in a bounded chunk with host signals unblocked
         // (so the forwarder can queue PENDING despite the trap handler's sa_mask).
@@ -710,6 +740,31 @@ pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> bool {
         let mut wpfd = libc::pollfd { fd, events, revents: 0 };
         unsafe { libc::poll(&mut wpfd, 1, 100) };
     }
+}
+
+/// Read SO_RCVTIMEO from the fd and convert to a monotonic-clock deadline.
+/// Returns None for non-socket fds or infinite timeout (tv_sec=0 on macOS
+/// means infinite, matching Linux's SO_RCVTIMEO_ZERO behavior for blocking).
+fn socket_rcvtimeo_deadline(fd: i32) -> Option<u64> {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 || (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        return None; // not a socket, or infinite timeout
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    let now_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+    let timeout_ns = tv.tv_sec as u64 * 1_000_000_000 + (tv.tv_usec as u64) * 1_000;
+    Some(now_ns + timeout_ns)
 }
 
 fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
@@ -724,11 +779,10 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     // Interruptible read: wait for readability so a blocking read can be woken
     // by a signal (non-blocking fds keep their EAGAIN semantics — see
     // wait_ready_interruptible).
-    let ret = if wait_ready_interruptible(fd_i32, libc::POLLIN) {
-        unsafe { libc::read(fd_i32, buf as *mut _, count as usize) }
-    } else {
-        unsafe { *libc::__error() = libc::EINTR; }
-        -1_isize
+    let ret = match wait_ready_interruptible(fd_i32, libc::POLLIN) {
+        WaitReady::Ready => unsafe { libc::read(fd_i32, buf as *mut _, count as usize) },
+        WaitReady::Interrupted => { unsafe { *libc::__error() = libc::EINTR; } -1_isize }
+        WaitReady::TimedOut => { unsafe { *libc::__error() = libc::EAGAIN; } -1_isize }
     };
     // DEBUG: optional per-pid raw-byte dump for read-side pipe tracing.
     // Pair with FAKELINUX_DUMP_WRITE_FD to verify pipe integrity end-to-end.

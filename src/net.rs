@@ -418,11 +418,10 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
     let alen = if addrlen_ptr == 0 { std::ptr::null_mut() } else { addrlen_ptr as *mut libc::socklen_t };
     // Interruptible accept: wait for an incoming connection so a blocking accept
     // can be woken by a signal (a non-blocking listener keeps EAGAIN semantics).
-    let ret = if crate::syscall::wait_ready_interruptible(fd, libc::POLLIN) {
-        unsafe { libc::accept(fd, addr, alen) }
-    } else {
-        unsafe { *libc::__error() = libc::EINTR; }
-        -1
+    let ret = match crate::syscall::wait_ready_interruptible(fd, libc::POLLIN) {
+        crate::syscall::WaitReady::Ready => unsafe { libc::accept(fd, addr, alen) },
+        crate::syscall::WaitReady::Interrupted => { unsafe { *libc::__error() = libc::EINTR; } -1 }
+        crate::syscall::WaitReady::TimedOut => { unsafe { *libc::__error() = libc::EAGAIN; } -1 }
     };
     if ret < 0 {
         return translate::linux_errno();
@@ -516,13 +515,14 @@ pub fn do_recvfrom(
     // signal. Skip the wait when the caller asked for non-blocking via
     // MSG_DONTWAIT (Linux 0x40) — recvfrom returns EAGAIN itself then.
     const LINUX_MSG_DONTWAIT: i32 = 0x40;
-    let do_op = (flags & LINUX_MSG_DONTWAIT) != 0
-        || crate::syscall::wait_ready_interruptible(fd, libc::POLLIN);
-    let ret = if do_op {
+    let ret = if (flags & LINUX_MSG_DONTWAIT) != 0 {
         unsafe { libc::recvfrom(fd, buf as *mut libc::c_void, len as usize, mac_flags, addr, alen) }
     } else {
-        unsafe { *libc::__error() = libc::EINTR; }
-        -1
+        match crate::syscall::wait_ready_interruptible(fd, libc::POLLIN) {
+            crate::syscall::WaitReady::Ready => unsafe { libc::recvfrom(fd, buf as *mut libc::c_void, len as usize, mac_flags, addr, alen) },
+            crate::syscall::WaitReady::Interrupted => { unsafe { *libc::__error() = libc::EINTR; } -1 }
+            crate::syscall::WaitReady::TimedOut => { unsafe { *libc::__error() = libc::EAGAIN; } -1 }
+        }
     };
     if ret < 0 {
         translate::linux_errno()
@@ -823,13 +823,14 @@ pub fn do_recvmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
     // Interruptible recvmsg: wait for data unless the caller asked for
     // non-blocking via MSG_DONTWAIT (Linux 0x40).
     const LINUX_MSG_DONTWAIT: i32 = 0x40;
-    let ret = if (flags & LINUX_MSG_DONTWAIT) != 0
-        || crate::syscall::wait_ready_interruptible(fd, libc::POLLIN)
-    {
+    let ret = if (flags & LINUX_MSG_DONTWAIT) != 0 {
         unsafe { libc::recvmsg(fd, &mut mac_msg, mac_flags) }
     } else {
-        unsafe { *libc::__error() = libc::EINTR; }
-        -1
+        match crate::syscall::wait_ready_interruptible(fd, libc::POLLIN) {
+            crate::syscall::WaitReady::Ready => unsafe { libc::recvmsg(fd, &mut mac_msg, mac_flags) },
+            crate::syscall::WaitReady::Interrupted => { unsafe { *libc::__error() = libc::EINTR; } -1 }
+            crate::syscall::WaitReady::TimedOut => { unsafe { *libc::__error() = libc::EAGAIN; } -1 }
+        }
     };
     if ret < 0 {
         translate::linux_errno()
