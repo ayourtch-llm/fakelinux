@@ -1153,51 +1153,90 @@ pub fn do_futex(uaddr: u64, op: u32, val: u32, timeout_or_val2: u64, uaddr2: u64
 static FUTEX_SPIN_LOG: AtomicU64 = AtomicU64::new(0);
 static FUTEX_SPIN_UADDR: AtomicU64 = AtomicU64::new(0);
 static FUTEX_SPIN_TS: AtomicU64 = AtomicU64::new(0);
+// Per-episode -EAGAIN spin streak: rapid same-uaddr re-entries in a row. Unlike
+// FUTEX_SPIN_LOG (a monotonic lifetime counter), this resets the moment the
+// spin stops, so it measures how hot the current spin is. Only calls that
+// are actually about to return -EAGAIN count; normal blocking futex waits do
+// not build up a stale streak that a later caller inherits.
+static FUTEX_SPIN_STREAK: AtomicU64 = AtomicU64::new(0);
+
+/// How long to back off on a hot `-EAGAIN` futex spin, as a function of the
+/// current same-uaddr rapid-re-entry `streak`. Returns microseconds to sleep;
+/// `0` means a bare `sched_yield` is enough. A bare yield round-robins
+/// equal-priority spinners without giving the lock holder a real scheduling
+/// gap, so a sustained spin escalates to a short, capped real sleep, the
+/// analog of the kernel parking a futex waiter. Capped so worst-case latency
+/// stays bounded even for a runaway spin.
+fn futex_spin_backoff_us(streak: u64) -> u64 {
+    match streak {
+        0..=1_000 => 0,       // brief contention: sched_yield only
+        1_001..=8_000 => 100, // sustained: short real sleep
+        8_001..=40_000 => 300,
+        _ => 600, // pathological: hard cap
+    }
+}
 
 fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool, realtime: bool, shared: bool) -> u64 {
-    // ── Livelock detector ──
+    // Livelock detector clock.
     let mut ts_now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts_now); }
     let now = ts_now.tv_sec as u64 * 1_000_000_000 + ts_now.tv_nsec as u64;
-    let prev_addr = FUTEX_SPIN_UADDR.load(Ordering::Relaxed);
-    let prev_ts = FUTEX_SPIN_TS.load(Ordering::Relaxed);
-    let rapid = prev_addr == uaddr && now.saturating_sub(prev_ts) < 2_000_000;
-    FUTEX_SPIN_UADDR.store(uaddr, Ordering::Relaxed);
-    FUTEX_SPIN_TS.store(now, Ordering::Relaxed);
-    if rapid {
-        let n = FUTEX_SPIN_LOG.fetch_add(1, Ordering::Relaxed);
-        if n % 200 == 0 {
-            let cur = unsafe { (uaddr as *const i32).read_volatile() };
-            let pend = crate::signal::deliverable_pending();
-            let pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
-            let pid = unsafe { libc::getpid() };
-            let tid = unsafe { libc::pthread_self() } as u64;
-            let buf = &mut [0u8; 256];
-            let m = crate::trap::raw_fmt(buf, format_args!(
-                "fakelinux: [{}] FUTEX_SPIN #{:#x} uaddr={:#x} val={} cur={} shared={} pend={:#x} tid={:#x} pc={:#x}\n",
-                pid, n, uaddr, val, cur, shared, pend, tid, pc));
-            unsafe { libc::write(2, buf.as_ptr() as *const _, m); }
-        }
-    }
 
     // Check if *uaddr == val; if so, sleep until woken
     let current = unsafe { (uaddr as *const AtomicI32).as_ref().unwrap() };
-    if current.load(Ordering::SeqCst) != val as i32 {
+    let cur = current.load(Ordering::SeqCst);
+    if cur != val as i32 {
+        let prev_addr = FUTEX_SPIN_UADDR.load(Ordering::Relaxed);
+        let prev_ts = FUTEX_SPIN_TS.load(Ordering::Relaxed);
+        let rapid = prev_addr == uaddr && now.saturating_sub(prev_ts) < 2_000_000;
+        FUTEX_SPIN_UADDR.store(uaddr, Ordering::Relaxed);
+        FUTEX_SPIN_TS.store(now, Ordering::Relaxed);
+        let streak = if rapid {
+            let s = FUTEX_SPIN_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            let n = FUTEX_SPIN_LOG.fetch_add(1, Ordering::Relaxed);
+            if s > 200 && s % 200 == 0 {
+                let pend = crate::signal::deliverable_pending();
+                let pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
+                let pid = unsafe { libc::getpid() };
+                let tid = unsafe { libc::pthread_self() } as u64;
+                let buf = &mut [0u8; 256];
+                let m = crate::trap::raw_fmt(buf, format_args!(
+                    "fakelinux: [{}] FUTEX_SPIN #{:#x} uaddr={:#x} val={} cur={} shared={} pend={:#x} tid={:#x} pc={:#x} streak={}\n",
+                    pid, n, uaddr, val, cur, shared, pend, tid, pc, s));
+                unsafe { libc::write(2, buf.as_ptr() as *const _, m); }
+            }
+            s
+        } else {
+            // Spin broke (different uaddr, or a >2ms gap): forget the streak.
+            FUTEX_SPIN_STREAK.store(0, Ordering::Relaxed);
+            0
+        };
         // -EAGAIN: the word changed since the caller last checked. On real Linux
-        // this is a ~100ns syscall, but on fakelinux each iteration costs ~5-10μs
-        // (SIGILL trap overhead). A guest lock-contention loop (CAS→futex→-EAGAIN
-        // →retry) burns 100% CPU here vs ~1% on Linux. If rapid re-entries were
-        // seen recently (within 1s), yield the core so whoever holds the lock can
-        // run. This mirrors the implicit scheduling the kernel does on syscall
-        // entry/exit — which the SIGILL trap bypasses.
-        let spin_n = FUTEX_SPIN_LOG.load(Ordering::Relaxed);
-        let spin_ts = FUTEX_SPIN_TS.load(Ordering::Relaxed);
-        let spin_active = spin_n > 200 && now.saturating_sub(spin_ts) < 1_000_000_000;
-        if spin_active {
-            unsafe { libc::sched_yield(); }
+        // this is a ~100ns syscall, but on fakelinux each iteration costs ~5-10us
+        // (SIGILL trap overhead). A guest lock-contention loop
+        // (CAS -> futex -> -EAGAIN -> retry) burns 100% CPU here vs ~1% on Linux,
+        // and a bare sched_yield only
+        // round-robins equal-priority spinners without letting the contended word
+        // settle; observed as VPP worker threads livelocking on a glibc mutex
+        // during test teardown, hanging the whole run. So back off proportionally
+        // to how long this same-uaddr spin has persisted: a yield for brief
+        // contention, a short capped real sleep for a sustained spin (the analog
+        // of the kernel parking a waiter, which the SIGILL trap bypasses). The
+        // streak only tracks actual -EAGAIN returns, so legitimate blocking
+        // futex traffic pays nothing.
+        if streak > 200 {
+            let us = futex_spin_backoff_us(streak);
+            if us == 0 {
+                unsafe { libc::sched_yield(); }
+            } else {
+                unsafe { libc::usleep(us as libc::useconds_t); }
+            }
         }
         return (-11_i64) as u64; // -EAGAIN (Linux value)
     }
+    // This call is going to park or be woken normally, so it is not part of an
+    // -EAGAIN spin episode.
+    FUTEX_SPIN_STREAK.store(0, Ordering::Relaxed);
 
     // Poll interval. For process-shared futexes the wake can only be observed by
     // re-reading the shared futex word (a remote FUTEX_WAKE never reaches our
@@ -1366,6 +1405,27 @@ fn futex_wake(uaddr: u64, max_wake: u32, bitset: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // futex_wait's -EAGAIN spin backoff: no real sleep for brief contention,
+    // escalating-but-monotonic real sleeps for a sustained spin, hard-capped so
+    // worst-case latency stays bounded even for a runaway (e.g. 95k+ re-entries)
+    // spin like the VPP teardown livelock that motivated this.
+    #[test]
+    fn futex_spin_backoff_escalates_and_caps() {
+        // Brief contention: sched_yield only (0us), never a real sleep.
+        assert_eq!(futex_spin_backoff_us(0), 0);
+        assert_eq!(futex_spin_backoff_us(200), 0);
+        assert_eq!(futex_spin_backoff_us(1_000), 0);
+        // Sustained spin: real sleeps, monotonically non-decreasing.
+        let a = futex_spin_backoff_us(2_000);
+        let b = futex_spin_backoff_us(20_000);
+        let c = futex_spin_backoff_us(200_000);
+        assert!(a > 0, "sustained spin must back off with a real sleep");
+        assert!(a <= b && b <= c, "backoff must be monotonic in streak length");
+        // Hard cap: a runaway spin sleeps no more than the cap.
+        assert!(c <= 1_000, "backoff must stay bounded");
+        assert_eq!(futex_spin_backoff_us(u64::MAX), c, "cap holds at the extreme");
+    }
 
     // Lifecycle of the saved-CLOEXEC mask across fork→(dup2/close)→exec.
     // Bug: fds with O_CLOEXEC (e.g. CPython subprocess's errpipe_write) had
