@@ -944,7 +944,33 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rusage = if rusage_ptr != 0 { &mut usage as *mut libc::rusage } else { std::ptr::null_mut() };
 
-    let ret = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
+    // Interruptible wait. A blocking wait4 inside the SIGILL trap handler (all
+    // host signals masked) with SA_RESTART forwarders would never wake on a
+    // signal — so SIGCHLD/SIGTERM-driven cleanup in a parent (e.g. a test runner
+    // waiting on a stuck child) stalls forever. wait4 has no fd to poll, so for a
+    // blocking wait we poll with WNOHANG and sleep in short chunks (host signals
+    // unblocked) so a deliverable signal returns -EINTR between chunks. WNOHANG
+    // callers keep the single-shot fast path.
+    let ret = if options & libc::WNOHANG != 0 {
+        unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) }
+    } else {
+        loop {
+            if crate::signal::deliverable_pending() != 0 {
+                unsafe { *libc::__error() = libc::EINTR; }
+                break -1_i32;
+            }
+            let r = unsafe {
+                libc::wait4(pid as i32, status_ptr, options | libc::WNOHANG, rusage)
+            };
+            if r != 0 {
+                break r; // child reaped (>0) or error such as ECHILD (<0)
+            }
+            // No child ready yet — sleep ~100ms with signals unblocked.
+            let _unblock = crate::signal::HostSigUnblock::new();
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+            unsafe { libc::nanosleep(&ts, &mut ts); }
+        }
+    };
     if crate::syscall::trace_enabled() && ret > 0 && wstatus_ptr != 0 {
         unsafe {
             let s = status;
