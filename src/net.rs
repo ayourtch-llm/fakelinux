@@ -142,17 +142,49 @@ fn mac_sockaddr_un(host_path: &[u8]) -> Result<(libc::sockaddr_un, libc::socklen
     Ok((sa, len))
 }
 
-/// A short, deterministic host path under /tmp for an AF_UNIX socket whose
-/// re-rooted path is too long for macOS's 104-byte sun_path. Both peers are
-/// fakelinux processes sharing the same rootfs, so they hash the same re-rooted
-/// path to the same rendezvous path and still connect. (FNV-1a 64-bit.)
-fn short_rendezvous_path(host: &[u8]) -> Vec<u8> {
+/// A short, deterministic GUEST rendezvous path (`/tmp/flx-<hash>.s`) for an
+/// AF_UNIX socket whose re-rooted path is too long for macOS's 104-byte
+/// sun_path. Both peers are fakelinux processes sharing the same rootfs, so they
+/// hash the same re-rooted path to the same rendezvous path and still connect.
+/// It is a GUEST path (not a host path): re-rooting it through the rootfs keeps
+/// the socket inside the rootfs so the guest can stat()/symlink to it. (FNV-1a.)
+fn rendezvous_guest_path(host: &[u8]) -> Vec<u8> {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in host {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("/tmp/flx-{:016x}.s", h).into_bytes() // 27 bytes, always fits
+    format!("/tmp/flx-{:016x}.s", h).into_bytes() // 27 bytes
+}
+
+/// Translate a guest AF_UNIX `sun_path` to the host path the kernel should
+/// bind/connect to. Handles the sun_path-overflow case with a rendezvous path.
+/// Returns `(host_bind_path, symlink_plan)` where `symlink_plan` is
+/// `Some((rootfs_visible_path, guest_rendezvous_path))` when an IN-ROOTFS
+/// rendezvous was used — do_bind drops a symlink there so the socket is visible
+/// at the location the guest expects (e.g. VPP's appns stat() of the bind path).
+fn translate_unix_path(path: &[u8]) -> Option<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)> {
+    let mut host = crate::rootfs::translate_path(path)?;
+    if host.ends_with(&[0]) {
+        host.pop();
+    }
+    if mac_sockaddr_un(&host).is_ok() {
+        return Some((host, None)); // fits sun_path directly — bind where the guest asked
+    }
+    // Overflow. Prefer a rendezvous INSIDE the rootfs (guest-visible, so a
+    // symlink + stat resolve to it); fall back to a bare host /tmp path when even
+    // that overflows (a pathologically long rootfs prefix) — connects but the
+    // guest can't stat it.
+    let guest_rv = rendezvous_guest_path(&host);
+    if let Some(mut host_rv) = crate::rootfs::translate_path(&guest_rv) {
+        if host_rv.ends_with(&[0]) {
+            host_rv.pop();
+        }
+        if mac_sockaddr_un(&host_rv).is_ok() {
+            return Some((host_rv, Some((host, guest_rv))));
+        }
+    }
+    Some((guest_rv, None)) // host /tmp fallback (the guest-path string used as a host path)
 }
 
 /// Convert an inbound guest sockaddr for the kernel, re-rooting AF_UNIX
@@ -163,16 +195,8 @@ fn sockaddr_for_kernel(addr_ptr: u64, addrlen: u32) -> Result<(libc::sockaddr_st
     if addr_ptr != 0 && addrlen >= 3 {
         let buf = unsafe { std::slice::from_raw_parts(addr_ptr as *const u8, addrlen as usize) };
         if let Some(path) = linux_sun_path(buf) {
-            if let Some(mut host) = crate::rootfs::translate_path(path) {
-                if host.ends_with(&[0]) {
-                    host.pop();
-                }
-                let (un, len) = match mac_sockaddr_un(&host) {
-                    Ok(v) => v,
-                    // Re-rooted path won't fit sun_path — use a short rendezvous
-                    // path under /tmp that both peers derive identically.
-                    Err(_) => mac_sockaddr_un(&short_rendezvous_path(&host))?,
-                };
+            if let Some((host_bind, _symlink)) = translate_unix_path(path) {
+                let (un, len) = mac_sockaddr_un(&host_bind)?;
                 let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -290,11 +314,34 @@ pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
     fd as u64
 }
 
+/// The symlink plan (rootfs_visible_path, guest_rendezvous_path) plus the actual
+/// host bind path for an AF_UNIX bind, or None when the address isn't an
+/// overflowing AF_UNIX path that needs a guest-visible rendezvous.
+fn unix_bind_plan(addr_ptr: u64, addrlen: u32) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if addr_ptr == 0 || addrlen < 3 {
+        return None;
+    }
+    let buf = unsafe { std::slice::from_raw_parts(addr_ptr as *const u8, addrlen as usize) };
+    let path = linux_sun_path(buf)?;
+    let (host_bind, symlink) = translate_unix_path(path)?;
+    let (rootfs_visible, guest_rv) = symlink?;
+    Some((rootfs_visible, guest_rv, host_bind))
+}
+
 pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
     let (mac_addr, mac_len) = match sockaddr_for_kernel(addr_ptr, addrlen) {
         Ok(pair) => pair,
         Err(errno) => return (-(errno as i64)) as u64,
     };
+    // If this AF_UNIX bind re-roots to an in-rootfs rendezvous, remove any stale
+    // socket node at the actual bind path first (the guest unlinked its own path,
+    // which maps elsewhere) so a server re-bind doesn't hit EADDRINUSE.
+    let plan = unix_bind_plan(addr_ptr, addrlen);
+    if let Some((_, _, ref host_bind)) = plan {
+        if let Ok(hb) = std::ffi::CString::new(host_bind.clone()) {
+            unsafe { libc::unlink(hb.as_ptr()); }
+        }
+    }
     let ret = unsafe {
         libc::bind(
             fd,
@@ -305,6 +352,20 @@ pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
     if ret < 0 {
         translate::linux_errno()
     } else {
+        // Expose the socket at the location the guest expects via a symlink to
+        // the (guest) rendezvous path, so post-bind stat()/access() succeed.
+        // Both resolve through the rootfs to the same in-rootfs socket node.
+        if let Some((rootfs_visible, guest_rv, _)) = plan {
+            if let (Ok(rp), Ok(rv)) = (
+                std::ffi::CString::new(rootfs_visible),
+                std::ffi::CString::new(guest_rv),
+            ) {
+                unsafe {
+                    libc::unlink(rp.as_ptr()); // clear stale symlink/node
+                    libc::symlink(rv.as_ptr(), rp.as_ptr()); // rootfs_visible -> guest_rv
+                }
+            }
+        }
         0
     }
 }
@@ -919,15 +980,15 @@ mod tests {
     }
 
     #[test]
-    fn short_rendezvous_path_is_deterministic_and_fits() {
+    fn rendezvous_guest_path_is_deterministic_and_fits() {
         let long = vec![b'a'; 200];
-        let r1 = short_rendezvous_path(&long);
-        let r2 = short_rendezvous_path(&long);
+        let r1 = rendezvous_guest_path(&long);
+        let r2 = rendezvous_guest_path(&long);
         assert_eq!(r1, r2, "must be deterministic so peers agree");
         assert!(r1.starts_with(b"/tmp/flx-"));
         assert!(mac_sockaddr_un(&r1).is_ok(), "rendezvous path must fit sun_path");
         // Different inputs → (almost surely) different paths.
-        assert_ne!(short_rendezvous_path(b"/a/b"), short_rendezvous_path(b"/a/c"));
+        assert_ne!(rendezvous_guest_path(b"/a/b"), rendezvous_guest_path(b"/a/c"));
     }
 
     #[test]
