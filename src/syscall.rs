@@ -514,16 +514,32 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let ret = unsafe { libc::setpgid(real_pid, real_pgid) };
             if ret < 0 {
                 let errno = unsafe { *libc::__error() };
-                if TRACE.load(std::sync::atomic::Ordering::Relaxed) || errno != 0 {
-                    let pid = unsafe { libc::getpid() };
-                    raw_eprintln_fmt(format_args!(
-                        "fakelinux: [{}] setpgid({} [real {}], {} [real {}]) = errno {}\n",
-                        pid, pid_arg, real_pid, pgid_arg, real_pgid, errno));
-                }
                 // EACCES (13 on macOS) = child already exec'd. This is normal
                 // in our re-exec model — the child sets its own pgid before exec.
                 if errno == libc::EACCES {
                     return 0; // pretend success
+                }
+                // EPERM: macOS forbids setpgid() on a session leader, but Linux
+                // treats setpgid(pid, pid) on a session leader (whose pgid already
+                // equals its pid) as a successful no-op. An interactive shell that
+                // fakelinux made a session leader (container setsid) hits this in
+                // initialize_job_control. If the requested state already holds,
+                // report success so job control can proceed.
+                if errno == libc::EPERM {
+                    let probe = if real_pid == 0 {
+                        unsafe { libc::getpgid(0) }
+                    } else {
+                        unsafe { libc::getpgid(real_pid) }
+                    };
+                    if probe == real_pgid {
+                        return 0;
+                    }
+                }
+                if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    let pid = unsafe { libc::getpid() };
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: [{}] setpgid({} [real {}], {} [real {}]) = errno {}\n",
+                        pid, pid_arg, real_pid, pgid_arg, real_pgid, errno));
                 }
                 translate::linux_errno()
             } else { 0 }
