@@ -663,6 +663,39 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
     if ret < 0 { translate::linux_errno() } else { ret as u64 }
 }
 
+/// Wait until `fd` is ready for `events` (POLLIN/POLLOUT), interruptibly, so a
+/// blocking read/accept/recv can be woken by a signal (host forwarders use
+/// SA_RESTART, so a bare blocking syscall would auto-restart and never return
+/// EINTR). Returns:
+///   true  → caller should perform the operation now (ready, OR the fd is
+///           non-blocking so the op returns EAGAIN itself, OR poll is unusable).
+///   false → interrupted by a deliverable (real-handler) signal → caller returns -EINTR.
+/// The fast path for a ready/non-blocking fd is poll(timeout=0) + at most one
+/// fcntl — no blocking wait, so non-blocking semantics are preserved.
+pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> bool {
+    loop {
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 0) }; // non-blocking probe
+        if pr != 0 {
+            return true; // ready, or poll error → let the caller do the op
+        }
+        // Not ready. If the fd is non-blocking, the op must return EAGAIN itself.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if fl >= 0 && (fl & libc::O_NONBLOCK) != 0 {
+            return true;
+        }
+        // Blocking fd, no data: a deliverable signal interrupts the wait.
+        if signal::deliverable_pending() != 0 {
+            return false;
+        }
+        // Sleep for the readiness in a bounded chunk with host signals unblocked
+        // (so the forwarder can queue PENDING despite the trap handler's sa_mask).
+        let _unblock = signal::HostSigUnblock::new();
+        let mut wpfd = libc::pollfd { fd, events, revents: 0 };
+        unsafe { libc::poll(&mut wpfd, 1, 100) };
+    }
+}
+
 fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     let fd_i32 = fd as i32;
     if eventfd::is_eventfd(fd_i32) {
@@ -672,37 +705,14 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
     if let Some(r) = procfs::try_read(fd_i32, buf, count) {
         return r;
     }
-    // Interruptible read. A blocking read() runs inside the SIGILL trap handler
-    // (sa_mask blocks all host signals) and the host signal forwarders use
-    // SA_RESTART, so a bare blocking read would auto-restart forever and never
-    // wake on a signal — any signal-driven cleanup (e.g. a test runner
-    // interrupting a stuck reader) would stall. Wait for readability in short
-    // chunks with host signals unblocked (so the forwarder can queue PENDING),
-    // and between chunks return -EINTR if a signal with a real handler is
-    // deliverable. Regular files report readable immediately (no added latency).
-    let ret = loop {
-        if signal::deliverable_pending() != 0 {
-            unsafe { *libc::__error() = libc::EINTR; }
-            break -1_isize;
-        }
-        let mut pfd = libc::pollfd { fd: fd_i32, events: libc::POLLIN, revents: 0 };
-        let pr = {
-            let _unblock = signal::HostSigUnblock::new();
-            unsafe { libc::poll(&mut pfd, 1, 100) }
-        };
-        if pr < 0 {
-            let e = unsafe { *libc::__error() };
-            if e == libc::EINTR {
-                continue; // re-check deliverable signals
-            }
-            // poll can't handle this fd — fall back to a plain blocking read.
-            break unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
-        }
-        if pr == 0 {
-            continue; // timeout: loop and re-check for deliverable signals
-        }
-        // Readable (data, or HUP/ERR) — the read won't block now.
-        break unsafe { libc::read(fd_i32, buf as *mut _, count as usize) };
+    // Interruptible read: wait for readability so a blocking read can be woken
+    // by a signal (non-blocking fds keep their EAGAIN semantics — see
+    // wait_ready_interruptible).
+    let ret = if wait_ready_interruptible(fd_i32, libc::POLLIN) {
+        unsafe { libc::read(fd_i32, buf as *mut _, count as usize) }
+    } else {
+        unsafe { *libc::__error() = libc::EINTR; }
+        -1_isize
     };
     // DEBUG: optional per-pid raw-byte dump for read-side pipe tracing.
     // Pair with FAKELINUX_DUMP_WRITE_FD to verify pipe integrity end-to-end.
