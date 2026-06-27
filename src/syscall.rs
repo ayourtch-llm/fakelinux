@@ -918,6 +918,9 @@ fn wake_socket_before_close(fd: i32) {
     if fd < 0 {
         return;
     }
+    if !thread::has_multiple_guest_threads() {
+        return;
+    }
     let mut ty: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let is_socket = unsafe {
@@ -932,7 +935,11 @@ fn wake_socket_before_close(fd: i32) {
     if is_socket {
         // Linux close() wakes another thread blocked in recv/send on the same
         // socket fd. macOS close() alone often does not; shutdown() provides the
-        // wakeup before the descriptor is actually closed.
+        // wakeup before the descriptor is actually closed. Do this only when
+        // this process has multiple guest threads: shutdown() affects the socket
+        // object, so using it for ordinary single-threaded close() can break
+        // forked children closing inherited descriptors that another process
+        // still legitimately owns.
         unsafe {
             libc::shutdown(fd, libc::SHUT_RDWR);
         }
@@ -4007,6 +4014,7 @@ mod tests {
         let mut sv = [-1; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
         assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(2);
 
         let recv_fd = sv[0];
         let peer_fd = sv[1];
@@ -4034,8 +4042,42 @@ mod tests {
             "blocked recv should return EOF or error after close, got {ret}"
         );
         handle.join().unwrap();
+        thread::set_live_guest_threads_for_test(1);
         unsafe {
             libc::close(peer_fd);
+        }
+    }
+
+    #[test]
+    fn single_thread_close_of_dup_socket_does_not_shutdown_peer() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(1);
+
+        let dup_fd = unsafe { libc::dup(sv[0]) };
+        assert!(dup_fd >= 0, "dup failed");
+        assert_eq!(do_close(dup_fd), 0);
+
+        let byte = 0x5au8;
+        let sent = unsafe {
+            libc::send(
+                sv[1],
+                &byte as *const _ as *const libc::c_void,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, 1, "send over peer after dup close failed");
+
+        let mut got = 0u8;
+        let recvd = unsafe { libc::recv(sv[0], &mut got as *mut _ as *mut libc::c_void, 1, 0) };
+        assert_eq!(recvd, 1, "recv after dup close failed");
+        assert_eq!(got, byte);
+
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
         }
     }
 

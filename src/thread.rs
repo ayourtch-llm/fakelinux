@@ -134,6 +134,7 @@ fn get_clear_tid_ptr() -> u64 {
 // ─── Thread ID tracking ─────────────────────────────────────────────────────
 
 static NEXT_TID: AtomicI32 = AtomicI32::new(1000);
+static LIVE_GUEST_THREADS: AtomicI32 = AtomicI32::new(1);
 
 pub fn alloc_tid() -> i32 {
     NEXT_TID.fetch_add(1, Ordering::SeqCst)
@@ -146,6 +147,7 @@ pub fn init_main_tid() {
     let tid = alloc_tid();
     MAIN_TID.store(tid, Ordering::SeqCst);
     CURRENT_TID.store(tid, Ordering::SeqCst);
+    LIVE_GUEST_THREADS.store(1, Ordering::SeqCst);
     set_thread_tid(tid);
 }
 
@@ -163,8 +165,18 @@ fn reset_main_thread_after_fork() {
     let tid = alloc_tid();
     MAIN_TID.store(tid, Ordering::SeqCst);
     CURRENT_TID.store(tid, Ordering::SeqCst);
+    LIVE_GUEST_THREADS.store(1, Ordering::SeqCst);
     set_thread_tid(tid);
     set_clear_tid_ptr(0);
+}
+
+pub fn has_multiple_guest_threads() -> bool {
+    LIVE_GUEST_THREADS.load(Ordering::SeqCst) > 1
+}
+
+#[cfg(test)]
+pub fn set_live_guest_threads_for_test(n: i32) {
+    LIVE_GUEST_THREADS.store(n, Ordering::SeqCst);
 }
 
 // Global fallback TID (for backward compat, used when pthread key not yet set)
@@ -303,10 +315,12 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
     });
     let arg_ptr = Box::into_raw(arg) as *mut libc::c_void;
 
+    LIVE_GUEST_THREADS.fetch_add(1, Ordering::SeqCst);
     let ret = unsafe {
         libc::pthread_create(&mut thread, std::ptr::null(), clone_entry, arg_ptr)
     };
     if ret != 0 {
+        LIVE_GUEST_THREADS.fetch_sub(1, Ordering::SeqCst);
         // Clean up
         unsafe { drop(Box::from_raw(arg_ptr as *mut CloneArgs)); }
         return (-12_i64) as u64; // -ENOMEM
@@ -464,6 +478,8 @@ pub fn thread_exit(status: i32) -> ! {
         // Wake any thread waiting on this futex (e.g., pthread_join)
         do_futex(clear_tid_addr, FUTEX_WAKE, 1, 0, 0, 0);
     }
+
+    LIVE_GUEST_THREADS.fetch_sub(1, Ordering::SeqCst);
 
     // Exit only this pthread, not the whole process.
     unsafe {
