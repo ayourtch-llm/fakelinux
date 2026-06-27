@@ -319,21 +319,30 @@ pub fn do_listen(fd: i32, backlog: i32) -> u64 {
 }
 
 pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
-    // macOS has no accept4; use accept + fcntl
-    let ret = unsafe {
-        libc::accept(
-            fd,
-            if addr_ptr == 0 {
-                std::ptr::null_mut()
-            } else {
-                addr_ptr as *mut libc::sockaddr
-            },
-            if addrlen_ptr == 0 {
-                std::ptr::null_mut()
-            } else {
-                addrlen_ptr as *mut libc::socklen_t
-            },
-        )
+    // macOS has no accept4; use accept + fcntl.
+    let addr = if addr_ptr == 0 { std::ptr::null_mut() } else { addr_ptr as *mut libc::sockaddr };
+    let alen = if addrlen_ptr == 0 { std::ptr::null_mut() } else { addrlen_ptr as *mut libc::socklen_t };
+    // Interruptible accept: a blocking accept inside the SIGILL trap handler with
+    // SA_RESTART forwarders never wakes on a signal (a manager server's accept
+    // loop would stall any signal-driven shutdown). Poll for an incoming
+    // connection in 100ms chunks with host signals unblocked, returning -EINTR
+    // between chunks when a signal with a real handler is deliverable.
+    let ret = loop {
+        if crate::signal::deliverable_pending() != 0 {
+            unsafe { *libc::__error() = libc::EINTR; }
+            break -1;
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let pr = {
+            let _unblock = crate::signal::HostSigUnblock::new();
+            unsafe { libc::poll(&mut pfd, 1, 100) }
+        };
+        if pr < 0 {
+            if unsafe { *libc::__error() } == libc::EINTR { continue; }
+            break unsafe { libc::accept(fd, addr, alen) }; // poll unusable → fall back
+        }
+        if pr == 0 { continue; }
+        break unsafe { libc::accept(fd, addr, alen) };
     };
     if ret < 0 {
         return translate::linux_errno();
