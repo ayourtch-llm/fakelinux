@@ -12,11 +12,14 @@ use crate::thread;
 use crate::timers;
 use crate::translate;
 use crate::trap::MContext64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Sysroot path for path translation (set once at startup from FAKELINUX_SYSROOT).
 static SYSROOT: OnceLock<String> = OnceLock::new();
+const SOCKET_WAITER_FD_LIMIT: usize = 65536;
+static SOCKET_WAITERS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
 
 /// Initialize the sysroot from the environment variable.
 pub fn init_sysroot(sysroot: &str) {
@@ -698,7 +701,62 @@ pub(crate) enum WaitReady {
     TimedOut,
 }
 
+fn socket_waiters() -> &'static [AtomicUsize] {
+    SOCKET_WAITERS.get_or_init(|| {
+        (0..SOCKET_WAITER_FD_LIMIT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+fn fd_is_socket(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    (unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    }) == 0
+}
+
+struct SocketWaiter {
+    fd: i32,
+}
+
+impl SocketWaiter {
+    fn new(fd: i32) -> Option<Self> {
+        if fd < 0 || fd as usize >= SOCKET_WAITER_FD_LIMIT || !fd_is_socket(fd) {
+            return None;
+        }
+        socket_waiters()[fd as usize].fetch_add(1, Ordering::SeqCst);
+        Some(Self { fd })
+    }
+}
+
+impl Drop for SocketWaiter {
+    fn drop(&mut self) {
+        socket_waiters()[self.fd as usize].fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn socket_has_waiter(fd: i32) -> bool {
+    if fd < 0 || fd as usize >= SOCKET_WAITER_FD_LIMIT {
+        return false;
+    }
+    socket_waiters()[fd as usize].load(Ordering::SeqCst) > 0
+}
+
 pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
+    let _socket_waiter = SocketWaiter::new(fd);
+
     // SO_RCVTIMEO deadline: if the socket has a receive timeout, enforce it
     // here so the wait doesn't block forever. The host recvfrom would respect
     // it natively, but we never reach recvfrom when the fd has no data — this
@@ -918,28 +976,16 @@ fn wake_socket_before_close(fd: i32) {
     if fd < 0 {
         return;
     }
-    if !thread::has_multiple_guest_threads() {
+    if !thread::has_multiple_guest_threads() && !socket_has_waiter(fd) {
         return;
     }
-    let mut ty: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    let is_socket = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            &mut ty as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    } == 0;
-    if is_socket {
+    if fd_is_socket(fd) {
         // Linux close() wakes another thread blocked in recv/send on the same
         // socket fd. macOS close() alone often does not; shutdown() provides the
-        // wakeup before the descriptor is actually closed. Do this only when
-        // this process has multiple guest threads: shutdown() affects the socket
-        // object, so using it for ordinary single-threaded close() can break
-        // forked children closing inherited descriptors that another process
-        // still legitimately owns.
+        // wakeup before the descriptor is actually closed. Avoid doing this for
+        // ordinary single-threaded close(): shutdown() affects the socket object,
+        // so it can break forked children closing inherited descriptors or code
+        // closing a dup while another fd still owns the socket.
         unsafe {
             libc::shutdown(fd, libc::SHUT_RDWR);
         }
@@ -4078,6 +4124,45 @@ mod tests {
         unsafe {
             libc::close(sv[0]);
             libc::close(sv[1]);
+        }
+    }
+
+    #[test]
+    fn close_wakes_fakelinux_socket_waiter_even_if_live_guest_count_is_one() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(1);
+
+        let recv_fd = sv[0];
+        let peer_fd = sv[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut byte = 0u8;
+            let ret = net::do_recvfrom(
+                recv_fd,
+                &mut byte as *mut _ as u64,
+                1,
+                0,
+                0,
+                0,
+            );
+            let _ = tx.send(ret);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(do_close(recv_fd), 0);
+        let ret = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close must wake a fakelinux recv waiter");
+        assert!(
+            ret == 0 || (ret as i64) < 0,
+            "blocked fakelinux recv should return EOF or error after close, got {ret}"
+        );
+        handle.join().unwrap();
+        thread::set_live_guest_threads_for_test(1);
+        unsafe {
+            libc::close(peer_fd);
         }
     }
 
