@@ -1123,36 +1123,35 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32) -> u64 {
             0
         }
         None => {
-            // No timeout: wait indefinitely until woken — that's the Linux
-            // contract. We loop wait_timeout (rather than a bare wait) only so a
-            // genuinely stuck wait can be reported under verbose; we never abort,
-            // since returning a spurious -EAGAIN breaks legitimate long blocks
-            // (timers, idle worker threads) and busy-loops the guest.
+            // No timeout: wait until woken — the Linux contract. But the wait
+            // must be interruptible by signals (Linux returns -EINTR), otherwise
+            // SIGALRM/SIGCHLD/SIGTERM never reach a guest blocked here and any
+            // signal-driven logic (e.g. test runners, clean shutdown) stalls.
+            // The host condvar isn't signal-aware, so poll PENDING_SIGNALS on a
+            // short interval and return -EINTR when one is deliverable.
             loop {
                 if *guard {
                     return 0;
                 }
-                let result = waiter.condvar.wait_timeout(guard, Duration::from_secs(30)).unwrap();
+                if crate::signal::deliverable_pending() != 0 {
+                    drop(guard); // release waiter.mutex before taking entry.waiters
+                    if let Ok(mut waiters) = entry.waiters.lock() {
+                        waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
+                    }
+                    return (-4_i64) as u64; // -EINTR
+                }
+                // Unblock host signals around the wait (the SIGILL trap handler
+                // blocks everything) so a signal arriving mid-wait reaches the
+                // forwarder and sets PENDING_SIGNALS — which the check above then
+                // turns into -EINTR within one poll interval.
+                let result = {
+                    let _unblock = crate::signal::HostSigUnblock::new();
+                    waiter
+                        .condvar
+                        .wait_timeout(guard, Duration::from_millis(200))
+                        .unwrap()
+                };
                 guard = result.0;
-                if *guard {
-                    return 0;
-                }
-                if crate::diag::verbose() && result.1.timed_out() {
-                    let pid = unsafe { libc::getpid() };
-                    let cur_val = current.load(Ordering::SeqCst);
-                    let guest_pc = crate::trap::LAST_SVC_PC.load(Ordering::Relaxed);
-                    let mut buf = [0u8; 250];
-                    let n = {
-                        use std::io::Write;
-                        let mut c = std::io::Cursor::new(&mut buf[..]);
-                        let _ = c.write_fmt(format_args!(
-                            "fakelinux: [{}] FUTEX_LONGWAIT uaddr={:#x} val={} cur={} pc={:#x} — still waiting\n",
-                            pid, uaddr, val, cur_val, guest_pc
-                        ));
-                        c.position() as usize
-                    };
-                    unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
-                }
             }
         }
     }
