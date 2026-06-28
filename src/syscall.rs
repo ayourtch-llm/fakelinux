@@ -754,6 +754,57 @@ fn socket_has_waiter(fd: i32) -> bool {
     socket_waiters()[fd as usize].load(Ordering::SeqCst) > 0
 }
 
+fn socket_has_duplicate_open_fd(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let mut target: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut target) } != 0 {
+        return false;
+    }
+    if target.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return false;
+    }
+
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let open_max = if open_max > 0 {
+        (open_max as i32).min(SOCKET_WAITER_FD_LIMIT as i32)
+    } else {
+        1024
+    };
+    for other in 0..open_max {
+        if other == fd {
+            continue;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(other, &mut st) } != 0 {
+            continue;
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFSOCK
+            && st.st_dev == target.st_dev
+            && st.st_ino == target.st_ino
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn socket_has_recv_timeout(fd: i32) -> bool {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && (tv.tv_sec != 0 || tv.tv_usec != 0)
+}
+
 pub(crate) fn reset_socket_waiters_after_fork() {
     if let Some(waiters) = SOCKET_WAITERS.get() {
         for count in waiters.iter() {
@@ -984,20 +1035,80 @@ fn wake_socket_before_close(fd: i32) {
     if fd < 0 {
         return;
     }
-    if !thread::has_multiple_guest_threads() && !socket_has_waiter(fd) {
+    let trace_close = std::env::var_os("FAKELINUX_TRACE_SOCKET_CLOSE").is_some();
+    if !fd_is_socket(fd) {
         return;
     }
-    if fd_is_socket(fd) {
-        // Linux close() wakes another thread blocked in recv/send on the same
-        // socket fd. macOS close() alone often does not; shutdown() provides the
-        // wakeup before the descriptor is actually closed. Avoid doing this for
-        // ordinary single-threaded close(): shutdown() affects the socket object,
-        // so it can break forked children closing inherited descriptors or code
-        // closing a dup while another fd still owns the socket.
-        unsafe {
-            libc::shutdown(fd, libc::SHUT_RDWR);
-        }
+    let has_waiter = socket_has_waiter(fd);
+    let guest_threaded = thread::has_multiple_guest_threads();
+    let host_threaded = host_has_multiple_threads();
+    let has_recv_timeout = socket_has_recv_timeout(fd);
+    let host_threaded_timeout_socket = !has_waiter && host_threaded && has_recv_timeout;
+    if trace_close {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] socket-close fd={} waiter={} guest_threads={} host_threads={} rcvtimeo={}\n",
+            pid, fd, has_waiter, guest_threaded, host_threaded, has_recv_timeout,
+        ));
     }
+    if !guest_threaded && !has_waiter && !host_threaded_timeout_socket {
+        return;
+    }
+    if !guest_threaded && !has_waiter && socket_has_duplicate_open_fd(fd) {
+        if trace_close {
+            let pid = unsafe { libc::getpid() };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] socket-close fd={} skip duplicate\n",
+                pid, fd,
+            ));
+        }
+        return;
+    }
+    // Linux close() wakes another thread blocked in recv/send on the same
+    // socket fd. macOS close() alone often does not; shutdown() provides the
+    // wakeup before the descriptor is actually closed. Avoid doing this for
+    // ordinary single-threaded close(): shutdown() affects the socket object,
+    // so it can break forked children closing inherited descriptors or code
+    // closing a dup while another fd still owns the socket.
+    unsafe {
+        if trace_close {
+            let pid = libc::getpid();
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] socket-close fd={} shutdown\n",
+                pid, fd,
+            ));
+        }
+        libc::shutdown(fd, libc::SHUT_RDWR);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_has_multiple_threads() -> bool {
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+        fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+    }
+
+    let mut threads: *mut u32 = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    let kr = unsafe { task_threads(mach_task_self(), &mut threads, &mut count) };
+    if kr != 0 || threads.is_null() {
+        return false;
+    }
+    unsafe {
+        vm_deallocate(
+            mach_task_self(),
+            threads as usize,
+            count as usize * std::mem::size_of::<u32>(),
+        );
+    }
+    count > 1
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_has_multiple_threads() -> bool {
+    false
 }
 
 fn do_close(fd: i32) -> u64 {
