@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, Arc};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // ─── Saved CLOEXEC mask for fork children ──────────────────────────────────
@@ -142,6 +143,54 @@ pub fn alloc_tid() -> i32 {
 
 // The main thread's TID
 static MAIN_TID: AtomicI32 = AtomicI32::new(0);
+const GUEST_THREAD_LIMIT: usize = 65536;
+static GUEST_THREAD_HOSTS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
+
+fn guest_thread_hosts() -> &'static [AtomicUsize] {
+    GUEST_THREAD_HOSTS.get_or_init(|| {
+        (0..GUEST_THREAD_LIMIT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+fn register_guest_thread(tid: i32) {
+    if tid > 0 && (tid as usize) < GUEST_THREAD_LIMIT {
+        let host = unsafe { libc::pthread_self() } as usize;
+        guest_thread_hosts()[tid as usize].store(host, Ordering::SeqCst);
+    }
+}
+
+fn unregister_guest_thread(tid: i32) {
+    if tid > 0 && (tid as usize) < GUEST_THREAD_LIMIT {
+        if let Some(hosts) = GUEST_THREAD_HOSTS.get() {
+            hosts[tid as usize].store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+fn clear_guest_threads() {
+    if let Some(hosts) = GUEST_THREAD_HOSTS.get() {
+        for host in hosts.iter() {
+            host.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+pub fn signal_guest_thread(tid: i32, mac_sig: i32) -> Option<i32> {
+    if tid <= 0 || (tid as usize) >= GUEST_THREAD_LIMIT {
+        return None;
+    }
+    let host = GUEST_THREAD_HOSTS
+        .get()
+        .map(|hosts| hosts[tid as usize].load(Ordering::SeqCst))
+        .unwrap_or(0);
+    if host == 0 {
+        return None;
+    }
+    Some(unsafe { libc::pthread_kill(host as libc::pthread_t, mac_sig) })
+}
 
 pub fn init_main_tid() {
     let tid = alloc_tid();
@@ -149,6 +198,7 @@ pub fn init_main_tid() {
     CURRENT_TID.store(tid, Ordering::SeqCst);
     LIVE_GUEST_THREADS.store(1, Ordering::SeqCst);
     set_thread_tid(tid);
+    register_guest_thread(tid);
 }
 
 pub fn main_tid() -> i32 {
@@ -162,11 +212,13 @@ pub fn main_tid() -> i32 {
 /// thread. Treating the surviving child thread as non-main makes SYS_EXIT call
 /// pthread_exit(), leaving helper pthreads alive and blocked in process teardown.
 fn reset_main_thread_after_fork() {
+    clear_guest_threads();
     let tid = alloc_tid();
     MAIN_TID.store(tid, Ordering::SeqCst);
     CURRENT_TID.store(tid, Ordering::SeqCst);
     LIVE_GUEST_THREADS.store(1, Ordering::SeqCst);
     set_thread_tid(tid);
+    register_guest_thread(tid);
     set_clear_tid_ptr(0);
 }
 
@@ -420,6 +472,7 @@ extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
 
     // Set up per-thread TID
     set_thread_tid(args.tid);
+    register_guest_thread(args.tid);
 
     // Set up per-thread TPIDR
     if args.set_tls {
@@ -480,6 +533,7 @@ pub fn thread_exit(status: i32) -> ! {
     }
 
     LIVE_GUEST_THREADS.fetch_sub(1, Ordering::SeqCst);
+    unregister_guest_thread(current_tid());
 
     // Exit only this pthread, not the whole process.
     unsafe {
@@ -1001,7 +1055,7 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
         unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) }
     } else {
         loop {
-            if crate::signal::deliverable_pending() != 0 {
+            if crate::signal::has_unblocked_pending() {
                 unsafe { *libc::__error() = libc::EINTR; }
                 break -1_i32;
             }
@@ -1332,7 +1386,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                     }
                     return (-110_i64) as u64; // -ETIMEDOUT (Linux value)
                 }
-                if crate::signal::deliverable_pending() != 0 {
+                if crate::signal::has_unblocked_pending() {
                     drop(guard);
                     if let Ok(mut waiters) = entry.waiters.lock() {
                         waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
@@ -1368,7 +1422,7 @@ fn futex_wait(uaddr: u64, val: u32, timeout_ptr: u64, bitset: u32, abstime: bool
                     }
                     return 0;
                 }
-                if crate::signal::deliverable_pending() != 0 {
+                if crate::signal::has_unblocked_pending() {
                     drop(guard); // release waiter.mutex before taking entry.waiters
                     if let Ok(mut waiters) = entry.waiters.lock() {
                         waiters.retain(|w| !Arc::ptr_eq(w, &waiter));
@@ -1479,6 +1533,21 @@ mod tests {
         CURRENT_TID.store(old_current, Ordering::SeqCst);
         set_thread_tid(old_current);
         set_clear_tid_ptr(old_clear_tid);
+    }
+
+    #[test]
+    fn guest_thread_registry_routes_current_thread_signal_zero() {
+        let old_current = CURRENT_TID.load(Ordering::SeqCst);
+        let tid = 3333;
+
+        set_thread_tid(tid);
+        register_guest_thread(tid);
+        assert_eq!(signal_guest_thread(tid, 0), Some(0));
+
+        unregister_guest_thread(tid);
+        assert_eq!(signal_guest_thread(tid, 0), None);
+
+        set_thread_tid(old_current);
     }
 
     // Lifecycle of the saved-CLOEXEC mask across fork→(dup2/close)→exec.

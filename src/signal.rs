@@ -184,6 +184,20 @@ pub fn deliverable_pending() -> u64 {
     )
 }
 
+/// Pending signals that are not blocked by the current guest thread mask.
+///
+/// This is intentionally broader than deliverable_pending(): a signal queued
+/// while this thread is in trap context has already reached the host forwarder,
+/// so blocking syscalls should return -EINTR and let trap-exit delivery decide
+/// whether to build a guest sigframe.
+pub fn unblocked_pending() -> u64 {
+    PENDING_SIGNALS.load(Ordering::SeqCst) & !sigmask_get()
+}
+
+pub fn has_unblocked_pending() -> bool {
+    unblocked_pending() != 0
+}
+
 /// Unblock all host signals for the duration of a blocking wait emulated
 /// inside the SIGILL trap handler (whose sa_mask blocks everything — a
 /// signal arriving mid-wait could otherwise never reach the forwarder to be
@@ -544,9 +558,10 @@ unsafe extern "C" fn signal_forwarder(
     // Translate macOS signal to Linux signal
     let linux_sig = mac_to_linux(sig);
 
-    // If we're inside the trap handler, the ucontext has the handler's
-    // native registers, NOT the guest's. We must defer delivery.
-    if crate::trap::IN_TRAP.load(Ordering::SeqCst) {
+    // If this thread is inside the trap handler, the ucontext has the handler's
+    // native registers, NOT guest registers. Defer delivery only for the
+    // interrupted thread; other guest threads can take a sigframe directly.
+    if crate::trap::in_trap() {
         if linux_sig > 0 && linux_sig <= 64 {
             PENDING_SIGNALS.fetch_or(1u64 << (linux_sig - 1) as u64, Ordering::SeqCst);
         }
@@ -954,12 +969,26 @@ pub fn do_kill(pid: i64, linux_sig: i32) -> u64 {
 
 /// Handle tkill(tid, sig) syscall. Translates Linux signal to macOS.
 pub fn do_tkill(tid: i32, linux_sig: i32) -> u64 {
-    // For single-threaded, tkill is essentially kill
-    do_kill(tid as i64, linux_sig)
+    if linux_sig == 0 {
+        return if crate::thread::signal_guest_thread(tid, 0).is_some() {
+            0
+        } else {
+            (-3_i64) as u64 // -ESRCH
+        };
+    }
+    let mac_sig = match linux_to_mac(linux_sig) {
+        Some(s) => s,
+        None => return (-22_i64) as u64, // -EINVAL
+    };
+    match crate::thread::signal_guest_thread(tid, mac_sig) {
+        Some(0) => 0,
+        Some(_) => crate::translate::linux_errno(),
+        None => (-3_i64) as u64, // -ESRCH
+    }
 }
 
 /// Handle tgkill(tgid, tid, sig) syscall. Translates Linux signal to macOS.
-pub fn do_tgkill(tgid: i32, _tid: i32, linux_sig: i32) -> u64 {
+pub fn do_tgkill(tgid: i32, tid: i32, linux_sig: i32) -> u64 {
     if linux_sig == 6 {
         // SIGABRT
         let msg = "fakelinux: guest called abort (tgkill SIGABRT)\n";
@@ -968,7 +997,28 @@ pub fn do_tgkill(tgid: i32, _tid: i32, linux_sig: i32) -> u64 {
             libc::_exit(134);
         }
     }
-    do_kill(tgid as i64, linux_sig)
+    if linux_sig == 0 {
+        let ret = unsafe { libc::kill(tgid, 0) };
+        if ret < 0 {
+            return crate::translate::linux_errno();
+        }
+        return if crate::thread::signal_guest_thread(tid, 0).is_some() {
+            0
+        } else {
+            (-3_i64) as u64 // -ESRCH
+        };
+    }
+    let mac_sig = match linux_to_mac(linux_sig) {
+        Some(s) => s,
+        None => return (-22_i64) as u64, // -EINVAL
+    };
+    match crate::thread::signal_guest_thread(tid, mac_sig) {
+        Some(0) => 0,
+        Some(_) => crate::translate::linux_errno(),
+        // Fall back for process IDs that are real host threads/processes from
+        // outside fakelinux's clone registry.
+        None => do_kill(tgid as i64, linux_sig),
+    }
 }
 
 // ---- Internal helpers ----

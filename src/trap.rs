@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
@@ -14,10 +15,28 @@ extern "C" {
     ) -> i32;
 }
 
-/// Flag indicating we're inside our trap handler. When set, other signal
-/// handlers (signal_forwarder) must defer delivery by queuing to pending,
-/// because the ucontext contains trap handler registers, not guest registers.
+/// Legacy process-wide trap marker, retained for diagnostics only.
+///
+/// Signal delivery decisions must use the thread-local trap marker below:
+/// macOS can deliver a process-directed signal to any unblocked thread, and
+/// another guest thread being in trap context does not make this thread's
+/// ucontext unsafe to edit.
 pub static IN_TRAP: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static IN_TRAP_TL: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline]
+pub fn in_trap() -> bool {
+    IN_TRAP_TL.with(|v| v.get())
+}
+
+#[inline]
+fn set_in_trap(v: bool) {
+    IN_TRAP_TL.with(|cell| cell.set(v));
+    IN_TRAP.store(v, Ordering::SeqCst);
+}
 
 // ─── Lazy relocation for relocated ET_EXEC ──────────────────────────────────
 // When a non-PIE ET_EXEC is relocated (macOS 4GB PAGEZERO), some absolute
@@ -1992,7 +2011,7 @@ unsafe extern "C" fn trap_handler(
     _info: *mut libc::siginfo_t,
     ctx: *mut c_void,
 ) {
-    IN_TRAP.store(true, Ordering::SeqCst);
+    set_in_trap(true);
 
     let uctx = &mut *(ctx as *mut UContext);
     let mctx = &mut *uctx.uc_mcontext;
@@ -2159,13 +2178,13 @@ unsafe extern "C" fn trap_handler(
         }
         // Otherwise, keep the UDF in place for next call
 
-        IN_TRAP.store(false, Ordering::SeqCst);
+        set_in_trap(false);
         return;
     }
 
     // Software-watchpoint step probe (UDF_WATCH_STEP at pc)
     if watch_handle_step(mctx) {
-        IN_TRAP.store(false, Ordering::SeqCst);
+        set_in_trap(false);
         return;
     }
 
@@ -2219,7 +2238,7 @@ unsafe extern "C" fn trap_handler(
         libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
         FORK_RETURN_PROBE.store(0, Ordering::Relaxed);
         // Don't advance PC — re-execute the restored instruction
-        IN_TRAP.store(false, Ordering::SeqCst);
+        set_in_trap(false);
         return;
     }
 
@@ -2249,7 +2268,7 @@ unsafe extern "C" fn trap_handler(
                     ));
                     libc::write(2, buf.as_ptr() as *const _, n);
                 }
-                IN_TRAP.store(false, Ordering::SeqCst);
+                set_in_trap(false);
                 return;
             } else if orig_instr & MRS_TPIDR_MASK == MRS_TPIDR_BASE {
                 // MRS Xn, tpidr_el0
@@ -2282,7 +2301,7 @@ unsafe extern "C" fn trap_handler(
                     ));
                     libc::write(2, buf.as_ptr() as *const _, n);
                 }
-                IN_TRAP.store(false, Ordering::SeqCst);
+                set_in_trap(false);
                 return;
             } else {
                 // Not TPIDR — must be an x18 instruction
@@ -2347,7 +2366,7 @@ unsafe extern "C" fn trap_handler(
                     // later crash dump must not report this instruction as
                     // "currently being emulated" (stale values misled debugging).
                     unsafe { CURRENT_X18_INSTR = 0; CURRENT_X18_PC = 0; }
-                    IN_TRAP.store(false, Ordering::SeqCst);
+                    set_in_trap(false);
                     crate::signal::deliver_pending_to_guest(mctx);
                     return;
                 }
@@ -2504,7 +2523,7 @@ unsafe extern "C" fn trap_handler(
         let sa = crate::signal::guest_sigaction(linux_sig);
         if sa.handler != 0 && sa.handler != 1 {
             // Guest has a SIGILL handler — let signal_forwarder handle it
-            IN_TRAP.store(false, Ordering::SeqCst);
+            set_in_trap(false);
             // SIGILL: si_addr = faulting pc, si_code = ILL_ILLOPC.
             crate::signal::build_sigframe_and_redirect(
                 mctx, linux_sig as i32, sa.handler, sa.mask, mctx.ss.pc, 1);
@@ -2520,7 +2539,7 @@ unsafe extern "C" fn trap_handler(
     // mutates `mctx`, and another macOS signal arriving here would also try to
     // mutate it via signal_forwarder, racing with our writes.
     crate::signal::deliver_pending_to_guest(mctx);
-    IN_TRAP.store(false, Ordering::SeqCst);
+    set_in_trap(false);
 }
 
 /// Full signal environment re-init for child after fork().
@@ -2560,7 +2579,7 @@ pub fn init_child_after_fork() {
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
 
         // Reset IN_TRAP (should already be false, but be safe)
-        IN_TRAP.store(false, Ordering::SeqCst);
+        set_in_trap(false);
     }
 }
 
@@ -3029,6 +3048,22 @@ unsafe extern "C" fn crash_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_trap_is_thread_local() {
+        set_in_trap(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            set_in_trap(true);
+            tx.send(in_trap()).unwrap();
+            set_in_trap(false);
+        });
+
+        assert_eq!(rx.recv().unwrap(), true);
+        assert_eq!(in_trap(), false);
+        handle.join().unwrap();
+    }
 
     // ── lazy_reloc_pick_register ─────────────────────────────────────────
     // ET_EXEC lazy relocation: when a load/store faults on an unrelocated
