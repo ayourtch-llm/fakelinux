@@ -893,11 +893,27 @@ pub fn dump_trap_stats() {
         return;
     }
     let pid = unsafe { libc::getpid() };
-    let mut buf = [0u8; 160];
+    let (tramp_ok, tramp_fb) = crate::x18_trampoline::tramp_fallback_counts();
+    let mut buf = [0u8; 320];
     let n = raw_fmt(&mut buf, format_args!(
-        "fakelinux: [{}] TRAP_STATS svc={} tpidr={} x18_fallback={}\n",
-        pid, svc, tpidr, x18));
+        "fakelinux: [{}] TRAP_STATS svc={} tpidr={} x18_fallback={} tramp_ok={} tramp_fb={} emit_gpr={} sig_in_island={} sig_in_window={}\n",
+        pid, svc, tpidr, x18, tramp_ok, tramp_fb,
+        crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
+        crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
+        crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
+    // Also write to a per-pid host file (robust vs. stderr capture). Diagnostic.
+    unsafe {
+        let mut path = [0u8; 64];
+        let pn = raw_fmt(&mut path, format_args!("/tmp/fl_trapstats_{}.txt\0", pid));
+        let fd = libc::open(path.as_ptr() as *const _,
+            libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND, 0o644);
+        if fd >= 0 {
+            libc::write(fd, buf.as_ptr() as *const _, n);
+            libc::close(fd);
+        }
+        let _ = pn;
+    }
     // top instructions, simple selection sort without allocating
     let mut done = [false; STAT_SLOTS];
     let mut printed = 0;
@@ -935,6 +951,7 @@ pub fn init_trace_flags() {
     let v: i8 = if std::env::var_os("FAKELINUX_TRACE_X18_STORES").is_some() { 1 } else { 0 };
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
+    crate::signal::SIGTRACE.store(std::env::var_os("FAKELINUX_SIGTRACE").is_some(), Ordering::Relaxed);
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
         let parts: Vec<&str> = spec.split(':').collect();
@@ -2972,6 +2989,7 @@ unsafe extern "C" fn crash_handler(
         regs.fp, regs.sp, regs.lr, guest_tpidr
     ));
     libc::write(2, buf.as_ptr() as *const _, n);
+    crate::signal::dump_sigtrace_ring();
     // Dump the top of the guest stack (callee-saved spill area) — lets us
     // recover caller-saved registers (e.g. an rtx pointer spilled by the
     // crashing callee's prologue) without a debugger. Safe mach read.

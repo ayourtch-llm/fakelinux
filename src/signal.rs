@@ -356,6 +356,25 @@ const UCONTEXT_OFFSET: usize = 944;
 const UCONTEXT_MCONTEXT: usize = 176; // offsetof(ucontext_t, uc_mcontext) on aarch64
 const RT_SIGFRAME_SIZE: usize = UCONTEXT_OFFSET + 480;
 
+/// Red-zone gap left between the guest sp and the top of the synthesized signal
+/// frame. AArch64 defines no ABI red zone, but fakelinux's x18 trampoline
+/// transiently parks the interrupted code's saved x16/x17 at `[sp-32]` while it
+/// raises sp back to the original value to run the wrapped instruction (see
+/// x18_trampoline.rs::emit, the `add sp,sp,#32` .. `sub sp,sp,#32` window). If a
+/// signal lands in that ~1-instruction window, placing the frame flush at sp
+/// would overwrite `[sp-32]`, and the trampoline's `ldp x16,x17,[sp],#32` on
+/// exit would restore corrupted values — a rare 16-byte register/crypto
+/// corruption or wild-store crash. The gap (>= the trampoline's 32-byte save)
+/// keeps that data safe. Generous margin for any future below-sp scratch use.
+const SIGFRAME_REDZONE: u64 = 256;
+
+/// Compute the (16-byte aligned) base address of the signal frame for a given
+/// guest sp, leaving SIGFRAME_REDZONE bytes untouched below sp. Pure helper so
+/// the red-zone invariant is unit-testable.
+fn sigframe_base(guest_sp: u64) -> u64 {
+    (guest_sp - SIGFRAME_REDZONE - RT_SIGFRAME_SIZE as u64) & !0xF
+}
+
 /// Build a Linux rt_sigframe on the guest stack and redirect execution to the
 /// guest signal handler. Called from signal_forwarder (macOS signal context).
 ///
@@ -363,6 +382,53 @@ const RT_SIGFRAME_SIZE: usize = UCONTEXT_OFFSET + 480;
 /// `linux_sig` is the Linux signal number.
 /// `handler` is the guest handler address.
 /// `handler_mask` is the sa_mask from the guest sigaction.
+thread_local! {
+    static DBG_FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DBG_CRC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// DIAGNOSTIC: enable compact signal build/restore tracing (FAKELINUX_SIGTRACE).
+pub static SIGTRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// DIAGNOSTIC: signals that interrupted the guest inside a trampoline island /
+/// in the sp-raised danger window.
+pub static SIG_IN_ISLAND: AtomicU64 = AtomicU64::new(0);
+pub static SIG_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+// Lock-free ring buffer of recent signal build/restore events (no I/O so timing
+// is not perturbed); dumped by the crash handler.
+const SIGRING_N: usize = 64;
+#[derive(Clone, Copy)]
+struct SigEv { tag: u8, a: u64, b: u64, c: u64, d: u64 }
+static mut SIGRING: [SigEv; SIGRING_N] =
+    [SigEv { tag: 0, a: 0, b: 0, c: 0, d: 0 }; SIGRING_N];
+static SIGRING_IDX: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+unsafe fn sigtrace(tag: &str, a: u64, b: u64, c: u64, d: u64) {
+    if !SIGTRACE.load(Ordering::Relaxed) { return; }
+    let i = (SIGRING_IDX.fetch_add(1, Ordering::Relaxed) as usize) % SIGRING_N;
+    let t = match tag { "BUILD" => b'B', "RESTORE" => b'R', _ => b'?' };
+    let p = &raw mut SIGRING[i];
+    (*p).tag = t; (*p).a = a; (*p).b = b; (*p).c = c; (*p).d = d;
+}
+
+/// Dump the signal-event ring buffer (oldest→newest). Called from crash handler.
+pub unsafe fn dump_sigtrace_ring() {
+    if !SIGTRACE.load(Ordering::Relaxed) { return; }
+    let end = SIGRING_IDX.load(Ordering::Relaxed);
+    let start = end.saturating_sub(SIGRING_N as u64);
+    let hdr = b"fakelinux: --- sigtrace ring (oldest first) ---\n";
+    libc::write(2, hdr.as_ptr() as *const _, hdr.len());
+    for k in start..end {
+        let e = SIGRING[(k as usize) % SIGRING_N];
+        let mut buf = [0u8; 160];
+        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+            "  {} a={:#x} b={:#x} c={:#x} d={:#x}\n",
+            e.tag as char, e.a, e.b, e.c, e.d));
+        libc::write(2, buf.as_ptr() as *const _, n);
+    }
+}
+
 pub unsafe fn build_sigframe_and_redirect(
     mctx: &mut crate::trap::MContext64,
     linux_sig: i32,
@@ -382,8 +448,9 @@ pub unsafe fn build_sigframe_and_redirect(
         sigmask_get()
     };
 
-    // Allocate frame on guest stack (stack grows down)
-    let frame_addr = (guest_sp - RT_SIGFRAME_SIZE as u64) & !0xF; // 16-byte align
+    // Allocate frame on guest stack (stack grows down), leaving a red-zone gap
+    // below sp (see sigframe_base / SIGFRAME_REDZONE).
+    let frame_addr = sigframe_base(guest_sp);
 
     let p = frame_addr as *mut u8;
 
@@ -421,6 +488,19 @@ pub unsafe fn build_sigframe_and_redirect(
         neon_dst.add(i).write_unaligned(mctx.ns.v[i]);
     }
 
+    // DIAGNOSTIC (gated): checksum the saved register region so do_rt_sigreturn
+    // can detect if guest memory holding the frame is overwritten before restore.
+    if SIGTRACE.load(Ordering::Relaxed) {
+        let mut crc = 0u64;
+        let mut off = 8usize;
+        while off < NEON_SAVE_OFFSET + 512 {
+            crc = crc.rotate_left(7) ^ (p.add(off) as *const u64).read_unaligned();
+            off += 8;
+        }
+        DBG_FRAME.with(|c| c.set(frame_addr));
+        DBG_CRC.with(|c| c.set(crc));
+    }
+
     // ---- SA_SIGINFO data: Linux siginfo_t + ucontext_t ----
     // Guest handlers (VPP's unix_signal_handler) dereference these
     // unconditionally; x1=x2=0 turned every forwarded signal into a NULL
@@ -455,6 +535,17 @@ pub unsafe fn build_sigframe_and_redirect(
     // Get the executable sigreturn trampoline address
     let trampoline_addr = SIGRETURN_TRAMPOLINE.load(Ordering::SeqCst);
 
+    sigtrace("BUILD", linux_sig as u64, guest_sp, frame_addr, regs.pc);
+
+    // DIAGNOSTIC (gated): count signals that interrupt the guest INSIDE a
+    // trampoline island (sp-raised danger window = slot offsets 12-20).
+    if SIGTRACE.load(Ordering::Relaxed) {
+        if let Some(slot_off) = crate::x18_trampoline::pc_island_slot_offset(regs.pc) {
+            SIG_IN_ISLAND.fetch_add(1, Ordering::Relaxed);
+            if (12..=20).contains(&slot_off) { SIG_IN_WINDOW.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
+
     // Redirect guest execution to the handler
     regs.sp = frame_addr;
     regs.pc = handler;
@@ -480,6 +571,29 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         let msg = "fakelinux: rt_sigreturn: invalid sigframe trampoline\n";
         libc::write(2, msg.as_ptr() as *const _, msg.len());
         return false;
+    }
+
+    // DIAGNOSTIC (gated): verify the saved register region was not overwritten
+    // in guest memory between save (build_sigframe) and now.
+    if SIGTRACE.load(Ordering::Relaxed) && DBG_FRAME.with(|c| c.get()) == frame_addr {
+        let mut crc = 0u64;
+        let mut off = 8usize;
+        while off < NEON_SAVE_OFFSET + 512 {
+            crc = crc.rotate_left(7) ^ (p.add(off) as *const u64).read_unaligned();
+            off += 8;
+        }
+        if crc != DBG_CRC.with(|c| c.get()) {
+            static C: AtomicU64 = AtomicU64::new(0);
+            if C.fetch_add(1, Ordering::Relaxed) < 16 {
+                // find first differing 8-byte word vs. nothing (we only have crc);
+                // report the region kind by scanning for the first non-saved word
+                let mut buf = [0u8; 160];
+                let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                    "fakelinux: SIGFRAME-CORRUPT frame={:#x} crc {:#x}!={:#x}\n",
+                    frame_addr, crc, DBG_CRC.with(|c| c.get())));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+        }
     }
 
     // Restore x0..x28. x18 goes back to the per-thread TSD slot (guest x18),
@@ -510,6 +624,15 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     let neon_src = p.add(NEON_SAVE_OFFSET) as *const u128;
     for i in 0..32 {
         mctx.ns.v[i] = neon_src.add(i).read_unaligned();
+    }
+
+    sigtrace("RESTORE", frame_addr, regs.pc, regs.sp, regs.x[6]);
+    if regs.pc < 0x10000 || regs.sp < 0x10000 {
+        let mut buf = [0u8; 160];
+        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+            "fakelinux: RESTORE-GARBAGE frame={:#x} pc={:#x} sp={:#x}\n",
+            frame_addr, regs.pc, regs.sp));
+        libc::write(2, buf.as_ptr() as *const _, n);
     }
 
     true
@@ -557,6 +680,17 @@ unsafe extern "C" fn signal_forwarder(
 ) {
     // Translate macOS signal to Linux signal
     let linux_sig = mac_to_linux(sig);
+
+    // DIAGNOSTIC (FAKELINUX_TRAP_STATS): dump accumulated trap stats once on
+    // SIGTERM, before the guest's own handler runs — captures the profile of a
+    // VPP process that the test harness terminates instead of letting exit().
+    if linux_sig == 15 {
+        static DUMPED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::Relaxed) {
+            crate::trap::dump_trap_stats();
+        }
+    }
 
     // If this thread is inside the trap handler, the ucontext has the handler's
     // native registers, NOT guest registers. Defer delivery only for the
@@ -1076,6 +1210,27 @@ fn install_forwarder(mac_sig: i32, handler: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigframe_leaves_redzone_below_sp() {
+        // Regression: an async signal interrupting an x18 trampoline in its
+        // sp-raised window must not let the sigframe overwrite the trampoline's
+        // scratch saved at [sp-32]. The frame must start far enough below sp that
+        // [sp-32] stays in the untouched red-zone gap.
+        for &sp in &[0x7ff0_0000_0000u64, 0x7ff0_7ff0_a0, 0x4000_1234_5680] {
+            let base = sigframe_base(sp);
+            // 16-byte aligned
+            assert_eq!(base & 0xF, 0, "frame base must be 16-byte aligned");
+            // top of frame is well below sp, leaving the full red zone
+            let frame_top = base + RT_SIGFRAME_SIZE as u64;
+            assert!(sp - frame_top >= SIGFRAME_REDZONE,
+                "gap {} below red zone {}", sp - frame_top, SIGFRAME_REDZONE);
+            // the trampoline parks scratch at [sp-32]; it must be above the frame
+            assert!(sp - 32 >= frame_top,
+                "trampoline scratch at sp-32 ({:#x}) must be above frame top ({:#x})",
+                sp - 32, frame_top);
+        }
+    }
 
     #[test]
     fn sigframe_passes_siginfo_and_ucontext() {

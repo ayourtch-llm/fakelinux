@@ -327,6 +327,7 @@ impl CodeIsland {
 
         self.meta.push((orig_pc, orig_instr));
         self.used += size;
+        EMIT_GPR_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(tramp_pc)
     }
 
@@ -542,6 +543,14 @@ pub fn init_trampoline_flags() {
 
 static TRAMP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FALLBACK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// DIAGNOSTIC: count of GPR-x18 trampolines built (emit()), which have the
+/// below-sp scratch window — distinct from tpidr/SIMD trampolines.
+pub static EMIT_GPR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (trampolined_ok, fallback_to_udf) counts — for trap-stats diagnostics.
+pub fn tramp_fallback_counts() -> (u64, u64) {
+    (TRAMP_COUNT.load(Ordering::Relaxed), FALLBACK_COUNT.load(Ordering::Relaxed))
+}
 
 /// Flush instruction caches for all islands and log stats.
 pub fn flush_all_islands() {
@@ -573,6 +582,19 @@ pub fn island_fault_recovery_info(pc: u64) -> Option<(u64, u32)> {
             }
             let idx = (delta / TRAMP_SIZE) as usize;
             return island.meta.get(idx).copied();
+        }
+    }
+    None
+}
+
+/// DIAGNOSTIC: if `pc` is inside a trampoline island, return its offset within
+/// the trampoline slot (0,4,8,... = which instruction). None if not in an island.
+pub fn pc_island_slot_offset(pc: u64) -> Option<u64> {
+    const TRAMP_SIZE: u64 = TRAMP_INSTRS as u64 * 4;
+    let islands = ISLANDS.try_lock().ok()?;
+    for island in islands.iter() {
+        if pc >= island.base && pc < island.base + island.used as u64 {
+            return Some((pc - island.base) % TRAMP_SIZE);
         }
     }
     None
