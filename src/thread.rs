@@ -820,6 +820,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // trap handler, unblock signals).
         crate::trap::init_child_after_fork();
         reset_main_thread_after_fork();
+        crate::syscall::reset_socket_waiters_after_fork();
         IS_FORK_CHILD.store(true, Ordering::Relaxed);
         // A fork child is never vpid 1 — clear the COW-inherited init flag so
         // getpid() returns the child's own pid (not 1), keeping job-control

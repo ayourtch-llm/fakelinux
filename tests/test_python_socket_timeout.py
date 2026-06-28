@@ -125,10 +125,38 @@ def check_poll_queue_socket_teardown():
         raise AssertionError("poll/queue/socket teardown exited without a reason")
 
 
+def check_poll_socket_close_wakeup():
+    sock, peer = socket.socketpair()
+    done = []
+
+    def message_thread():
+        poller = select.poll()
+        poller.register(sock.fileno(), select.POLLIN)
+        for _fd, event in poller.poll(2000):
+            done.append(event)
+            return
+        done.append("timeout")
+
+    thread = threading.Thread(target=message_thread)
+    thread.daemon = True
+    thread.start()
+    time.sleep(0.1)
+    sock.close()
+    thread.join(1.5)
+    peer.close()
+    if thread.is_alive():
+        raise AssertionError("closing a socket did not wake blocked poll thread")
+    if done == ["timeout"]:
+        raise AssertionError("poll waiter timed out instead of waking on socket close")
+    if not done:
+        raise AssertionError("poll waiter exited without a reason")
+
+
 def main():
     check_timeout()
     check_close_wakeup()
     check_fork_child_close_wakeup()
+    check_poll_socket_close_wakeup()
     check_poll_queue_socket_teardown()
     print("socket-timeout-ok")
 

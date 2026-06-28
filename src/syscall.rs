@@ -754,6 +754,14 @@ fn socket_has_waiter(fd: i32) -> bool {
     socket_waiters()[fd as usize].load(Ordering::SeqCst) > 0
 }
 
+pub(crate) fn reset_socket_waiters_after_fork() {
+    if let Some(waiters) = SOCKET_WAITERS.get() {
+        for count in waiters.iter() {
+            count.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
 pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
     let _socket_waiter = SocketWaiter::new(fd);
 
@@ -1728,6 +1736,18 @@ fn do_ppoll(fds_ptr: u64, nfds: u32, timeout_ptr: u64, sigmask_ptr: u64, _sigset
             signal::PENDING_SIGNALS.load(std::sync::atomic::Ordering::SeqCst),
             signal::deliverable_pending()));
     }
+
+    let _socket_waiters = if total_ms != 0 && fds_ptr != 0 && nfds > 0 {
+        let fds = unsafe {
+            std::slice::from_raw_parts(fds_ptr as *const libc::pollfd, nfds as usize)
+        };
+        fds.iter()
+            .filter(|pfd| pfd.fd >= 0 && pfd.events != 0)
+            .filter_map(|pfd| SocketWaiter::new(pfd.fd))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     // Poll in chunks: a signal arriving mid-poll is queued as pending by the
     // forwarder (IN_TRAP is set) and the host poll() is auto-restarted
@@ -4163,6 +4183,69 @@ mod tests {
         thread::set_live_guest_threads_for_test(1);
         unsafe {
             libc::close(peer_fd);
+        }
+    }
+
+    #[test]
+    fn close_wakes_fakelinux_poll_socket_waiter_even_if_live_guest_count_is_one() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(1);
+
+        let recv_fd = sv[0];
+        let peer_fd = sv[1];
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut pfd = libc::pollfd {
+                fd: recv_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = [2_i64, 0_i64];
+            let _ = ready_tx.send(());
+            let ret = do_ppoll(
+                &mut pfd as *mut _ as u64,
+                1,
+                timeout.as_ptr() as u64,
+                0,
+                0,
+            );
+            let _ = done_tx.send((ret, pfd.revents));
+        });
+
+        ready_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(do_close(recv_fd), 0);
+        let (ret, revents) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close must wake a fakelinux ppoll socket waiter");
+        assert!(ret > 0, "blocked fakelinux ppoll should report readiness after close, got {ret:#x}");
+        assert_ne!(revents, 0, "blocked fakelinux ppoll returned without revents");
+        handle.join().unwrap();
+        thread::set_live_guest_threads_for_test(1);
+        unsafe {
+            libc::close(peer_fd);
+        }
+    }
+
+    #[test]
+    fn fork_reset_clears_socket_waiter_counts() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+
+        let waiter = SocketWaiter::new(sv[0]).expect("socket waiter should register");
+        assert!(socket_has_waiter(sv[0]));
+        std::mem::forget(waiter);
+
+        reset_socket_waiters_after_fork();
+        assert!(!socket_has_waiter(sv[0]));
+
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
         }
     }
 
