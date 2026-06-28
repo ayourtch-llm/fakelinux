@@ -21,6 +21,7 @@ static SYSROOT: OnceLock<String> = OnceLock::new();
 const SOCKET_WAITER_FD_LIMIT: usize = 65536;
 static SOCKET_WAITERS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
 static INTERRUPTIBLE_SOCKET_FDS: OnceLock<Box<[AtomicBool]>> = OnceLock::new();
+static SOCKET_CLOSE_GENERATIONS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
 
 /// Initialize the sysroot from the environment variable.
 pub fn init_sysroot(sysroot: &str) {
@@ -720,6 +721,30 @@ fn interruptible_socket_fds() -> &'static [AtomicBool] {
     })
 }
 
+fn socket_close_generations() -> &'static [AtomicUsize] {
+    SOCKET_CLOSE_GENERATIONS.get_or_init(|| {
+        (0..SOCKET_WAITER_FD_LIMIT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+fn socket_close_generation(fd: i32) -> usize {
+    if fd < 0 || fd as usize >= SOCKET_WAITER_FD_LIMIT {
+        return 0;
+    }
+    SOCKET_CLOSE_GENERATIONS
+        .get()
+        .map_or(0, |gens| gens[fd as usize].load(Ordering::SeqCst))
+}
+
+fn bump_socket_close_generation(fd: i32) {
+    if fd >= 0 && (fd as usize) < SOCKET_WAITER_FD_LIMIT {
+        socket_close_generations()[fd as usize].fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn fd_is_socket(fd: i32) -> bool {
     if fd < 0 {
         return false;
@@ -853,7 +878,12 @@ pub(crate) fn reset_socket_waiters_after_fork() {
 }
 
 pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
+    if fd < 0 {
+        return WaitReady::Ready;
+    }
+
     let _socket_waiter = SocketWaiter::new(fd);
+    let close_generation = socket_close_generation(fd);
 
     // SO_RCVTIMEO deadline: if the socket has a receive timeout, enforce it
     // here so the wait doesn't block forever. The host recvfrom would respect
@@ -865,14 +895,24 @@ pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
     let deadline = socket_rcvtimeo_deadline(fd);
 
     loop {
+        // poll() ignores negative fds and may not report EBADF consistently
+        // for descriptors closed by another thread. Let the real operation
+        // surface EBADF instead of sleeping forever in this gate.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if fl < 0 {
+            return WaitReady::Ready;
+        }
+
         let mut pfd = libc::pollfd { fd, events, revents: 0 };
         let pr = unsafe { libc::poll(&mut pfd, 1, 0) }; // non-blocking probe
         if pr != 0 {
             return WaitReady::Ready; // ready, or poll error → let the caller do the op
         }
+        if socket_close_generation(fd) != close_generation {
+            return WaitReady::Ready;
+        }
         // Not ready. If the fd is non-blocking, the op must return EAGAIN itself.
-        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-        if fl >= 0 && (fl & libc::O_NONBLOCK) != 0 {
+        if (fl & libc::O_NONBLOCK) != 0 {
             return WaitReady::Ready;
         }
         // Blocking fd, no data: a deliverable signal interrupts the wait.
@@ -895,6 +935,9 @@ pub(crate) fn wait_ready_interruptible(fd: i32, events: i16) -> WaitReady {
         let _unblock = signal::HostSigUnblock::new();
         let mut wpfd = libc::pollfd { fd, events, revents: 0 };
         unsafe { libc::poll(&mut wpfd, 1, 100) };
+        if socket_close_generation(fd) != close_generation {
+            return WaitReady::Ready;
+        }
     }
 }
 
@@ -1078,11 +1121,13 @@ fn wake_socket_before_close(fd: i32) {
     if !fd_is_socket(fd) {
         return;
     }
+    bump_socket_close_generation(fd);
     let has_waiter = socket_has_waiter(fd);
     let guest_threaded = thread::has_multiple_guest_threads();
     let host_threaded = host_has_multiple_threads();
     let has_recv_timeout = socket_has_recv_timeout(fd);
     let used_interruptible_wait = socket_used_interruptible_wait(fd);
+    let has_duplicate = socket_has_duplicate_open_fd(fd);
     let host_threaded_control_socket =
         !has_waiter && host_threaded && (has_recv_timeout || used_interruptible_wait);
     if trace_close {
@@ -1092,10 +1137,14 @@ fn wake_socket_before_close(fd: i32) {
             pid, fd, has_waiter, guest_threaded, host_threaded, has_recv_timeout, used_interruptible_wait,
         ));
     }
-    if !guest_threaded && !has_waiter && !host_threaded_control_socket {
+    if !guest_threaded
+        && !has_waiter
+        && !host_threaded_control_socket
+        && !(used_interruptible_wait && !has_duplicate)
+    {
         return;
     }
-    if !guest_threaded && !has_waiter && socket_has_duplicate_open_fd(fd) {
+    if !guest_threaded && !has_waiter && has_duplicate {
         if trace_close {
             let pid = unsafe { libc::getpid() };
             raw_eprintln_fmt(format_args!(
@@ -4300,6 +4349,86 @@ mod tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+
+    #[test]
+    fn interruptible_waited_dup_close_does_not_shutdown_peer() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(1);
+
+        let dup_fd = unsafe { libc::dup(sv[0]) };
+        assert!(dup_fd >= 0, "dup failed");
+        mark_interruptible_socket_fd(dup_fd);
+        assert_eq!(do_close(dup_fd), 0);
+
+        let byte = 0x6bu8;
+        let sent = unsafe {
+            libc::send(
+                sv[1],
+                &byte as *const _ as *const libc::c_void,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, 1, "send over peer after waited dup close failed");
+
+        let mut got = 0u8;
+        let recvd = unsafe { libc::recv(sv[0], &mut got as *mut _ as *mut libc::c_void, 1, 0) };
+        assert_eq!(recvd, 1, "recv after waited dup close failed");
+        assert_eq!(got, byte);
+
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+    }
+
+    #[test]
+    fn close_generation_wakes_interruptible_socket_wait() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+
+        let wait_fd = sv[0];
+        let peer_fd = sv[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let ret = wait_ready_interruptible(wait_fd, libc::POLLIN);
+            let _ = tx.send(ret);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        bump_socket_close_generation(wait_fd);
+        let ret = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close generation should wake interruptible socket wait");
+        assert!(matches!(ret, WaitReady::Ready));
+
+        handle.join().unwrap();
+        unsafe {
+            libc::close(wait_fd);
+            libc::close(peer_fd);
+        }
+    }
+
+    #[test]
+    fn interruptible_wait_on_invalid_fd_returns_ready() {
+        let ret = wait_ready_interruptible(-1, libc::POLLIN);
+        assert!(matches!(ret, WaitReady::Ready));
+
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let closed_fd = sv[0];
+        unsafe {
+            libc::close(closed_fd);
+            libc::close(sv[1]);
+        }
+
+        let ret = wait_ready_interruptible(closed_fd, libc::POLLIN);
+        assert!(matches!(ret, WaitReady::Ready));
     }
 
     #[test]
