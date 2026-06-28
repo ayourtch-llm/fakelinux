@@ -2692,14 +2692,23 @@ fn do_brk(addr: u64) -> u64 {
 /// first to preserve the already-mapped common case.)
 fn ensure_pages_writable(pg_start: u64, len: u64) -> bool {
     let rw = libc::PROT_READ | libc::PROT_WRITE;
-    if unsafe { libc::mprotect(pg_start as *mut _, len as usize, rw) } == 0 {
-        return true;
+    let page: u64 = 16384;
+    let mut cur = pg_start;
+    let end = pg_start.saturating_add(len);
+
+    while cur < end {
+        if unsafe { libc::mprotect(cur as *mut _, page as usize, rw) } != 0 {
+            let ret = unsafe {
+                libc::mmap(cur as *mut _, page as usize, rw,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
+            };
+            if ret == libc::MAP_FAILED {
+                return false;
+            }
+        }
+        cur += page;
     }
-    let ret = unsafe {
-        libc::mmap(pg_start as *mut _, len as usize, rw,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED, -1, 0)
-    };
-    ret != libc::MAP_FAILED
+    true
 }
 
 fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
@@ -2738,6 +2747,10 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     let page: u64 = 16384;
     let has_exec = prot & 4 != 0; // PROT_EXEC
     let is_fixed = flags & 0x10 != 0; // MAP_FIXED
+    let end = match addr.checked_add(length) {
+        Some(end) => end,
+        None => return (-22_i64) as u64, // -EINVAL
+    };
 
     // DIAGNOSTIC: a MAP_FIXED mapping over a trampoline island silently
     // destroys live trampolines (this zeroed cc1's island when its data
@@ -2756,7 +2769,8 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
     // adjacent data if applied at 16KB granularity. Skip these.
     let addr_misaligned = addr & (page - 1) != 0;
-    if is_fixed && (addr_misaligned || length < page) {
+    let end_misaligned = end & (page - 1) != 0;
+    if is_fixed && (addr_misaligned || end_misaligned) {
         if prot == 0 {
             // PROT_NONE guard page smaller than a macOS page — skip it
             return addr;
@@ -4673,6 +4687,64 @@ mod tests {
         unsafe {
             libc::munmap((addr & !16383) as *mut _, 0x10000);
             libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn ensure_pages_writable_does_not_remap_already_mapped_neighbors() {
+        let page: u64 = 0x4000;
+        let base: u64 = 0x1fff_f900_0000;
+        unsafe {
+            libc::munmap(base as *mut _, (page * 2) as usize);
+            let ret = libc::mmap(
+                base as *mut _,
+                page as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            assert_ne!(ret, libc::MAP_FAILED);
+            std::ptr::write_volatile(base as *mut u64, 0x1122_3344_5566_7788);
+
+            assert!(ensure_pages_writable(base, page * 2));
+            assert_eq!(
+                std::ptr::read_volatile(base as *const u64),
+                0x1122_3344_5566_7788,
+                "fallback must not replace the already-mapped first page"
+            );
+            std::ptr::write_volatile((base + page) as *mut u8, 0x5a);
+            assert_eq!(std::ptr::read_volatile((base + page) as *const u8), 0x5a);
+            libc::munmap(base as *mut _, (page * 2) as usize);
+        }
+    }
+
+    #[test]
+    fn map_fixed_aligned_start_unaligned_end_preserves_tail() {
+        let page: u64 = 0x4000;
+        let base: u64 = 0x1fff_f901_0000;
+        let tail = base + 0x6000;
+        unsafe {
+            libc::munmap(base as *mut _, (page * 2) as usize);
+            let ret = libc::mmap(
+                base as *mut _,
+                (page * 2) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            assert_ne!(ret, libc::MAP_FAILED);
+            std::ptr::write_volatile(tail as *mut u64, 0xaabb_ccdd_eeff_0011);
+
+            let mapped = do_mmap(base, 0x5000, 3, 0x32, -1, 0);
+            assert_eq!(mapped, base);
+            assert_eq!(
+                std::ptr::read_volatile(tail as *const u64),
+                0xaabb_ccdd_eeff_0011,
+                "MAP_FIXED must not let macOS round an unaligned guest end outward"
+            );
+            libc::munmap(base as *mut _, (page * 2) as usize);
         }
     }
 
