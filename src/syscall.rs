@@ -12,7 +12,7 @@ use crate::thread;
 use crate::timers;
 use crate::translate;
 use crate::trap::MContext64;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 static SYSROOT: OnceLock<String> = OnceLock::new();
 const SOCKET_WAITER_FD_LIMIT: usize = 65536;
 static SOCKET_WAITERS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
+static INTERRUPTIBLE_SOCKET_FDS: OnceLock<Box<[AtomicBool]>> = OnceLock::new();
 
 /// Initialize the sysroot from the environment variable.
 pub fn init_sysroot(sysroot: &str) {
@@ -710,6 +711,15 @@ fn socket_waiters() -> &'static [AtomicUsize] {
     })
 }
 
+fn interruptible_socket_fds() -> &'static [AtomicBool] {
+    INTERRUPTIBLE_SOCKET_FDS.get_or_init(|| {
+        (0..SOCKET_WAITER_FD_LIMIT)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
 fn fd_is_socket(fd: i32) -> bool {
     if fd < 0 {
         return false;
@@ -727,6 +737,29 @@ fn fd_is_socket(fd: i32) -> bool {
     }) == 0
 }
 
+fn mark_interruptible_socket_fd(fd: i32) {
+    if fd >= 0 && (fd as usize) < SOCKET_WAITER_FD_LIMIT {
+        interruptible_socket_fds()[fd as usize].store(true, Ordering::SeqCst);
+    }
+}
+
+fn clear_interruptible_socket_fd(fd: i32) {
+    if fd >= 0 && (fd as usize) < SOCKET_WAITER_FD_LIMIT {
+        if let Some(fds) = INTERRUPTIBLE_SOCKET_FDS.get() {
+            fds[fd as usize].store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn socket_used_interruptible_wait(fd: i32) -> bool {
+    if fd < 0 || fd as usize >= SOCKET_WAITER_FD_LIMIT {
+        return false;
+    }
+    INTERRUPTIBLE_SOCKET_FDS
+        .get()
+        .is_some_and(|fds| fds[fd as usize].load(Ordering::SeqCst))
+}
+
 struct SocketWaiter {
     fd: i32,
 }
@@ -736,6 +769,7 @@ impl SocketWaiter {
         if fd < 0 || fd as usize >= SOCKET_WAITER_FD_LIMIT || !fd_is_socket(fd) {
             return None;
         }
+        mark_interruptible_socket_fd(fd);
         socket_waiters()[fd as usize].fetch_add(1, Ordering::SeqCst);
         Some(Self { fd })
     }
@@ -809,6 +843,11 @@ pub(crate) fn reset_socket_waiters_after_fork() {
     if let Some(waiters) = SOCKET_WAITERS.get() {
         for count in waiters.iter() {
             count.store(0, Ordering::SeqCst);
+        }
+    }
+    if let Some(fds) = INTERRUPTIBLE_SOCKET_FDS.get() {
+        for fd in fds.iter() {
+            fd.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -1043,15 +1082,17 @@ fn wake_socket_before_close(fd: i32) {
     let guest_threaded = thread::has_multiple_guest_threads();
     let host_threaded = host_has_multiple_threads();
     let has_recv_timeout = socket_has_recv_timeout(fd);
-    let host_threaded_timeout_socket = !has_waiter && host_threaded && has_recv_timeout;
+    let used_interruptible_wait = socket_used_interruptible_wait(fd);
+    let host_threaded_control_socket =
+        !has_waiter && host_threaded && (has_recv_timeout || used_interruptible_wait);
     if trace_close {
         let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!(
-            "fakelinux: [{}] socket-close fd={} waiter={} guest_threads={} host_threads={} rcvtimeo={}\n",
-            pid, fd, has_waiter, guest_threaded, host_threaded, has_recv_timeout,
+            "fakelinux: [{}] socket-close fd={} waiter={} guest_threads={} host_threads={} rcvtimeo={} waited={}\n",
+            pid, fd, has_waiter, guest_threaded, host_threaded, has_recv_timeout, used_interruptible_wait,
         ));
     }
-    if !guest_threaded && !has_waiter && !host_threaded_timeout_socket {
+    if !guest_threaded && !has_waiter && !host_threaded_control_socket {
         return;
     }
     if !guest_threaded && !has_waiter && socket_has_duplicate_open_fd(fd) {
@@ -1123,6 +1164,7 @@ fn do_close(fd: i32) -> u64 {
     if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
     clear_fd_seals(fd);
     wake_socket_before_close(fd);
+    clear_interruptible_socket_fd(fd);
     let ret = unsafe { libc::close(fd) };
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
@@ -1163,6 +1205,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 epoll::on_close(fd_i);
                 procfs::on_close(fd_i);
                 wake_socket_before_close(fd_i);
+                clear_interruptible_socket_fd(fd_i);
                 unsafe { libc::close(fd_i); }
             } else if thread::FORK_SAVED_CLOEXEC.take(fd as usize) {
                 // Had CLOEXEC before fork — restore the flag so exec closes it.
@@ -1181,6 +1224,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
             procfs::on_close(fd);
             thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);
             wake_socket_before_close(fd);
+            clear_interruptible_socket_fd(fd);
             unsafe { libc::close(fd); }
         }
     }
@@ -4256,6 +4300,26 @@ mod tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+
+    #[test]
+    fn interruptible_socket_fd_marks_clear_on_close_and_fork_reset() {
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+
+        mark_interruptible_socket_fd(sv[0]);
+        assert!(socket_used_interruptible_wait(sv[0]));
+        assert_eq!(do_close(sv[0]), 0);
+        assert!(!socket_used_interruptible_wait(sv[0]));
+        unsafe {
+            libc::close(sv[1]);
+        }
+
+        mark_interruptible_socket_fd(42);
+        assert!(socket_used_interruptible_wait(42));
+        reset_socket_waiters_after_fork();
+        assert!(!socket_used_interruptible_wait(42));
     }
 
     #[test]
