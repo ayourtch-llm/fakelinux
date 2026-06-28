@@ -901,6 +901,12 @@ pub fn dump_trap_stats() {
         crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
         crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
         crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
+    let mut b2 = [0u8; 160];
+    let n2 = raw_fmt(&mut b2, format_args!(
+        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={}\n",
+        pid, crate::signal::FORWARDER_CALLS.load(Ordering::Relaxed),
+        crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed)));
+    unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
     // Also write to a per-pid host file (robust vs. stderr capture). Diagnostic.
     unsafe {
@@ -910,6 +916,7 @@ pub fn dump_trap_stats() {
             libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND, 0o644);
         if fd >= 0 {
             libc::write(fd, buf.as_ptr() as *const _, n);
+            libc::write(fd, b2.as_ptr() as *const _, n2);
             libc::close(fd);
         }
         let _ = pn;

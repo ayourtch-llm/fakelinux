@@ -393,6 +393,10 @@ pub static SIGTRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// in the sp-raised danger window.
 pub static SIG_IN_ISLAND: AtomicU64 = AtomicU64::new(0);
 pub static SIG_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+/// DIAGNOSTIC: total signal_forwarder invocations (async signals reaching the
+/// guest), and how many were deferred because the thread was in trap context.
+pub static FORWARDER_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static FORWARDER_DEFERRED: AtomicU64 = AtomicU64::new(0);
 
 // Lock-free ring buffer of recent signal build/restore events (no I/O so timing
 // is not perturbed); dumped by the crash handler.
@@ -692,10 +696,13 @@ unsafe extern "C" fn signal_forwarder(
         }
     }
 
+    FORWARDER_CALLS.fetch_add(1, Ordering::Relaxed);
+
     // If this thread is inside the trap handler, the ucontext has the handler's
     // native registers, NOT guest registers. Defer delivery only for the
     // interrupted thread; other guest threads can take a sigframe directly.
     if crate::trap::in_trap() {
+        FORWARDER_DEFERRED.fetch_add(1, Ordering::Relaxed);
         if linux_sig > 0 && linux_sig <= 64 {
             PENDING_SIGNALS.fetch_or(1u64 << (linux_sig - 1) as u64, Ordering::SeqCst);
         }
