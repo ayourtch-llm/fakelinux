@@ -1,0 +1,73 @@
+From 17ea0391b1bae076ad91486184e8a1d787f7c54f Mon Sep 17 00:00:00 2001
+From: Andrew Yourtchenko <ayourtch@gmail.com>
+Date: Mon, 29 Jun 2026 19:04:29 +0200
+Subject: [PATCH] ip6-nd: fix DAD process timer-wheel overflow on aarch64
+
+Type: fix
+
+The DAD process used 1e70 as a "sleep forever" timeout passed to
+vlib_process_wait_for_event_or_clock(). That becomes
+resume_clock_interval = dt * VLIB_TW_TICKS_PER_SECOND (1e5) cast to u64.
+On aarch64, fcvtzu saturates the out-of-range result to U64_MAX; the
+timer wheel then computes interval + current_tick, which wraps u64 back
+to a small value and bypasses timer_add()'s "too far in the future ->
+overflow vector" guard, tripping
+ASSERT(glacier_ring_offset < TW_SLOTS_PER_RING) -> os_panic. On x86 the
+same cast yields ~9.2e18, which trips the guard, so the abort only
+happens on arm64 (and was thus missed by x86 CI).
+
+Use a finite far-future sentinel (~3 years): effectively infinite for an
+event-driven process, but well clear of the wheel's u64 range.
+
+Signed-off-by: Andrew Yourtchenko <ayourtch@gmail.com>
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/vnet/ip6-nd/ip6_dad.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/vnet/ip6-nd/ip6_dad.c b/src/vnet/ip6-nd/ip6_dad.c
+index 9ecee5590..ed37978fe 100644
+--- a/src/vnet/ip6-nd/ip6_dad.c
++++ b/src/vnet/ip6-nd/ip6_dad.c
+@@ -273,6 +273,20 @@ ip6_dad_na_received_main (ip6_dad_na_event_t *event)
+   handle_dad_conflict (vm, event->sw_if_index, &event->address);
+ }
+ 
++/*
++ * "Sleep forever" sentinel for the DAD process's clock wait.
++ *
++ * NB: do NOT use a value like 1e70 here. vlib_process_wait_for_event_or_clock()
++ * computes resume_clock_interval = dt * VLIB_TW_TICKS_PER_SECOND (1e5) and casts
++ * it to u64. On aarch64 fcvtzu SATURATES an out-of-range result to U64_MAX;
++ * the timer wheel then adds current_tick, which WRAPS u64 back to a small value,
++ * bypassing timer_add()'s "too far in the future -> overflow vector" guard and
++ * tripping `ASSERT(glacier_ring_offset < TW_SLOTS_PER_RING)` -> os_panic. (On
++ * x86 the same cast yields ~9.2e18, which trips the guard, so it only crashes on
++ * arm64.) ~3 years is effectively infinite for an event-driven process and
++ * stays well clear of the wheel's u64 range. */
++#define IP6_DAD_SLEEP_FOREVER 1e8
++
+ /**
+  * DAD process node - runs on main thread only
+  */
+@@ -288,7 +302,7 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
+   ASSERT (vm->thread_index == 0); /* Main thread only */
+ 
+   /* Initialize */
+-  next_timeout = 1e70; /* Far in the future */
++  next_timeout = IP6_DAD_SLEEP_FOREVER; /* Far in the future (see note above) */
+ 
+   while (1)
+     {
+@@ -300,7 +314,7 @@ ip6_dad_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
+ 
+       /* Current time */
+       now = vlib_time_now (vm);
+-      next_timeout = 1e70;
++      next_timeout = IP6_DAD_SLEEP_FOREVER;
+ 
+       /* Process events */
+       if (event_type == IP6_DAD_EVENT_START)
+-- 
+2.50.1 (Apple Git-155)
+
