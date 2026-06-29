@@ -362,3 +362,159 @@ Had the fix not arrived, these are the experiments I would have proposed, in ord
    repro used system libcrypto (patched, clean-ish); the canonical repro used the
    vendored _rust.abi3.so (unpatched, corrupt). A repro that exercises a different
    binary than the target can produce a different (or no) bug.
+
+---
+
+## 8. Autopsy: the `FAKELINUX_FORCE_PHDR_RANGES` experiment (program-header-only path)
+
+### 8.1 What was tried
+
+After the section-based fix (`f9f2f60`) landed, an experiment (uncommitted, in the
+working tree) tested collapsing to a single codepath: use **only** the `PF_X PT_LOAD`
+program-header strategy for ALL DSOs, gated by `FAKELINUX_FORCE_PHDR_RANGES` (which
+also bypasses the patch cache). The hypothesis: simpler, and it would also cover
+stripped DSOs (no section headers) since program headers survive `strip`.
+
+### 8.2 The failure
+
+```
+fakelinux: runtime patch at 0x102db0000+0x408c8:  0 SVC,    0 TPIDR,  150 x18
+fakelinux: runtime patch at 0x102e00000+0x1bdf90: 517 SVC, 1530 TPIDR, 1660 x18
+roots/ubuntu/usr/bin/bash: error while loading shared libraries:
+    ld-linux-aa: cannot open shared object file: No such file or directory
+```
+
+The guest `bash` fails to start because its `.interp` interpreter path was corrupted
+from `ld-linux-aarch64.so.1` to `ld-linux-aa`.
+
+### 8.3 The PRECISE mechanism (reasoned from the code + ELF layout)
+
+**Step 1 — bash has a MERGED R-X PT_LOAD.** Verified by parsing
+`roots/ubuntu/usr/bin/bash`:
+
+```
+PT_LOAD: file=[0x0..0x163238) flags=R-X     ← contains EVERYTHING read-only
+PT_LOAD: file=[0x16b6a0..0x178390) flags=RW-
+
+  .interp  file=[0x238..0x253)   in R-X seg   ← "/lib/ld-linux-aarch64.so.1\0"
+  .dynstr  file=[0x141c8..0x1e396) in R-X seg
+  .text    file=[0x33a00..0x120620) in R-X seg
+  .rodata  file=[0x120640..0x13a7f4) in R-X seg
+```
+
+Unlike modern `-z separate-code` layouts (which split R-only data into its own
+PT_LOAD), this bash binary was linked with the OLDER merged-segment convention where
+`.interp`, `.dynstr`, `.rodata`, and `.text` all share ONE R-X segment. The section
+strategy handles this correctly because `SHF_EXECINSTR` only marks `.text`/`.plt`.
+The PF_X program-header strategy cannot — it only sees the segment flag.
+
+**Step 2 — the PF_X range includes `.interp`.** Under `FORCE_PHDR`, the projected
+code range is the entire `[0x0..0x163238)` — including `.interp` at `0x238`.
+
+**Step 3 — a word in `.interp` matches `references_x18`.** The 4-byte-aligned word
+at file offset `0x248` (`.interp` byte 16) is `rch6` = ASCII `0x72 0x63 0x68 0x36` =
+little-endian `0x36686372`. Decoding this as an A64 instruction:
+
+```
+bits[30:25] = 011011  → TBZ/TBNZ (test-bit-and-branch)
+bit[24]     = 0        → TBZ
+bits[4:0]   = 10010    → Rt = 18  (x18!)
+```
+
+This is `TBZ x18, #13, <target>` — a valid instruction that references x18 as Rt.
+`references_x18()` returns true.
+
+**Step 4 — the patcher overwrites it with UDF.** `patch_x18_with_trampoline` rejects
+`TestBranch` (can't relocate a PC-relative branch into an island, per
+`x18_trampoline.rs:419–422`). The fallback at `loader.rs:924–925` writes
+`UDF_MARKER = 0x0000_F000`. In little-endian bytes: **`00 F0 00 00`**.
+
+**Step 5 — the null byte truncates the string.** The `.interp` string becomes:
+
+```
+/lib/ld-linux-aa \x00 \xf0 \x00 \x00 4.so.1\0
+                 ↑ null from UDF_MARKER low byte
+```
+
+C-string reads up to the first `\0` → `/lib/ld-linux-aa`. Basename → `ld-linux-aa`.
+
+The kernel/fakelinux loader reads this corrupted `.interp`, tries to open
+`/lib/ld-linux-aa`, fails, and reports the error. The decrypt loop never runs.
+
+### 8.4 Why the section strategy is immune
+
+`SHF_EXECINSTR` is a **per-section semantic flag** the linker sets on `.text`/`.plt`/
+`.init`/`.fini` — and ONLY on those. `.interp` has `SHF_ALLOC` but not
+`SHF_EXECINSTR`. The section strategy's code ranges never include `.interp`, so the
+scanner never visits those bytes. The program-header strategy has no such precision:
+`PF_X` is a per-SEGMENT flag that reflects the MMU protection, not the content type.
+
+### 8.5 Answer to question (1): can the program-header strategy be made safe?
+
+**Yes, but only by re-deriving the precision the section strategy gives for free.**
+The raw PF_X projection must be narrowed to exclude non-code data. The codebase
+already has the machinery: `extract_code_ranges_via_phdrs` (loader.rs:1170, Strategy 3
+of the in-memory path) parses `PT_DYNAMIC` to find `DT_STRTAB`, `DT_SYMTAB`,
+`DT_RELA`, `DT_JMPREL`, etc., and **subtracts** those data regions from the PF_X
+ranges. A safe program-header fallback would replicate this subtraction (translating
+virtual addresses to file offsets via the PT_LOAD `p_vaddr`/`p_offset` mapping).
+
+However, PT_DYNAMIC subtraction is still **incomplete** vs. sections: it excludes
+dynamically-linked data (`.dynstr`, `.dynsym`, `.rela.*`) but NOT statically-referenced
+data like `.interp`, `.note.*`, `.gnu.hash`, or `.rodata` (which has no DT_* tag).
+For bash, `.interp` at `0x238` would STILL be in range even after PT_DYNAMIC
+subtraction, because `.interp` has no dynamic tag. You'd need an explicit `.interp`
+exclusion (read `PT_INTERP` and subtract its file range) plus a blanket exclusion of
+everything before `.text`'s first instruction. This is fragile and binary-specific.
+
+**Verdict: the section strategy (`SHF_EXECINSTR`) is fundamentally required.** It is
+the only mechanism that precisely distinguishes "bytes the CPU will execute" from
+"bytes that merely share the same MMU protection." The program-header strategy can
+approximate this with enough exclusions, but it will always be a heuristic chasing
+what section flags already give you exactly.
+
+### 8.6 Answer to question (2): does the stripped-DSO fallback (PF_X) have the same flaw?
+
+**YES — identically.** The merged-segment problem is a property of the DSO's link
+layout, not of whether section headers are present. A stripped DSO built with
+`-z noseparate-code` (or an older toolchain) has the same merged R-X PT_LOAD
+containing `.dynstr`/`.interp`/`.rodata`. The raw PF_X fallback would scan those data
+bytes and corrupt any word matching the x18 pattern — exactly the `ld-linux-aa` failure.
+
+**Practical risk assessment:** the danger depends on the toolchain:
+- Modern binutils (2.31+, default `-z separate-code`) → R and R-X are **separate**
+  PT_LOADs → the R-X segment is pure `.text`/`.plt` → raw PF_X is safe.
+- Older binutils or explicit `-z noseparate-code` → **merged** R-X → unsafe.
+
+You cannot control or detect the toolchain from the DSO alone. A DSO built either way
+looks identical in its program headers except for the number/layout of PT_LOADs. So
+the raw PF_X fallback is **conditionally safe** (separate-code) with a **silent
+corruption risk** (merged-code) that you can't cheaply distinguish.
+
+**Recommendation for the stripped-DSO fallback:** do NOT use raw PF_X projection.
+Instead, implement the `PT_DYNAMIC` subtraction approach from
+`extract_code_ranges_via_phdrs` for the file-based path (pread `PT_DYNAMIC` from the
+file, translate `DT_STRTAB`/`DT_SYMTAB`/etc. to file offsets, subtract). This covers
+the dynamically-linked data that `references_x18` is most likely to false-positive on
+(`.dynstr` strings, which are dense in byte patterns). Additionally, exclude the
+file range `[0..first_PF_X_text_offset]` (everything before the first executable
+byte — `.interp`, `.note`, ELF header, program headers themselves) to cover the
+exact `.interp` corruption vector. If those refinements are too complex, the safer
+fallback is simply to **scan the whole PF_X segment as code BUT skip the first N KB**
+(where the ELF header + `.interp` + metadata live) — a crude heuristic, but the
+`.interp`/`.dynstr` corruption is the critical failure mode to avoid.
+
+### 8.7 The deeper lesson: PF_X ≠ SHF_EXECINSTR
+
+The experiment elegantly demonstrates the semantic gap:
+- `PF_X` (program header flag) = "the MMU will allow execution of this segment."
+- `SHF_EXECINSTR` (section flag) = "the linker placed instructions here."
+
+On modern separate-code toolchains these coincide (R-X segment = code only). On
+merged-segment toolchains they do not: the R-X segment contains data that the MMU
+*allows* you to jump to but that was never *intended* as code. The x18 patcher's
+`references_x18` is a bitwise pattern matcher — it cannot tell the difference between
+an instruction and a string whose bytes happen to decode as `TBZ x18, #13`. Only the
+section flag can. This is why the section strategy is not just "more precise" but
+**semantically correct**, and the program-header strategy is a structural
+approximation that breaks on the first data-in-code-segment binary it meets.
