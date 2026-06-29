@@ -772,6 +772,47 @@ mod tests {
 
     // ── Dynamic scratch selection (x16/x17 conflicts used to fall back) ──
 
+    /// T1 — end-to-end: the openssl AES_encrypt "smoking gun" candidate
+    /// `LDP W18, W17, [X6, #8]` (instruction word 0x294144d2 — actual byte
+    /// found in libcrypto's AES_encrypt at offset +0xfc). The hypothesis
+    /// under test is: the trampoline epilogue's `ldp s1, s2, [sp], #32`
+    /// unconditionally restores the picked scratch pair regardless of
+    /// whether the wrapped instruction also writes to one of them. For
+    /// this LDP, Rt2=17 is a destination — if pick_scratch_pair picks
+    /// (s1, s2) such that s2==17, the epilogue would clobber the loaded
+    /// w17. pick_scratch_pair is supposed to avoid x17 here (it is in
+    /// referenced_gprs), but this test verifies the END-TO-END behavior
+    /// by actually executing the emitted trampoline and reading back w17.
+    #[test]
+    fn t1_trampoline_ldp_w18_w17_preserves_w17() {
+        crate::trap::init_x18_key();
+        //   [0] LDP W18, W17, [X6, #8]   = 0x294144d2
+        //   [1] MOV W0, W17 (ORR W0,WZR,W17) = 0x2A1103E0
+        //   [2] RET                       = 0xD65F03C0
+        let code = alloc_code_page(&[0x294144d2, 0x2A1103E0, 0xD65F03C0]);
+        assert!(patch_x18_with_trampoline(code, 0x294144d2),
+            "LDP W18, W17 must be trampolinable");
+        make_executable(code);
+        flush_all_islands();
+
+        // src layout: pass X6=src.as_ptr(). LDP W18, W17, [X6, #8]
+        // reads w18 from [X6+8] = src[2], w17 from [X6+12] = src[3].
+        let src: [u32; 8] = [0, 0, 0xAAAA_1111, 0xBBBB_2222, 0, 0, 0, 0];
+        crate::trap::set_thread_x18(0xDEAD_BEEF);
+        let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(code) };
+        let result_w0 = f(0, 0, 0, 0, 0, 0, src.as_ptr() as u64) as u32;
+
+        // w17 should hold the value loaded from [X6+12] = 0xBBBB_2222.
+        // If the trampoline epilogue clobbered w17, this fails.
+        assert_eq!(result_w0, 0xBBBB_2222,
+            "trampoline epilogue clobbered w17 — got {:#x}, expected 0xBBBB_2222 (the value LDP loaded into w17)",
+            result_w0);
+        // TSD x18 should hold the 32-bit zero-extended w18 load.
+        assert_eq!(crate::trap::get_thread_x18(), 0xAAAA_1111u64,
+            "trampoline must write zero-extended w18 to TSD");
+    }
+
     #[test]
     fn scratch_pair_avoids_referenced_regs() {
         // ldr x16, [x18] references {16, 18} → scratch must avoid both
