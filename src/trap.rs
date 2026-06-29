@@ -870,6 +870,21 @@ pub static RESUME_PROBE_PAGE: AtomicU64 = AtomicU64::new(0);
 pub static RESUME_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static RESUME_PROBE_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
 
+/// P4 probe: at the WATCH-caught corrupting STUR, compare the round-key table
+/// at [x21..+240] against a first-hit reference (key is FIXED in the repro,
+/// so the AES-256 round keys MUST be identical across all decryptors). Any
+/// divergence at the store = inputs corrupted during NORMAL guest execution,
+/// outside any signal round-trip — which is why the prior in-tree probes
+/// (RK_PROBE, KS_PROBE, FWD_REG_PROBE, RESUME_PROBE) all came back clean:
+/// they verify state ACROSS signal boundaries, not at the failing store.
+pub static P4_RK_DIFFS: AtomicU64 = AtomicU64::new(0);
+pub static P4_CTR_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+pub static P4_POINTER_LIKE_HITS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    pub static P4_RK_REF: std::cell::Cell<Option<[u64; 30]>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Altstack bounds captured at sigaltstack install. Used by the depth probe
 /// in signal_forwarder to compute how close handler-stack consumption is
 /// getting to the altstack boundary. ss_lo = ss_sp (low addr); ss_hi = lo+size.
@@ -1138,6 +1153,16 @@ pub fn dump_trap_stats() {
             pid, RESUME_PROBE_HITS.load(Ordering::Relaxed),
             RESUME_PROBE_DIVERGENCES.load(Ordering::Relaxed)));
         unsafe { libc::write(2, b4.as_ptr() as *const _, n4); }
+    }
+    let p4_rk = P4_RK_DIFFS.load(Ordering::Relaxed);
+    let p4_ctr = P4_CTR_MISMATCHES.load(Ordering::Relaxed);
+    let p4_ptr = P4_POINTER_LIKE_HITS.load(Ordering::Relaxed);
+    if p4_rk + p4_ctr + p4_ptr > 0 {
+        let mut b5 = [0u8; 192];
+        let n5 = raw_fmt(&mut b5, format_args!(
+            "fakelinux: [{}] P4 rk_diffs={} ctr_mismatches={} ptr_like_hits={}\n",
+            pid, p4_rk, p4_ctr, p4_ptr));
+        unsafe { libc::write(2, b5.as_ptr() as *const _, n5); }
     }
     watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
@@ -1524,6 +1549,81 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
                 r.x[0], r.x[1], r.x[3], r.x[19], r.x[22], x27, r.sp, r.lr,
                 x27_w0, x27_w1, x27_w2, x27_w3, x27_w2));
             libc::write(2, buf.as_ptr() as *const _, n);
+
+            // P4: round-key/counter/pointer-pattern diagnostics at the store.
+            // (a) Compare [x21..+240] to the first-hit reference. Repro key
+            //     is FIXED, so AES-256 round keys are constant across all
+            //     decryptors — any divergence here means round keys were
+            //     corrupted during NORMAL guest execution (between forwarded
+            //     signals, invisible to RK_PROBE which only checks across
+            //     the round-trip).
+            let x21 = r.x[21];
+            if (0x7_0000_0000..0x8_0000_0000).contains(&x21) {
+                let mut rk_cur = [0u64; 30];
+                for i in 0..30 {
+                    rk_cur[i] = ((x21 + (i as u64) * 8) as *const u64).read_volatile();
+                }
+                let ref_opt = P4_RK_REF.with(|c| c.get());
+                if let Some(rk_ref) = ref_opt {
+                    let mut diffs: u32 = 0;
+                    let mut first_diff: i32 = -1;
+                    for i in 0..30 {
+                        if rk_cur[i] != rk_ref[i] {
+                            diffs += 1;
+                            if first_diff < 0 { first_diff = i as i32; }
+                        }
+                    }
+                    if diffs > 0 {
+                        P4_RK_DIFFS.fetch_add(1, Ordering::Relaxed);
+                        let fi = first_diff as usize;
+                        let mut pbuf = [0u8; 320];
+                        let pn = raw_fmt(&mut pbuf, format_args!(
+                            "fakelinux: P4_RK_DIFF_AT_STORE x21={:#x} diff_words={}/30 first_word={} ref={:#x} cur={:#x}\n",
+                            x21, diffs, fi, rk_ref[fi], rk_cur[fi]));
+                        libc::write(2, pbuf.as_ptr() as *const _, pn);
+                    }
+                } else {
+                    P4_RK_REF.with(|c| c.set(Some(rk_cur)));
+                    let mut pbuf = [0u8; 192];
+                    let pn = raw_fmt(&mut pbuf, format_args!(
+                        "fakelinux: P4_RK_REF_CAPTURED x21={:#x} w0={:#x} w1={:#x} w29={:#x}\n",
+                        x21, rk_cur[0], rk_cur[1], rk_cur[29]));
+                    libc::write(2, pbuf.as_ptr() as *const _, pn);
+                }
+            }
+            // (b) Counter check. [x27..+16] = nonce(0..11) || ctr_be. At this
+            //     hit (out_buf[0..8]), block 0 was just produced, so counter
+            //     in memory = post-increment = 3 (big-endian). Expected u64
+            //     little-endian halves match what the prior verbose dumps
+            //     consistently showed: w0=0x0706050403020100, w1=0x030000000b0a0908.
+            const CTR_EXP_LO: u64 = 0x0706050403020100;
+            const CTR_EXP_HI: u64 = 0x030000000b0a0908;
+            if x27_w0 != CTR_EXP_LO || x27_w1 != CTR_EXP_HI {
+                P4_CTR_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                let mut pbuf = [0u8; 256];
+                let pn = raw_fmt(&mut pbuf, format_args!(
+                    "fakelinux: P4_CTR_MISMATCH x27={:#x} got=({:#x},{:#x}) exp=({:#x},{:#x})\n",
+                    x27, x27_w0, x27_w1, CTR_EXP_LO, CTR_EXP_HI));
+                libc::write(2, pbuf.as_ptr() as *const _, pn);
+            }
+            // (c) Pointer-likeness check on the foreign value `cur`. Guest
+            //     heap pointers in fakelinux live at 0x7_0000_0000+, so the
+            //     high u32 is in 0x7_xxxx_xxxx range — top nibble = 0x7 and
+            //     the next nibble is small (0..F). If `cur` looks like
+            //     two stacked pointers OR one pointer + scratch, that's a
+            //     strong hint at an allocation/object-overlap stomp.
+            let hi32 = (cur >> 32) as u32;
+            let lo32 = cur as u32;
+            let hi_ptrlike = (hi32 & 0xF000_0000) == 0x7000_0000;
+            let lo_ptrlike = (lo32 & 0xF000_0000) == 0x7000_0000;
+            if hi_ptrlike || lo_ptrlike {
+                P4_POINTER_LIKE_HITS.fetch_add(1, Ordering::Relaxed);
+                let mut pbuf = [0u8; 192];
+                let pn = raw_fmt(&mut pbuf, format_args!(
+                    "fakelinux: P4_PTR_LIKE val={:#x} (hi32={:#x} lo32={:#x}) hi_ptrlike={} lo_ptrlike={}\n",
+                    cur, hi32, lo32, hi_ptrlike, lo_ptrlike));
+                libc::write(2, pbuf.as_ptr() as *const _, pn);
+            }
         }
     }
     // Do not advance pc — re-execute the restored instruction.
