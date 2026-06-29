@@ -1,10 +1,9 @@
 # Expected response — apt-get SHA-256 regression
 
-> **STATUS: OPEN / UNSOLVED as of 2026-06-29.** The ground-truth root cause is
-> not yet known. This file currently records the **acceptance criteria** (which
-> are gradeable even without the root cause), the **facts any correct solution
-> must be consistent with**, and the **leading hypotheses**. Fill in the
-> "Root cause" and "Fix" sections once solved.
+> **STATUS: SOLVED 2026-06-29.** Root cause and fix below. Hypothesis #2 (a
+> patched site landing on a SHA-256 constant table) was correct — with one
+> twist the original isolation got wrong: the table is in **libgcrypt**, not
+> libapt-pkg. apt computes its hashes via `gcry_md_*`, not its own code.
 
 ## Acceptance criteria (gradeable)
 
@@ -55,11 +54,50 @@ direct mis-emulation of the SHA-256 instructions.
 
 ## Root cause
 
-_TODO — fill in when solved._
+The patcher **overwrote SHA-256 round constants, mistaking the K-table for code.**
+
+- apt computes SHA-256 via **libgcrypt** (`gcry_md_write`/`gcry_md_read`,
+  imported `GCRYPT_1.6`) — *not* libapt-pkg's own code. (Standalone
+  `sha256sum` is coreutils → **libcrypto/OpenSSL**, a different implementation,
+  hence correct. That's why the two disagree.)
+- libgcrypt's ARMv8-CE SHA-256 transform is hand-written asm. Its 64-word
+  `K[]` round-constant table is emitted **inline in the executable `.text`
+  section** (file offset/vaddr `0xa1450` in `libgcrypt.so.20.4.3`), in an
+  **inter-function gap with no `.eh_frame` FDE**.
+- On Linux, x18 is an unreserved GPR, so `references_x18` legitimately flags
+  ~1494 real instructions in libgcrypt — but it *also* flags **9 of the 64 K
+  constants** that happen to have a GPR field == 18 (e.g. `K[4]=0x3956c25b`
+  decodes as `ldrb w27,[x18,#0x5b0]`; `K[63]=0xc67178f2` as `… x18`).
+- `f9f2f60` made the patcher reach DSOs mapped past their ELF header via
+  `extract_code_ranges_from_file_mapping`, which uses **only section headers
+  (`SHF_EXECINSTR`)** — the *entire* `.text` is treated as code. The precise
+  `.eh_frame` FDE strategy (used by the in-memory extractor) would have
+  excluded the no-FDE K-table; the section strategy does not. So those 9 K
+  constants got rewritten to UDF/trampoline branches → **corrupt K-table →
+  wrong SHA-256**, deterministically and identically under both x18 paths.
+- SHA-1/MD5 share the hash plumbing but have different constants that don't
+  collide with x18 encodings → unaffected. The real transform code uses
+  `x0/x1/x3` + NEON (`sha256h`), **no x18** — so excluding the table loses no
+  real patch.
+
+The removed "SHA-256 K-table fingerprint" guard (loader.rs `find_literal_pools`
+comment) had been deleted on the assumption that the FDE strategy always
+excludes such tables. That holds for the in-memory path but **not** for the
+section-mode file path `f9f2f60` introduced.
 
 ## Fix
 
-_TODO — fill in when solved (commit hash, the change, and which hypothesis held)._
+`src/loader.rs`: added `find_crypto_const_tables(start, len)` — detects SHA-256
+(64×u32) and SHA-512 (80×u64) K-tables by their leading-constant signature and
+returns their byte ranges; `patch_new_code_with_ranges` now adds those ranges
+to the `literal_pools` exclusion so the x18 patcher skips them. Surgical,
+matches only exact crypto-constant signatures, never excludes real code.
+
+Verification: `apt-get update` → 0 `Hash Sum mismatch` (19/19 indexes fetched
+& verified); `gcm_evp_fixed 8000 1970 200` → `bad=0`; standalone
+sha256/sha1/md5 correct; `tests/smoke/apt-get-update.sh` PASS.
+
+**Hypothesis #2 held** (modulo the libapt-pkg→libgcrypt correction).
 
 ## Grading rubric (preliminary)
 

@@ -27,7 +27,7 @@ that re-verify load-bearing assumptions rather than trusting prior analysis.
 | Directory | Bug | Trap |
 |-----------|-----|------|
 | [`ipsec-gcm-corruption/`](ipsec-gcm-corruption/) | AES-GCM decrypt corruption under fakelinux (the `test_ipsec_*` cluster) | The trail's exhaustive investigation **retracts the correct root cause** (x18) on the strength of a probe that checked the *wrong DSO* / a stale cache. The agent must distrust the "ruled out" list. |
-| [`apt-sha256-hash-regression/`](apt-sha256-hash-regression/) **(OPEN)** | `apt-get update` SHA-256 verification fails — a regression introduced by the GCM fix (`f9f2f60`) expanding x18 patching coverage | Every obvious probe says "fine" (standalone hashes correct, binary loads, SHA-256 code isn't even patched), yet apt's scalar SHA-256 is deterministically wrong. The cause is a *side effect* of patching, not a direct mis-emulation. **Authored before the answer was known** — `response.md` records acceptance criteria + leading hypotheses, ground truth TBD. |
+| [`apt-sha256-hash-regression/`](apt-sha256-hash-regression/) | `apt-get update` SHA-256 verification fails — a regression introduced by the GCM fix (`f9f2f60`) expanding x18 patching coverage | Every obvious probe says "fine" (standalone hashes correct, binary loads), yet apt's SHA-256 is deterministically wrong. **Two traps:** the bug is *not* in libapt-pkg (the request's "isolated" attribution is wrong — apt hashes via libgcrypt), and the cause is a patcher *side effect*, not a mis-emulation: the section-mode code-range strategy patches libgcrypt's inline SHA-256 **K-table**, whose constants decode as x18 instructions. **SOLVED 2026-06-29.** |
 
 ## Adding a benchmark
 

@@ -549,6 +549,55 @@ fn find_literal_pools(start: u64, len: u64) -> Vec<(u64, u64)> {
     pools
 }
 
+/// Detect well-known crypto round-constant tables embedded in an executable
+/// range, returning their byte ranges so the x18 patcher skips them.
+///
+/// WHY: SHA-256/SHA-512 K-tables are emitted inline in `.text` by hand-written
+/// aarch64 crypto assembly (libgcrypt, OpenSSL, …). They carry no `.eh_frame`
+/// FDE, and several of their 32-bit constants happen to decode as
+/// x18-referencing instructions (e.g. SHA-256 `K[4]=0x3956c25b` looks like
+/// `ldrb w27,[x18,#0x5b0]`). The FDE-based code-range strategy excludes these
+/// data words automatically, but the section-header / file-mapping strategy
+/// (the only one available for DSOs mapped past their ELF header) treats the
+/// whole `.text` as code — so without this guard the patcher overwrites K
+/// constants with UDF/trampoline branches and the hash comes out wrong.
+fn find_crypto_const_tables(start: u64, len: u64) -> Vec<(u64, u64)> {
+    let count = (len / 4) as usize;
+    let base = start as *const u32;
+    let read = |i: usize| unsafe { base.add(i).read() };
+    let mut tables = Vec::new();
+
+    // SHA-256 K[0..8] as stored in memory (little-endian u32 words).
+    const SHA256_K0: [u32; 8] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    ];
+    // SHA-512 K[0..4] (each 64-bit constant stored low-word then high-word):
+    // K[0]=0x428a2f98d728ae22, K[1]=0x7137449123ef65cd, …
+    const SHA512_K0: [u32; 8] = [
+        0xd728ae22, 0x428a2f98, 0x23ef65cd, 0x71374491,
+        0xec4d3b2f, 0xb5c0fbcf, 0x8189dbbc, 0xe9b5dba5,
+    ];
+
+    let mut i = 0usize;
+    while i + 8 <= count {
+        if (0..8).all(|k| read(i + k) == SHA256_K0[k]) {
+            let s = start + (i as u64) * 4;
+            tables.push((s, s + 64 * 4)); // 64 u32 words
+            i += 64;
+            continue;
+        }
+        if (0..8).all(|k| read(i + k) == SHA512_K0[k]) {
+            let s = start + (i as u64) * 4;
+            tables.push((s, s + 80 * 8)); // 80 u64 words
+            i += 160;
+            continue;
+        }
+        i += 1;
+    }
+    tables
+}
+
 /// Check if an address falls within a literal pool range.
 fn addr_in_pools(addr: u64, pools: &[(u64, u64)]) -> bool {
     // Pools are sorted; binary search would be faster for large lists.
@@ -896,7 +945,15 @@ fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>
     // self-deadlocks in signal context (see init_trace_flags note in trap.rs).
     let skip_x18 = NO_X18_RUNTIME.load(std::sync::atomic::Ordering::Relaxed);
     // Find embedded literal pools to exclude from x18 patching.
-    let literal_pools = find_literal_pools(start, len);
+    let mut literal_pools = find_literal_pools(start, len);
+    // Also exclude well-known crypto round-constant tables (SHA-256/SHA-512).
+    // These live in .text in hand-written aarch64 crypto asm (e.g. libgcrypt's
+    // ARMv8-CE SHA transform), are NOT covered by any .eh_frame FDE, and several
+    // of their constants decode as x18-referencing instructions. The eh_frame
+    // code-range strategy excludes them, but the section-header/file-mapping
+    // strategy (used for DSOs mapped past their ELF header) does not — so we must
+    // detect them explicitly or the patcher corrupts the table (wrong hashes).
+    literal_pools.extend(find_crypto_const_tables(start, len));
     for i in 0..count as usize {
         unsafe {
             let instr = base.add(i).read();
