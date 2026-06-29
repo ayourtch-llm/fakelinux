@@ -405,7 +405,18 @@ pub static FORWARDER_NESTED: AtomicU64 = AtomicU64::new(0);
 pub static FORWARDER_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FWD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-thread snapshot of [x27+16..+32] at signal ENTRY, used by
+    /// do_rt_sigreturn to detect if the openssl keystream buffer was stomped
+    /// across the signal round-trip. Gated by FAKELINUX_SIGTRACE.
+    /// Tuple: (x27_address, mem_lo_at_entry, mem_hi_at_entry, frame_addr).
+    /// Zero x27 = no snapshot armed.
+    static KS_PROBE: std::cell::Cell<(u64, u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
 }
+/// DIAGNOSTIC: stomps observed in [x27+16..+32] across a single signal
+/// round-trip (signal ENTRY value vs do_rt_sigreturn EXIT value, same address).
+pub static KS_PROBE_STOMPS: AtomicU64 = AtomicU64::new(0);
+pub static KS_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
 
 // Lock-free ring buffer of recent signal build/restore events (no I/O so timing
 // is not perturbed); dumped by the crash handler.
@@ -550,6 +561,23 @@ pub unsafe fn build_sigframe_and_redirect(
 
     sigtrace("BUILD", linux_sig as u64, guest_sp, frame_addr, regs.pc);
 
+    // DIAGNOSTIC (gated by FAKELINUX_SIGTRACE): snapshot the openssl AES-GCM
+    // keystream buffer at [x27+16..+32] iff x27 looks like an openssl-decryptor
+    // heap pointer (0x700000000+ range = Python ET_EXEC brk). do_rt_sigreturn
+    // re-reads the same 16 bytes from the same address and flags if they
+    // changed across the signal round-trip — proving (or ruling out) that
+    // fakelinux's own signal code is the stomper.
+    if SIGTRACE.load(Ordering::Relaxed) {
+        let x27 = regs.x[27];
+        if (0x7_0000_0000..0x8_0000_0000).contains(&x27) {
+            let ks_lo = ((x27 + 16) as *const u64).read_volatile();
+            let ks_hi = ((x27 + 24) as *const u64).read_volatile();
+            KS_PROBE.with(|c| c.set((x27, ks_lo, ks_hi, frame_addr)));
+        } else {
+            KS_PROBE.with(|c| c.set((0, 0, 0, 0)));
+        }
+    }
+
     // DIAGNOSTIC (gated): count signals that interrupt the guest INSIDE a
     // trampoline island (sp-raised danger window = slot offsets 12-20).
     if SIGTRACE.load(Ordering::Relaxed) {
@@ -641,6 +669,30 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     }
 
     sigtrace("RESTORE", frame_addr, regs.pc, regs.sp, regs.x[6]);
+
+    // DIAGNOSTIC: check if the openssl keystream buffer was stomped across
+    // the signal round-trip. Compare entry snapshot (saved in TLS during
+    // build_sigframe) against current memory at the same address. Pair by
+    // frame_addr to be safe under nesting (only the matching frame's exit
+    // is compared). Gated by SIGTRACE.
+    if SIGTRACE.load(Ordering::Relaxed) {
+        let (x27, ks_lo_entry, ks_hi_entry, snap_frame) =
+            KS_PROBE.with(|c| c.get());
+        if x27 != 0 && snap_frame == frame_addr {
+            KS_PROBE_CHECKED.fetch_add(1, Ordering::Relaxed);
+            let ks_lo_exit = ((x27 + 16) as *const u64).read_volatile();
+            let ks_hi_exit = ((x27 + 24) as *const u64).read_volatile();
+            if ks_lo_entry != ks_lo_exit || ks_hi_entry != ks_hi_exit {
+                KS_PROBE_STOMPS.fetch_add(1, Ordering::Relaxed);
+                let mut buf = [0u8; 320];
+                let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                    "fakelinux: KS_STOMP frame={:#x} x27={:#x}\n  entry: lo={:#x} hi={:#x}\n  exit:  lo={:#x} hi={:#x}\n",
+                    frame_addr, x27, ks_lo_entry, ks_hi_entry, ks_lo_exit, ks_hi_exit));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+            KS_PROBE.with(|c| c.set((0, 0, 0, 0)));
+        }
+    }
     if regs.pc < 0x10000 || regs.sp < 0x10000 {
         let mut buf = [0u8; 160];
         let n = crate::trap::raw_fmt(&mut buf, format_args!(

@@ -901,13 +901,15 @@ pub fn dump_trap_stats() {
         crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
         crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
         crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
-    let mut b2 = [0u8; 224];
+    let mut b2 = [0u8; 320];
     let n2 = raw_fmt(&mut b2, format_args!(
-        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={}\n",
+        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={}\n",
         pid, crate::signal::FORWARDER_CALLS.load(Ordering::Relaxed),
         crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed),
         crate::signal::FORWARDER_NESTED.load(Ordering::Relaxed),
-        crate::signal::FORWARDER_MAX_DEPTH.load(Ordering::Relaxed)));
+        crate::signal::FORWARDER_MAX_DEPTH.load(Ordering::Relaxed),
+        crate::signal::KS_PROBE_CHECKED.load(Ordering::Relaxed),
+        crate::signal::KS_PROBE_STOMPS.load(Ordering::Relaxed)));
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
     // Also write to a per-pid host file (robust vs. stderr capture). Diagnostic.
