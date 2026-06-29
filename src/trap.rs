@@ -1669,6 +1669,41 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
                 P4_CODE_REF.with(|c| c.set(Some(code_cur)));
             }
 
+            // (f) AES_encrypt stack-frame spill dump (P5). At the watched
+            //     STUR, AES_encrypt has returned but its 80-byte frame
+            //     at [sp-80..sp) is "freed but not yet reused" — between
+            //     the BLR return (back[9]) and the watched STUR (back[18]),
+            //     the caller pushes nothing, so the stack bytes still hold
+            //     AES_encrypt's prologue spills:
+            //       [sp-80..-72): saved fp (caller's x29 at BLR)
+            //       [sp-72..-64): saved lr (caller's PC at BLR)
+            //       [sp-64..-48): saved x19, x20
+            //       [sp-48..-32): saved x21, x22  (x21 = caller's AES_KEY ptr)
+            //       [sp-32..-16): saved x23, x24
+            //       [sp-16..-8 ): saved x25
+            //       [sp-8 ..  0): alignment pad
+            //     For each WATCH event, dump these 10 words + sp + cur flag
+            //     so legit/corrupting hits can be diff'd post-hoc. If a
+            //     spill word differs only on corrupting hits, the sigframe
+            //     or some other write reached into AES_encrypt's stack
+            //     frame — directly answering the user's "is our sp/redzone
+            //     model wrong" question.
+            let sp = r.sp;
+            let is_corrupt = cur != 0x5858585858585858 && prev == 0x5858585858585858;
+            let is_restore = cur == 0x5858585858585858 && prev != 0x5858585858585858;
+            let tag = if is_corrupt { 'C' } else if is_restore { 'R' } else { '?' };
+            let mut spill = [0u64; 10];
+            for i in 0..10 {
+                spill[i] = ((sp.wrapping_sub(80) + (i as u64) * 8) as *const u64).read_volatile();
+            }
+            let mut pbuf = [0u8; 512];
+            let pn = raw_fmt(&mut pbuf, format_args!(
+                "fakelinux: P5_AES_SPILL {} sp={:#x} x27={:#x} cur={:#x}\n  [sp-80..sp) = {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x}\n",
+                tag, sp, x27, cur,
+                spill[0], spill[1], spill[2], spill[3], spill[4],
+                spill[5], spill[6], spill[7], spill[8], spill[9]));
+            libc::write(2, pbuf.as_ptr() as *const _, pn);
+
             // (e) AES_encrypt routine integrity: x20 is the callee-saved
             //     function pointer the CTR loop BLRs into. Snapshot 64
             //     instructions there and compare. On the first hit, also
