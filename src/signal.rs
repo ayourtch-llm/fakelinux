@@ -412,11 +412,32 @@ thread_local! {
     /// Zero x27 = no snapshot armed.
     static KS_PROBE: std::cell::Cell<(u64, u64, u64, u64)> =
         const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// Forwarded-round-trip register fidelity probe. Snapshot ALL of the
+    /// guest's x[0..28] + fp + lr + sp + pc at build_sigframe_and_redirect
+    /// entry (the values being written into the sigframe for later
+    /// restoration), keyed by frame_addr. do_rt_sigreturn compares the
+    /// RESTORED mctx against this snapshot for the matching frame. Any
+    /// divergence means the round-trip lost or corrupted a guest register
+    /// — and since the bug we are chasing has been localized to a wrong
+    /// caller-saved x1 (keystream) at the moment openssl resumes EOR, the
+    /// probe must cover x0..x18 too, not just callee-saved. Gated by
+    /// FAKELINUX_SIGTRACE so it shares the same enable knob as KS_PROBE.
+    /// Layout: ([x0..x28; 29], fp, lr, sp, pc, frame_addr).
+    static FWD_REG_PROBE: std::cell::Cell<Option<FwdRegSnap>> =
+        const { std::cell::Cell::new(None) };
 }
 /// DIAGNOSTIC: stomps observed in [x27+16..+32] across a single signal
 /// round-trip (signal ENTRY value vs do_rt_sigreturn EXIT value, same address).
 pub static KS_PROBE_STOMPS: AtomicU64 = AtomicU64::new(0);
 pub static KS_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
+/// DIAGNOSTIC: callee-saved guest register divergence across forwarded
+/// signal round-trip (build_sigframe ENTRY save vs do_rt_sigreturn EXIT
+/// restore for the same frame_addr). Any non-zero count = root cause.
+pub static FWD_REG_CHECKED: AtomicU64 = AtomicU64::new(0);
+pub static FWD_REG_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Copy, Clone)]
+struct FwdRegSnap { x: [u64; 29], fp: u64, lr: u64, sp: u64, pc: u64, frame: u64 }
 
 // Lock-free ring buffer of recent signal build/restore events (no I/O so timing
 // is not perturbed); dumped by the crash handler.
@@ -587,6 +608,28 @@ pub unsafe fn build_sigframe_and_redirect(
         }
     }
 
+    // DIAGNOSTIC (gated by FAKELINUX_SIGTRACE): snapshot interrupted guest's
+    // callee-saved registers (x19..x28, fp) keyed by frame_addr. do_rt_sigreturn
+    // compares restored regs against this snapshot for the same frame and flags
+    // any divergence — that would be the forwarded round-trip silently
+    // mutating a callee-saved guest register (e.g. AES state register held
+    // by openssl across the SIGALRM interrupt). The snapshot is taken AFTER
+    // the GPR-save loops but BEFORE the redirect rewrites of x0/x1/x2/sp/pc/lr,
+    // so we capture exactly the values that ought to come back on sigreturn.
+    if SIGTRACE.load(Ordering::Relaxed) {
+        let mut snap = FwdRegSnap {
+            x: [0; 29], fp: regs.fp, lr: regs.lr, sp: regs.sp, pc: regs.pc,
+            frame: frame_addr,
+        };
+        // Snapshot exactly what build_sigframe just wrote into the frame's
+        // GPR save slots — for slot 18 that's the TSD guest x18, not mctx.x[18]
+        // (mctx.x[18] is the macOS-zeroed hw x18 and is irrelevant for restore).
+        for i in 0..29usize {
+            snap.x[i] = if i == 18 { crate::trap::get_thread_x18() } else { regs.x[i] };
+        }
+        FWD_REG_PROBE.with(|c| c.set(Some(snap)));
+    }
+
     // Redirect guest execution to the handler
     regs.sp = frame_addr;
     regs.pc = handler;
@@ -693,6 +736,51 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
             KS_PROBE.with(|c| c.set((0, 0, 0, 0)));
         }
     }
+
+    // DIAGNOSTIC: compare the RESTORED guest callee-saved registers (x19..x28,
+    // fp) against the snapshot taken at build_sigframe entry for the matching
+    // frame. Any divergence here means the forwarded signal round-trip lost or
+    // corrupted a guest callee-saved register, which would make openssl resume
+    // AES with wrong state (the leading hypothesis after KS_PROBE proved the
+    // keystream memory is untouched and REG_PROBE proved sync traps preserve
+    // callee-saved). Gated by FAKELINUX_SIGTRACE.
+    if SIGTRACE.load(Ordering::Relaxed) {
+        if let Some(snap) = FWD_REG_PROBE.with(|c| c.get()) {
+            if snap.frame == frame_addr {
+                FWD_REG_CHECKED.fetch_add(1, Ordering::Relaxed);
+                let mut any = false;
+                for i in 0..29usize {
+                    let cur = if i == 18 { crate::trap::get_thread_x18() } else { regs.x[i] };
+                    if cur != snap.x[i] {
+                        any = true;
+                        let mut buf = [0u8; 256];
+                        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                            "fakelinux: FWD_REG_DIVERGE frame={:#x} x{}: entry={:#x} exit={:#x} (delta={:#x})\n",
+                            frame_addr, i, snap.x[i], cur, cur ^ snap.x[i]));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
+                }
+                for (name, entry, exit) in [
+                    ("fp(x29)", snap.fp, regs.fp),
+                    ("lr(x30)", snap.lr, regs.lr),
+                    ("sp", snap.sp, regs.sp),
+                    ("pc", snap.pc, regs.pc),
+                ] {
+                    if exit != entry {
+                        any = true;
+                        let mut buf = [0u8; 256];
+                        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                            "fakelinux: FWD_REG_DIVERGE frame={:#x} {}: entry={:#x} exit={:#x} (delta={:#x})\n",
+                            frame_addr, name, entry, exit, exit ^ entry));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
+                }
+                if any { FWD_REG_MISMATCHES.fetch_add(1, Ordering::Relaxed); }
+                FWD_REG_PROBE.with(|c| c.set(None));
+            }
+        }
+    }
+
     if regs.pc < 0x10000 || regs.sp < 0x10000 {
         let mut buf = [0u8; 160];
         let n = crate::trap::raw_fmt(&mut buf, format_args!(
