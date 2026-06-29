@@ -32,6 +32,22 @@ pub fn set_trace_socket_close(on: bool) {
     TRACE_SOCKET_CLOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// High-water mark of the highest fd number that has ever been a socket (from
+/// socket/socketpair/accept) or a duplicate of any fd (dup/dup2/dup3/F_DUPFD).
+/// A live socket fd can never exceed this, so the duplicate scan in
+/// socket_has_duplicate_open_fd only needs to look at 0..=SOCKET_FD_MAX instead
+/// of the whole RLIMIT_NOFILE table (65536 here). Monotonic (fetch_max); fd
+/// reuse keeps it a safe upper bound. dup() is included unconditionally because
+/// a non-socket dup is harmless over-approximation, never a missed duplicate.
+pub static SOCKET_FD_MAX: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+pub fn note_socket_fd(fd: i32) {
+    if fd >= 0 && (fd as usize) < SOCKET_WAITER_FD_LIMIT {
+        SOCKET_FD_MAX.fetch_max(fd as usize, Ordering::Relaxed);
+    }
+}
+
 /// Diagnostic counters (FAKELINUX_TRAP_STATS): close() volume and the cost of
 /// the per-socket-close duplicate scan.
 pub static CLOSE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -774,6 +790,11 @@ fn bump_socket_close_generation(fd: i32) {
     }
 }
 
+/// Public wrapper for fd_is_socket (used by net.rs for SCM_RIGHTS fds).
+pub fn fd_is_socket_pub(fd: i32) -> bool {
+    fd_is_socket(fd)
+}
+
 fn fd_is_socket(fd: i32) -> bool {
     if fd < 0 {
         return false;
@@ -861,7 +882,10 @@ fn socket_has_duplicate_open_fd(fd: i32) -> bool {
     } else {
         1024
     };
-    for other in 0..open_max {
+    // A live socket fd can never exceed the highest fd we've ever handed out as
+    // a socket/dup, so cap the scan there instead of walking all 65536 fds.
+    let scan_hi = ((SOCKET_FD_MAX.load(Ordering::Relaxed) as i32).saturating_add(1)).min(open_max);
+    for other in 0..scan_hi {
         if other == fd {
             continue;
         }
@@ -1832,7 +1856,9 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
         // F_DUPFD_CLOEXEC is 1030 on Linux
         if linux_cmd == translate::LINUX_F_DUPFD_CLOEXEC {
             let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32) };
-            return if ret < 0 { translate::linux_errno() } else { ret as u64 };
+            if ret < 0 { return translate::linux_errno(); }
+            if fd_is_socket(fd) { note_socket_fd(ret); }
+            return ret as u64;
         }
         // memfd seals (F_ADD_SEALS=1033 / F_GET_SEALS=1034): our memfds are
         // unlinked temp files, so seals can't be enforced — track them per
@@ -1918,6 +1944,9 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
             thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);
         }
         let ret = unsafe { libc::fcntl(fd, mac_cmd, effective_arg) };
+        if ret >= 0 && mac_cmd == libc::F_DUPFD && fd_is_socket(fd) {
+            note_socket_fd(ret);
+        }
         if ret < 0 {
             translate::linux_errno()
         } else if linux_cmd == translate::LINUX_F_GETFL {
@@ -2210,6 +2239,8 @@ fn do_dup(fd: i32) -> u64 {
     if ret < 0 { return translate::linux_errno(); }
     // Fresh fd object — forget any stale pre-fork CLOEXEC bit for this slot.
     thread::FORK_SAVED_CLOEXEC.clear_fd(ret as usize);
+    // A dup of a socket is a socket: keep SOCKET_FD_MAX a correct upper bound.
+    if fd_is_socket(fd) { note_socket_fd(ret); }
     ret as u64
 }
 
@@ -2229,6 +2260,7 @@ fn do_dup3(oldfd: i32, newfd: i32, flags: i32) -> u64 {
     // newfd is a fresh fd object now — any pre-fork CLOEXEC bit saved for the
     // old fd at this slot must not be re-applied at exec time.
     if newfd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(newfd as usize); }
+    if fd_is_socket(oldfd) { note_socket_fd(newfd); }
     if flags & 0o2000000 != 0 {
         // O_CLOEXEC
         unsafe { libc::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC); }

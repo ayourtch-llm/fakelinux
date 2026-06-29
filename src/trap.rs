@@ -1191,12 +1191,13 @@ pub fn dump_trap_stats() {
     {
         let mut b6 = [0u8; 200];
         let n6 = raw_fmt(&mut b6, format_args!(
-            "fakelinux: [{}] CLOSE close_total={} socket_closes={} dup_scans={} dup_scan_fstats={}\n",
+            "fakelinux: [{}] CLOSE close_total={} socket_closes={} dup_scans={} dup_scan_fstats={} sock_fd_max={}\n",
             pid,
             crate::syscall::CLOSE_TOTAL.load(Ordering::Relaxed),
             crate::syscall::CLOSE_SOCKET.load(Ordering::Relaxed),
             crate::syscall::DUP_SCANS.load(Ordering::Relaxed),
-            crate::syscall::DUP_SCAN_FSTATS.load(Ordering::Relaxed)));
+            crate::syscall::DUP_SCAN_FSTATS.load(Ordering::Relaxed),
+            crate::syscall::SOCKET_FD_MAX.load(Ordering::Relaxed)));
         unsafe { libc::write(2, b6.as_ptr() as *const _, n6); }
     }
     watch_dump_pc_histogram();

@@ -344,6 +344,7 @@ pub fn do_socket(domain: i32, type_: i32, protocol: i32) -> u64 {
     if mac_domain == libc::AF_UNIX {
         bump_unix_sockbuf(fd);
     }
+    crate::syscall::note_socket_fd(fd);
     fd as u64
 }
 
@@ -438,6 +439,7 @@ pub fn do_accept4(fd: i32, addr_ptr: u64, addrlen_ptr: u64, flags: i32) -> u64 {
     // Accepted AF_UNIX connections (e.g. VPP's socket-API clients) need Linux-sized
     // buffers so large replies aren't throttled by macOS's 8 KiB default.
     bump_unix_sockbuf(ret);
+    crate::syscall::note_socket_fd(ret);
     ret as u64
 }
 
@@ -662,6 +664,8 @@ pub fn do_socketpair(domain: i32, type_: i32, protocol: i32, sv_ptr: u64) -> u64
         bump_unix_sockbuf(sv[0]);
         bump_unix_sockbuf(sv[1]);
     }
+    crate::syscall::note_socket_fd(sv[0]);
+    crate::syscall::note_socket_fd(sv[1]);
     0
 }
 
@@ -862,10 +866,17 @@ pub fn do_recvmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
                 std::ptr::copy_nonoverlapping(linux_ctl.as_ptr(), guest_ctl as *mut u8, n);
             }
             linux_ctl_len = n as u64;
-            // Linux MSG_CMSG_CLOEXEC applies O_CLOEXEC to received fds.
-            if flags & LINUX_MSG_CMSG_CLOEXEC != 0 {
-                for fd in fds {
+            let cmsg_cloexec = flags & LINUX_MSG_CMSG_CLOEXEC != 0;
+            for fd in fds {
+                // Linux MSG_CMSG_CLOEXEC applies O_CLOEXEC to received fds.
+                if cmsg_cloexec {
                     unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                }
+                // A socket can be passed in via SCM_RIGHTS, landing at an fd we
+                // never saw created — keep the socket-fd high-water correct so
+                // the duplicate scan in close() still covers it.
+                if crate::syscall::fd_is_socket_pub(fd) {
+                    crate::syscall::note_socket_fd(fd);
                 }
             }
         }
