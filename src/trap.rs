@@ -877,6 +877,12 @@ pub static RESUME_PROBE_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
 /// outside any signal round-trip — which is why the prior in-tree probes
 /// (RK_PROBE, KS_PROBE, FWD_REG_PROBE, RESUME_PROBE) all came back clean:
 /// they verify state ACROSS signal boundaries, not at the failing store.
+/// One-shot AES_encrypt x18-signature scan flag (FAKELINUX_AES_X18_SCAN=1)
+/// — when set, the scan runs once at the first WATCH WRITE event (by which
+/// time libcrypto.so is definitely loaded by python's cryptography import).
+pub static AES_X18_SCAN_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static AES_X18_SCAN_DONE: AtomicBool = AtomicBool::new(false);
+
 pub static P4_RK_DIFFS: AtomicU64 = AtomicU64::new(0);
 pub static P4_CTR_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 pub static P4_POINTER_LIKE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -1245,6 +1251,9 @@ pub fn init_trace_flags() {
     if resume_on { init_resume_probe_page(); }
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
     init_fl_text_bounds();
+
+    AES_X18_SCAN_ENABLED.store(
+        std::env::var_os("FAKELINUX_AES_X18_SCAN").is_some(), Ordering::Relaxed);
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
         let parts: Vec<&str> = spec.split(':').collect();
         if parts.len() == 3 {
@@ -1372,6 +1381,57 @@ fn init_resume_probe_page() {
             "fakelinux: RESUME_PROBE page={:#x}\n", ptr as u64));
         libc::write(2, buf.as_ptr() as *const _, n);
     }
+}
+
+/// Scan all loaded executable guest mappings for openssl AES_encrypt's
+/// signature x18 instructions and log every site we find. If the patcher
+/// caught them, they should now be UDF_MARKER (0x0000_xxxx pattern) at
+/// those offsets; if they are present as their original bytes, they will
+/// execute natively on macOS and be subject to x18 clobbering.
+pub unsafe fn aes_x18_signature_scan() {
+    // AES_encrypt at +0xfc: LDP W18, W17, [X6, #8]
+    const SIG_LDP_W18_W17: u32 = 0x294144d2;
+    // AES_encrypt at +0xec: EOR W5, W5, W18 (distinctive 32-bit EOR pattern)
+    const SIG_EOR_W5_W18: u32  = 0x4a1200a5;
+    // AES_encrypt at +0xfc: paired check for UBFM X18, X5, #8, #15
+    const SIG_UBFM_X18_X5: u32 = 0xd3483cb2;
+
+    let maps = crate::procfs::snapshot_maps();
+    let s = std::str::from_utf8(&maps).unwrap_or("");
+    let mut findings_ldp = 0u32;
+    let mut findings_eor = 0u32;
+    let mut findings_ubfm = 0u32;
+    let mut udf_count = 0u32;
+    let hdr = b"fakelinux: AES_X18_SCAN -- checking all r-x guest mappings for AES_encrypt's x18 instructions\n";
+    libc::write(2, hdr.as_ptr() as *const _, hdr.len());
+    for line in s.lines() {
+        // /proc/self/maps format: "start-end r-xp offset 00:00 0   name"
+        if !line.contains("r-xp") { continue; }
+        let Some(dash) = line.find('-') else { continue };
+        let Some(space) = line[dash..].find(' ') else { continue };
+        let Ok(start) = u64::from_str_radix(&line[..dash], 16) else { continue };
+        let Ok(end) = u64::from_str_radix(&line[dash+1..dash+space], 16) else { continue };
+        if start < 0x1_0000 || end < start { continue; }
+        let len = end - start;
+        if len == 0 || len > 0x4000_0000 { continue; }
+        // Scan as little-endian u32 instruction words.
+        let words = (len / 4) as usize;
+        let p = start as *const u32;
+        for i in 0..words {
+            let w = p.add(i).read_volatile();
+            if w == SIG_LDP_W18_W17 { findings_ldp += 1; }
+            if w == SIG_EOR_W5_W18  { findings_eor += 1; }
+            if w == SIG_UBFM_X18_X5 { findings_ubfm += 1; }
+            // UDF_MARKER has the top 16 bits zero and a non-zero low 16 (0xF000 etc.)
+            // Detect generic UDF (#imm) markers used by the x18 patcher.
+            if (w & 0xFFFF_0000) == 0 && (w & 0xFFFF) >= 0xF000 { udf_count += 1; }
+        }
+    }
+    let mut buf = [0u8; 256];
+    let n = raw_fmt(&mut buf, format_args!(
+        "fakelinux: AES_X18_SCAN findings: LDP_W18_W17={} EOR_W5_W18={} UBFM_X18_X5={} udf_markers_total={}\n",
+        findings_ldp, findings_eor, findings_ubfm, udf_count));
+    libc::write(2, buf.as_ptr() as *const _, n);
 }
 
 /// Capture the runtime address range of fakelinux's own __TEXT segment by
@@ -1567,6 +1627,11 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
                 r.x[0], r.x[1], r.x[3], r.x[19], r.x[22], x27, r.sp, r.lr,
                 x27_w0, x27_w1, x27_w2, x27_w3, x27_w2));
             libc::write(2, buf.as_ptr() as *const _, n);
+            // One-shot AES_encrypt x18-signature scan (FAKELINUX_AES_X18_SCAN=1)
+            if AES_X18_SCAN_ENABLED.load(Ordering::Relaxed)
+                && !AES_X18_SCAN_DONE.swap(true, Ordering::Relaxed) {
+                aes_x18_signature_scan();
+            }
 
             // P4: round-key/counter/pointer-pattern diagnostics at the store.
             // (a) Compare [x21..+240] to the first-hit reference. Repro key
