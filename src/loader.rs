@@ -856,17 +856,14 @@ fn try_patch_from_cache(start: u64, len: u64, fd: i32, offset: u64) -> bool {
 /// patch_new_code for file-backed mappings: consult the persistent patch-site
 /// cache first; on miss run the full scan and record the sites it patched.
 pub fn patch_new_code_file(start: u64, len: u64, fd: i32, offset: u64) {
-    let force_phdr = std::env::var_os("FAKELINUX_FORCE_PHDR_RANGES").is_some();
-    if !force_phdr && try_patch_from_cache(start, len, fd, offset) {
+    if try_patch_from_cache(start, len, fd, offset) {
         return;
     }
     let code_ranges = extract_code_ranges_from_file_mapping(fd, start, len, offset)
         .unwrap_or_else(|| extract_code_ranges_from_memory(start, len));
     let sites = patch_new_code_with_ranges(start, len, code_ranges);
-    if !force_phdr {
-        if let Some(path) = patch_cache_path(fd, offset, len) {
-            write_file_raw_atomic(&path, &encode_patch_cache(&sites));
-        }
+    if let Some(path) = patch_cache_path(fd, offset, len) {
+        write_file_raw_atomic(&path, &encode_patch_cache(&sites));
     }
 }
 
@@ -955,17 +952,13 @@ fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>
     sites
 }
 
-/// Extract executable code ranges for a runtime file-backed mapping.
+/// Extract executable section ranges for a runtime file-backed mapping.
 ///
 /// Dynamic-linker mappings often start at an executable PT_LOAD offset, not at
 /// the ELF header. The in-memory extractor therefore sees non-ELF bytes and
 /// returns no ranges, which caused x18 patching to be skipped for DSOs such as
-/// cryptography's bundled `_rust.abi3.so`. Read the backing ELF file directly:
-///  1. .eh_frame FDE ranges (function precise, survives strip).
-///  2. SHF_EXECINSTR + SHT_PROGBITS section ranges.
-///  3. Fallback for stripped DSOs: PF_X PT_LOAD minus known data ranges.
-/// FAKELINUX_FORCE_PHDR_RANGES skips strategy 2 so the stripped-DSO path can be
-/// exercised against normal DSOs without using the patch cache.
+/// cryptography's bundled `_rust.abi3.so`. Use section file offsets from the
+/// backing ELF to project SHF_EXECINSTR ranges into this mapping.
 fn extract_code_ranges_from_file_mapping(
     fd: i32,
     map_start: u64,
@@ -977,21 +970,6 @@ fn extract_code_ranges_from_file_mapping(
     const ELFCLASS64: u8 = 2;
     const ELFDATA2LSB: u8 = 1;
     const SHF_EXECINSTR: u64 = 4;
-    const SHT_PROGBITS: u32 = 1;
-    const PT_LOAD: u32 = 1;
-    const PT_DYNAMIC: u32 = 2;
-    const PT_INTERP: u32 = 3;
-    const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-    const PF_X: u32 = 1;
-
-    #[derive(Clone, Copy)]
-    struct Phdr {
-        p_type: u32,
-        p_flags: u32,
-        p_offset: u64,
-        p_vaddr: u64,
-        p_filesz: u64,
-    }
 
     fn pread_exact(fd: i32, off: u64, buf: &mut [u8]) -> bool {
         let mut done = 0usize;
@@ -1012,139 +990,6 @@ fn extract_code_ranges_from_file_mapping(
         true
     }
 
-    fn read_file_prefix(fd: i32, max_len: usize) -> Option<Vec<u8>> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_size <= 0 {
-            return None;
-        }
-        let len = (st.st_size as usize).min(max_len);
-        let mut data = vec![0u8; len];
-        if !pread_exact(fd, 0, &mut data) {
-            return None;
-        }
-        Some(data)
-    }
-
-    fn read_phdrs(fd: i32, eh: &[u8]) -> Option<Vec<Phdr>> {
-        let e_phoff = elf::read_u64_pub(eh, 32);
-        let e_phentsize = elf::read_u16_pub(eh, 54) as usize;
-        let e_phnum = elf::read_u16_pub(eh, 56) as usize;
-        if e_phoff == 0 || e_phentsize < 56 || e_phnum == 0 {
-            return None;
-        }
-        let ptab_len = e_phentsize.checked_mul(e_phnum)?;
-        if ptab_len > 1024 * 1024 {
-            return None;
-        }
-        let mut phdrs_raw = vec![0u8; ptab_len];
-        if !pread_exact(fd, e_phoff, &mut phdrs_raw) {
-            return None;
-        }
-        let mut phdrs = Vec::with_capacity(e_phnum);
-        for i in 0..e_phnum {
-            let off = i * e_phentsize;
-            if off + 56 > phdrs_raw.len() {
-                break;
-            }
-            phdrs.push(Phdr {
-                p_type: elf::read_u32_pub(&phdrs_raw, off),
-                p_flags: elf::read_u32_pub(&phdrs_raw, off + 4),
-                p_offset: elf::read_u64_pub(&phdrs_raw, off + 8),
-                p_vaddr: elf::read_u64_pub(&phdrs_raw, off + 16),
-                p_filesz: elf::read_u64_pub(&phdrs_raw, off + 32),
-            });
-        }
-        Some(phdrs)
-    }
-
-    fn project_file_range(
-        ranges: &mut Vec<(u64, u64)>,
-        map_start: u64,
-        map_file_off: u64,
-        map_file_end: u64,
-        f_off: u64,
-        f_size: u64,
-    ) {
-        if f_size == 0 {
-            return;
-        }
-        let Some(f_end) = f_off.checked_add(f_size) else {
-            return;
-        };
-        let lo = f_off.max(map_file_off);
-        let hi = f_end.min(map_file_end);
-        if lo < hi {
-            ranges.push((map_start + (lo - map_file_off), hi - lo));
-        }
-    }
-
-    fn project_vaddr_range(
-        ranges: &mut Vec<(u64, u64)>,
-        phdrs: &[Phdr],
-        map_start: u64,
-        map_file_off: u64,
-        map_file_end: u64,
-        vaddr: u64,
-        size: u64,
-    ) {
-        if size == 0 {
-            return;
-        }
-        let Some(end_vaddr) = vaddr.checked_add(size) else {
-            return;
-        };
-        let mut cur_vaddr = vaddr;
-        while cur_vaddr < end_vaddr {
-            let Some(ph) = phdrs.iter().find(|ph| {
-                ph.p_type == PT_LOAD
-                    && cur_vaddr >= ph.p_vaddr
-                    && cur_vaddr < ph.p_vaddr.saturating_add(ph.p_filesz)
-            }) else {
-                break;
-            };
-            let pos = ph.p_offset + (cur_vaddr - ph.p_vaddr);
-            let ph_file_end = ph.p_offset + ph.p_filesz;
-            let chunk = (end_vaddr - cur_vaddr).min(ph_file_end.saturating_sub(pos));
-            project_file_range(ranges, map_start, map_file_off, map_file_end, pos, chunk);
-            if chunk == 0 {
-                break;
-            }
-            cur_vaddr += chunk;
-        }
-    }
-
-    fn subtract_ranges(mut base: Vec<(u64, u64)>, mut holes: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-        holes.sort_by_key(|&(s, _)| s);
-        let mut out = Vec::new();
-        for (start, len) in base.drain(..) {
-            let Some(end) = start.checked_add(len) else {
-                continue;
-            };
-            let mut pos = start;
-            for &(h_start, h_len) in &holes {
-                let Some(h_end) = h_start.checked_add(h_len) else {
-                    continue;
-                };
-                if h_end <= pos || h_start >= end {
-                    continue;
-                }
-                let cut_start = h_start.max(pos);
-                let cut_end = h_end.min(end);
-                if cut_start > pos {
-                    out.push((pos, cut_start - pos));
-                }
-                pos = cut_end.max(pos);
-                if pos >= end {
-                    break;
-                }
-            }
-            if pos < end {
-                out.push((pos, end - pos));
-            }
-        }
-        out
-    }
-
     let mut eh = [0u8; 64];
     if !pread_exact(fd, 0, &mut eh) {
         return None;
@@ -1153,166 +998,55 @@ fn extract_code_ranges_from_file_mapping(
         return None;
     }
 
-    let map_file_end = map_file_off.checked_add(map_len)?;
-    let phdrs = read_phdrs(fd, &eh)?;
-    let force_phdr = std::env::var_os("FAKELINUX_FORCE_PHDR_RANGES").is_some();
-
-    // Strategy 1: .eh_frame FDE ranges from the backing file. FDE PCs are
-    // vaddrs in the ELF, so project vaddr -> file offset -> mapped address.
-    if let Some(data) = read_file_prefix(fd, 256 * 1024 * 1024) {
-        let fde_vaddr_ranges = elf::find_code_ranges_from_eh_frame(&data, 0);
-        if !fde_vaddr_ranges.is_empty() {
-            let mut ranges = Vec::new();
-            for (vaddr, len) in fde_vaddr_ranges {
-                project_vaddr_range(&mut ranges, &phdrs, map_start, map_file_off, map_file_end, vaddr, len);
-            }
-            if !ranges.is_empty() {
-                return Some(ranges);
-            }
-        }
-    }
-
-    // Strategy 2: executable SHT_PROGBITS section ranges.
     let e_shoff = elf::read_u64_pub(&eh, 40);
     let e_shentsize = elf::read_u16_pub(&eh, 58) as usize;
     let e_shnum = elf::read_u16_pub(&eh, 60) as usize;
-    if !force_phdr && e_shoff != 0 && e_shentsize >= 64 && e_shnum != 0 {
-        let table_len = e_shentsize.checked_mul(e_shnum)?;
-        if table_len <= 16 * 1024 * 1024 {
-            let mut shdrs = vec![0u8; table_len];
-            if pread_exact(fd, e_shoff, &mut shdrs) {
-                let mut ranges = Vec::new();
-                for i in 0..e_shnum {
-                    let off = i * e_shentsize;
-                    if off + 64 > shdrs.len() {
-                        break;
-                    }
-                    let sh_type = elf::read_u32_pub(&shdrs, off + 4);
-                    let sh_flags = elf::read_u64_pub(&shdrs, off + 8);
-                    if sh_type != SHT_PROGBITS || sh_flags & SHF_EXECINSTR == 0 {
-                        continue;
-                    }
-                    let sh_offset = elf::read_u64_pub(&shdrs, off + 24);
-                    let sh_size = elf::read_u64_pub(&shdrs, off + 32);
-                    project_file_range(&mut ranges, map_start, map_file_off, map_file_end, sh_offset, sh_size);
-                }
-                if !ranges.is_empty() {
-                    return Some(ranges);
-                }
-            }
-        }
+    if e_shoff == 0 || e_shentsize < 64 || e_shnum == 0 {
+        return None;
     }
-
-    // Strategy 3: PF_X PT_LOAD minus identifiable non-code regions.
-    let mut exec_ranges = Vec::new();
-    for ph in &phdrs {
-        if ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0 {
-            project_file_range(&mut exec_ranges, map_start, map_file_off, map_file_end, ph.p_offset, ph.p_filesz);
-        }
-    }
-    if exec_ranges.is_empty() {
+    let table_len = e_shentsize.checked_mul(e_shnum)?;
+    if table_len > 16 * 1024 * 1024 {
         return None;
     }
 
-    let mut holes = Vec::new();
-    for ph in &phdrs {
-        if ph.p_type == PT_INTERP || ph.p_type == PT_GNU_EH_FRAME {
-            project_file_range(&mut holes, map_start, map_file_off, map_file_end, ph.p_offset, ph.p_filesz);
-        }
-    }
-
-    let dyn_ph = phdrs.iter().find(|ph| ph.p_type == PT_DYNAMIC && ph.p_filesz > 0)?;
-    let dyn_len = dyn_ph.p_filesz as usize;
-    if dyn_len > 1024 * 1024 {
-        return None;
-    }
-    let mut dyn_raw = vec![0u8; dyn_len];
-    if !pread_exact(fd, dyn_ph.p_offset, &mut dyn_raw) {
+    let mut shdrs = vec![0u8; table_len];
+    if !pread_exact(fd, e_shoff, &mut shdrs) {
         return None;
     }
 
-    let mut strtab = 0u64;
-    let mut strsz = 0u64;
-    let mut symtab = 0u64;
-    let mut hash = 0u64;
-    let mut gnu_hash = 0u64;
-    let mut rela = 0u64;
-    let mut relasz = 0u64;
-    let mut rel = 0u64;
-    let mut relsz = 0u64;
-    let mut jmprel = 0u64;
-    let mut pltrelsz = 0u64;
-    let mut pltgot = 0u64;
-    let mut versym = 0u64;
-    let mut verneed = 0u64;
-    let mut verneednum = 0u64;
-    let mut verdef = 0u64;
-    let mut verdefnum = 0u64;
-
-    for ent in dyn_raw.chunks_exact(16) {
-        let tag = elf::read_u64_pub(ent, 0);
-        let val = elf::read_u64_pub(ent, 8);
-        match tag {
-            0 => break,                 // DT_NULL
-            2 => pltrelsz = val,        // DT_PLTRELSZ
-            3 => pltgot = val,          // DT_PLTGOT
-            4 => hash = val,            // DT_HASH
-            5 => strtab = val,          // DT_STRTAB
-            6 => symtab = val,          // DT_SYMTAB
-            7 => rela = val,            // DT_RELA
-            8 => relasz = val,          // DT_RELASZ
-            10 => strsz = val,          // DT_STRSZ
-            17 => rel = val,            // DT_REL
-            18 => relsz = val,          // DT_RELSZ
-            23 => jmprel = val,         // DT_JMPREL
-            0x6fff_fef5 => gnu_hash = val, // DT_GNU_HASH
-            0x6fff_fff0 => versym = val,   // DT_VERSYM
-            0x6fff_fffc => verdef = val,   // DT_VERDEF
-            0x6fff_fffd => verdefnum = val, // DT_VERDEFNUM
-            0x6fff_fffe => verneed = val,  // DT_VERNEED
-            0x6fff_ffff => verneednum = val, // DT_VERNEEDNUM
-            _ => {}
+    let map_file_end = map_file_off.checked_add(map_len)?;
+    let mut ranges = Vec::new();
+    for i in 0..e_shnum {
+        let off = i * e_shentsize;
+        if off + 64 > shdrs.len() {
+            break;
         }
+        let sh_flags = elf::read_u64_pub(&shdrs, off + 8);
+        if sh_flags & SHF_EXECINSTR == 0 {
+            continue;
+        }
+        let sh_offset = elf::read_u64_pub(&shdrs, off + 24);
+        let sh_size = elf::read_u64_pub(&shdrs, off + 32);
+        if sh_size == 0 {
+            continue;
+        }
+        let sh_end = sh_offset.checked_add(sh_size)?;
+        let overlap_start = sh_offset.max(map_file_off);
+        let overlap_end = sh_end.min(map_file_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        ranges.push((
+            map_start + (overlap_start - map_file_off),
+            overlap_end - overlap_start,
+        ));
     }
 
-    let add_vaddr_hole = |holes: &mut Vec<(u64, u64)>, vaddr: u64, size: u64| {
-        project_vaddr_range(holes, &phdrs, map_start, map_file_off, map_file_end, vaddr, size);
-    };
-    let next_known_vaddr = |vaddr: u64| -> Option<u64> {
-        [
-            hash, gnu_hash, symtab, strtab, rela, rel, jmprel, pltgot, versym, verneed, verdef,
-        ]
-        .into_iter()
-        .filter(|&x| x > vaddr)
-        .min()
-    };
-    let add_unknown_sized_table = |holes: &mut Vec<(u64, u64)>, vaddr: u64| {
-        if vaddr == 0 {
-            return;
-        }
-        if let Some(next) = next_known_vaddr(vaddr) {
-            add_vaddr_hole(holes, vaddr, next - vaddr);
-        } else if let Some(ph) = phdrs.iter().find(|ph| {
-            ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr.saturating_add(ph.p_filesz)
-        }) {
-            add_vaddr_hole(holes, vaddr, ph.p_vaddr + ph.p_filesz - vaddr);
-        }
-    };
-
-    if strtab != 0 && strsz != 0 { add_vaddr_hole(&mut holes, strtab, strsz); }
-    if symtab != 0 && strtab > symtab { add_vaddr_hole(&mut holes, symtab, strtab - symtab); }
-    if hash != 0 { add_unknown_sized_table(&mut holes, hash); }
-    if gnu_hash != 0 { add_unknown_sized_table(&mut holes, gnu_hash); }
-    if rela != 0 && relasz != 0 { add_vaddr_hole(&mut holes, rela, relasz); }
-    if rel != 0 && relsz != 0 { add_vaddr_hole(&mut holes, rel, relsz); }
-    if jmprel != 0 && pltrelsz != 0 { add_vaddr_hole(&mut holes, jmprel, pltrelsz); }
-    if pltgot != 0 { add_vaddr_hole(&mut holes, pltgot, 8); }
-    if versym != 0 { add_unknown_sized_table(&mut holes, versym); }
-    if verneed != 0 && verneednum != 0 { add_vaddr_hole(&mut holes, verneed, verneednum * 16); }
-    if verdef != 0 && verdefnum != 0 { add_vaddr_hole(&mut holes, verdef, verdefnum * 20); }
-
-    let ranges = subtract_ranges(exec_ranges, holes);
-    if ranges.is_empty() { None } else { Some(ranges) }
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
 }
 
 /// Try to extract code ranges from ELF headers in mapped memory.
@@ -2742,42 +2476,6 @@ mod tests {
         let text = words(&[adrp(1, text_vaddr, page), add(1, 1, 0x100), ldrh, add_disp, br_x9]);
         let r = scan_rodata_table_exclusions(&text, text_vaddr, page, page + 0x4000);
         assert!(r.is_empty(), "no guard cmp → not a dispatch → no exclusion, got {:?}", r);
-    }
-
-    #[test]
-    fn file_mapping_ranges_do_not_cover_interp_string_bytes() {
-        let candidates = [
-            "roots/ubuntu/usr/bin/bash",
-            "roots/ubuntu/bin/bash",
-            "/bin/bash",
-        ];
-        let Some(path) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
-            return;
-        };
-        let data = std::fs::read(path).unwrap();
-        let Some(interp_off) = data.windows(b"ld-linux-aarch64.so.1".len())
-            .position(|w| w == b"ld-linux-aarch64.so.1") else {
-            return;
-        };
-        let rch6_off = interp_off + b"ld-linux-aa".len();
-        let word = u32::from_le_bytes(data[rch6_off..rch6_off + 4].try_into().unwrap());
-        assert!(crate::decoder::references_x18(word),
-            "test must cover the exact false-positive x18 word");
-
-        let file = std::fs::File::open(path).unwrap();
-        use std::os::fd::AsRawFd;
-        let ranges = extract_code_ranges_from_file_mapping(
-            file.as_raw_fd(),
-            0x1000_0000,
-            data.len() as u64,
-            0,
-        ).expect("bash should produce file-backed code ranges");
-
-        let interp_addr = 0x1000_0000 + rch6_off as u64;
-        assert!(
-            !ranges.iter().any(|&(start, len)| interp_addr >= start && interp_addr < start + len),
-            "code ranges must not include the rch6 bytes in the interpreter string"
-        );
     }
 
     #[test]
