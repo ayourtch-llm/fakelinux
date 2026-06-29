@@ -623,8 +623,9 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     let saved_mask = (p.add(288) as *const u64).read_unaligned();
     sigmask_set(saved_mask);
 
-    // Restore NEON/FP registers q0-q31 into the mcontext.
-    // When the signal handler returns, macOS restores these from the mcontext.
+    // Keep the mcontext copy coherent for diagnostics, but the real restore
+    // happens in the sigreturn trampoline below: macOS does not reliably honor
+    // modified NEON/FP mcontext state on signal return.
     let neon_src = p.add(NEON_SAVE_OFFSET) as *const u128;
     for i in 0..32 {
         mctx.ns.v[i] = neon_src.add(i).read_unaligned();
@@ -642,8 +643,10 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
     true
 }
 
-/// Create the sigreturn trampoline: an executable page containing
-/// `mov x8, #139; brk #0xf000`. Called once during init.
+/// Create the sigreturn trampoline. macOS reliably honors GPR/PC changes made
+/// to the signal mcontext, but does not reliably restore modified NEON state
+/// from that mcontext. Reload q0-q31 in executable guest context immediately
+/// before trapping into fakelinux's rt_sigreturn emulation.
 pub fn create_sigreturn_trampoline() {
     let page_size: usize = 16384;
     let ptr = unsafe {
@@ -661,8 +664,46 @@ pub fn create_sigreturn_trampoline() {
     }
     unsafe {
         let p = ptr as *mut u32;
-        p.add(0).write(0xD280_1168); // mov x8, #139
-        p.add(1).write(0x0000_F000); // udf #0xf000 (triggers SIGILL → trap_handler)
+        const CODE: &[u32] = &[
+            0x9104_A3F0, // add x16, sp, #296
+            0x3DC0_0200, // ldr q0, [x16]
+            0x3DC0_0601, // ldr q1, [x16, #16]
+            0x3DC0_0A02, // ldr q2, [x16, #32]
+            0x3DC0_0E03, // ldr q3, [x16, #48]
+            0x3DC0_1204, // ldr q4, [x16, #64]
+            0x3DC0_1605, // ldr q5, [x16, #80]
+            0x3DC0_1A06, // ldr q6, [x16, #96]
+            0x3DC0_1E07, // ldr q7, [x16, #112]
+            0x3DC0_2208, // ldr q8, [x16, #128]
+            0x3DC0_2609, // ldr q9, [x16, #144]
+            0x3DC0_2A0A, // ldr q10, [x16, #160]
+            0x3DC0_2E0B, // ldr q11, [x16, #176]
+            0x3DC0_320C, // ldr q12, [x16, #192]
+            0x3DC0_360D, // ldr q13, [x16, #208]
+            0x3DC0_3A0E, // ldr q14, [x16, #224]
+            0x3DC0_3E0F, // ldr q15, [x16, #240]
+            0x3DC0_4210, // ldr q16, [x16, #256]
+            0x3DC0_4611, // ldr q17, [x16, #272]
+            0x3DC0_4A12, // ldr q18, [x16, #288]
+            0x3DC0_4E13, // ldr q19, [x16, #304]
+            0x3DC0_5214, // ldr q20, [x16, #320]
+            0x3DC0_5615, // ldr q21, [x16, #336]
+            0x3DC0_5A16, // ldr q22, [x16, #352]
+            0x3DC0_5E17, // ldr q23, [x16, #368]
+            0x3DC0_6218, // ldr q24, [x16, #384]
+            0x3DC0_6619, // ldr q25, [x16, #400]
+            0x3DC0_6A1A, // ldr q26, [x16, #416]
+            0x3DC0_6E1B, // ldr q27, [x16, #432]
+            0x3DC0_721C, // ldr q28, [x16, #448]
+            0x3DC0_761D, // ldr q29, [x16, #464]
+            0x3DC0_7A1E, // ldr q30, [x16, #480]
+            0x3DC0_7E1F, // ldr q31, [x16, #496]
+            0xD280_1168, // mov x8, #139
+            0x0000_F000, // udf #0xf000 (triggers SIGILL -> trap_handler)
+        ];
+        for (i, instr) in CODE.iter().enumerate() {
+            p.add(i).write(*instr);
+        }
         libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
         extern "C" {
             fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
