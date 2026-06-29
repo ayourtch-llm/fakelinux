@@ -1,0 +1,40 @@
+From 97b84156d96aafa85d8b8d07859f656a45e9e675 Mon Sep 17 00:00:00 2001
+From: Andrew Yourtchenko <ayourtch@gmail.com>
+Date: Tue, 30 Jun 2026 00:53:44 +0200
+Subject: [PATCH] test: bump TestCrypto vapi timeout for slow debug/emulated
+ perf runs
+
+The 'test crypto perf' CLIs run a real AES/SHA benchmark (512 buffers x
+200 rounds x 6 alg/buffer-size combos) inside VPP. On a debug build under
+aarch64 emulation a single command takes ~7s and the full sweep ~44s,
+exceeding the default 5s vapi_response_timeout and raising a spurious
+VPPIOError(2, 'VPP API client: read failed').
+
+Mirror the existing TestBihash aarch64/test-debug workaround and raise
+the per-class timeout. No emulator change: the reply is small and timely;
+only VPP's compute exceeds the tight default.
+---
+ test/asf/test_crypto.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/test/asf/test_crypto.py b/test/asf/test_crypto.py
+index c23c2191c..9df0ba38b 100644
+--- a/test/asf/test_crypto.py
++++ b/test/asf/test_crypto.py
+@@ -10,6 +10,13 @@ class TestCrypto(VppAsfTestCase):
+ 
+     @classmethod
+     def setUpClass(cls):
++        # The "test crypto perf" CLIs run a real AES/SHA benchmark (512 buffers
++        # x 200 rounds) inside VPP. On a debug build under emulation (aarch64
++        # fakelinux) a single command takes ~7s and the full perf sweep ~44s,
++        # blowing the default 5s vapi response timeout -> spurious
++        # "VPP API client: read failed". Mirror TestBihash's aarch64/test-debug
++        # workaround and give the API replies room. (see fakelinux cluster D)
++        cls.vapi_response_timeout = 120
+         super(TestCrypto, cls).setUpClass()
+ 
+     @classmethod
+-- 
+2.50.1 (Apple Git-155)
+
