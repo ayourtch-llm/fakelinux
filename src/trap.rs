@@ -829,6 +829,62 @@ pub static WATCH_MMAP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_OFF: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_PAGE: AtomicU64 = AtomicU64::new(0);
+// FAKELINUX_WATCH_X27=1: single-shot mode. On the first signal_forwarder
+// call where x27 is in the Python ET_EXEC heap range, capture x27+16 and
+// arm WATCH on that page. Catches the keystream-buffer stomper regardless
+// of whether it lives on the signal path or in synchronous trap_handler.
+pub static WATCH_X27_PENDING: AtomicBool = AtomicBool::new(false);
+
+// Open-addressed PC histogram for ALL fault PCs hitting the watched page.
+// Captures rare writers that don't change the 8-byte watched slot.
+// Each slot holds (pc, count, last_offset_in_page).
+const WATCH_PC_SLOTS: usize = 256;
+static WATCH_PC_KEY: [AtomicU64; WATCH_PC_SLOTS] =
+    [const { AtomicU64::new(0) }; WATCH_PC_SLOTS];
+static WATCH_PC_CNT: [AtomicU64; WATCH_PC_SLOTS] =
+    [const { AtomicU64::new(0) }; WATCH_PC_SLOTS];
+static WATCH_PC_OFF: [AtomicU64; WATCH_PC_SLOTS] =
+    [const { AtomicU64::new(0) }; WATCH_PC_SLOTS];
+
+pub fn watch_record_fault(pc: u64, off_in_page: u64) {
+    let mut idx = ((pc.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize) % WATCH_PC_SLOTS;
+    for _ in 0..8 {
+        let k = WATCH_PC_KEY[idx].load(Ordering::Relaxed);
+        if k == pc {
+            WATCH_PC_CNT[idx].fetch_add(1, Ordering::Relaxed);
+            WATCH_PC_OFF[idx].store(off_in_page, Ordering::Relaxed);
+            return;
+        }
+        if k == 0 && WATCH_PC_KEY[idx].compare_exchange(
+            0, pc, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            WATCH_PC_CNT[idx].fetch_add(1, Ordering::Relaxed);
+            WATCH_PC_OFF[idx].store(off_in_page, Ordering::Relaxed);
+            return;
+        }
+        idx = (idx + 1) % WATCH_PC_SLOTS;
+    }
+}
+
+pub fn watch_dump_pc_histogram() {
+    let mut any = false;
+    for i in 0..WATCH_PC_SLOTS {
+        let pc = WATCH_PC_KEY[i].load(Ordering::Relaxed);
+        let cnt = WATCH_PC_CNT[i].load(Ordering::Relaxed);
+        if pc == 0 || cnt == 0 { continue; }
+        if !any {
+            let hdr = b"fakelinux: WATCH PC histogram (all writes to watched page):\n";
+            unsafe { libc::write(2, hdr.as_ptr() as *const _, hdr.len()); }
+            any = true;
+        }
+        let off = WATCH_PC_OFF[i].load(Ordering::Relaxed);
+        let instr = unsafe { (pc as *const u32).read_volatile() };
+        let mut buf = [0u8; 160];
+        let n = raw_fmt(&mut buf, format_args!(
+            "  pc={:#x} instr={:#010x} count={} last_off={:#x}\n",
+            pc, instr, cnt, off));
+        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+    }
+}
 static WATCH_STEP_PC: AtomicU64 = AtomicU64::new(0);
 static WATCH_STEP_ORIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static WATCH_PREV_VAL: AtomicU64 = AtomicU64::new(0);
@@ -910,6 +966,7 @@ pub fn dump_trap_stats() {
         crate::signal::FORWARDER_MAX_DEPTH.load(Ordering::Relaxed),
         crate::signal::KS_PROBE_CHECKED.load(Ordering::Relaxed),
         crate::signal::KS_PROBE_STOMPS.load(Ordering::Relaxed)));
+    watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
     // Also write to a per-pid host file (robust vs. stderr capture). Diagnostic.
@@ -963,6 +1020,8 @@ pub fn init_trace_flags() {
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
     crate::signal::SIGTRACE.store(std::env::var_os("FAKELINUX_SIGTRACE").is_some(), Ordering::Relaxed);
+    WATCH_X27_PENDING.store(
+        std::env::var_os("FAKELINUX_WATCH_X27").is_some(), Ordering::Relaxed);
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
         let parts: Vec<&str> = spec.split(':').collect();
@@ -979,6 +1038,21 @@ pub fn init_trace_flags() {
             }
         }
     }
+}
+
+/// Arm WATCH on a specific guest address — single-shot, idempotent.
+/// Used by FAKELINUX_WATCH_X27 path. Runs in signal/trap context.
+pub unsafe fn watch_arm_addr(addr: u64) {
+    if WATCH_ADDR.load(Ordering::Relaxed) != 0 { return; }
+    let page = addr & !0x3FFF;
+    WATCH_ADDR.store(addr, Ordering::Relaxed);
+    WATCH_PAGE.store(page, Ordering::Relaxed);
+    libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ);
+    let mut buf = [0u8; 160];
+    let n = raw_fmt(&mut buf, format_args!(
+        "fakelinux: WATCH armed (x27 trigger): addr={:#x} page={:#x}\n",
+        addr, page));
+    libc::write(2, buf.as_ptr() as *const _, n);
 }
 
 /// Called by do_mmap after a successful anonymous mapping. Arms the watch
@@ -1016,6 +1090,10 @@ pub unsafe fn watch_handle_fault(mctx: &mut MContext64, fault_addr: u64) -> bool
     }
     let pc = mctx.ss.pc;
     let waddr = WATCH_ADDR.load(Ordering::Relaxed);
+    // Record EVERY fault PC FIRST (before the host-range disarm), so a
+    // fakelinux-internal stomper (x18 emul / syscall handler writing on the
+    // guest's behalf) shows up in the histogram even if it disarms WATCH.
+    watch_record_fault(pc, fault_addr - page);
     // Host-code store (e.g. our own emulation writing on the guest's
     // behalf): unprotect, log, and disarm — patching host code would be
     // fatal. CURRENT_X18_INSTR identifies the emulated guest instruction.
@@ -1026,13 +1104,17 @@ pub unsafe fn watch_handle_fault(mctx: &mut MContext64, fault_addr: u64) -> bool
     // addresses near the process's existing mappings — guest openssl can
     // land within 10-20 MB of host text and was falsely flagged as host).
     if pc.wrapping_sub(host_anchor) < 0x400000 || host_anchor.wrapping_sub(pc) < 0x400000 {
-        let mut buf = [0u8; 224];
+        let delta = pc.wrapping_sub(host_anchor) as i64;
+        let nm_off = 0x1000183F4u64; // watch_handle_fault file/link addr
+        let file_addr = (nm_off as i64 + delta) as u64;
+        let mut buf = [0u8; 320];
         let n = raw_fmt(&mut buf, format_args!(
-            "fakelinux: WATCH HOST-CODE write! host_pc={:#x} fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
-            pc, fault_addr, CURRENT_X18_INSTR, CURRENT_X18_PC));
+            "fakelinux: WATCH HOST-CODE write! host_pc={:#x} (file_addr~{:#x}, whf+{:#x}) fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
+            pc, file_addr, delta, fault_addr, CURRENT_X18_INSTR, CURRENT_X18_PC));
         libc::write(2, buf.as_ptr() as *const _, n);
         libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
         WATCH_PAGE.store(0, Ordering::Relaxed);
+        WATCH_ADDR.store(0, Ordering::Relaxed);
         return true;
     }
     WATCH_PREV_VAL.store((waddr as *const u64).read(), Ordering::Relaxed);
@@ -1080,12 +1162,23 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
             let fpc = WATCH_FAULT_PC.load(Ordering::Relaxed);
             let instr = (fpc as *const u32).read();
             let r = &mctx.ss;
-            let mut buf = [0u8; 512];
+            // Dump 20 instructions before the faulting STUR so we can identify
+            // where x1 is set (FMOV from NEON, LDR from memory, or chained
+            // GPR ops). x1 contains the corrupting value on bad hits.
+            // x1 is set by `LDR x1, [x27, #16]` at pc-28. If memory at
+            // [x27+16] is stomped between AES-round write and LDR read, x1
+            // is wrong. Dump x27 and the 32 bytes at [x27..x27+32].
+            let x27 = r.x[27];
+            let x27_w0 = (x27 as *const u64).read_volatile();
+            let x27_w1 = ((x27 + 8) as *const u64).read_volatile();
+            let x27_w2 = ((x27 + 16) as *const u64).read_volatile();
+            let x27_w3 = ((x27 + 24) as *const u64).read_volatile();
+            let mut buf = [0u8; 768];
             let n = raw_fmt(&mut buf, format_args!(
-                "fakelinux: WATCH WRITE [{:#x}] {:#x} → {:#x} by pc={:#x} instr={:#010x} lr={:#x}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n  x19={:#x} x20={:#x} x21={:#x} x22={:#x} sp={:#x}\n",
-                waddr, prev, cur, fpc, instr, r.lr,
-                r.x[0], r.x[1], r.x[2], r.x[3], r.x[4], r.x[5], r.x[6], r.x[7],
-                r.x[19], r.x[20], r.x[21], r.x[22], r.sp));
+                "fakelinux: WATCH WRITE [{:#x}] {:#x} → {:#x} by pc={:#x} instr={:#010x}\n  x0={:#x} x1={:#x} x3={:#x} x19={:#x} x22={:#x} x27={:#x} sp={:#x} lr={:#x}\n  [x27..+32] = {:#x} {:#x} {:#x} {:#x}   (LDR x1,[x27,#16] => {:#x})\n",
+                waddr, prev, cur, fpc, instr,
+                r.x[0], r.x[1], r.x[3], r.x[19], r.x[22], x27, r.sp, r.lr,
+                x27_w0, x27_w1, x27_w2, x27_w3, x27_w2));
             libc::write(2, buf.as_ptr() as *const _, n);
         }
     }

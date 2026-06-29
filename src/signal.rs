@@ -860,6 +860,23 @@ unsafe extern "C" fn signal_forwarder(
     let uctx = &mut *(ctx as *mut crate::trap::UContext);
     let mctx = &mut *uctx.uc_mcontext;
 
+    // FAKELINUX_WATCH_X27 multi-shot trigger: arm WATCH on [x27+16] whenever
+    // (a) the env-var is set, (b) x27 is in the Python ET_EXEC heap range
+    // (= openssl's keystream-buffer scratch), and (c) WATCH is currently
+    // unarmed. After a disarm (host-code or completion), the next qualifying
+    // forwarded signal re-arms on the NEW decryptor's keystream buffer. With
+    // ~3% corruption rate and many decryptors per run, this gives us many
+    // chances to catch a stomp, vs the single-shot mode that only watched
+    // one decryptor instance.
+    if crate::trap::WATCH_X27_PENDING.load(Ordering::Relaxed)
+        && crate::trap::WATCH_ADDR.load(Ordering::Relaxed) == 0
+    {
+        let x27 = mctx.ss.x[27];
+        if (0x7_0000_0000..0x8_0000_0000).contains(&x27) {
+            crate::trap::watch_arm_addr(x27 + 16);
+        }
+    }
+
     // Fault signals: FIRST try the ET_EXEC lazy-relocation fixup. Once a
     // guest installs its own SIGSEGV handler (gcc's ICE handler), this
     // forwarder replaces segv_fixup_handler — without this hook lazy reloc
