@@ -1101,9 +1101,9 @@ pub fn dump_trap_stats() {
         pid, as_lo, as_hi, as_min, used, free));
     unsafe { libc::write(2, b3.as_ptr() as *const _, n3); }
 
-    let mut b2 = [0u8; 448];
+    let mut b2 = [0u8; 512];
     let n2 = raw_fmt(&mut b2, format_args!(
-        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={} reg_checked={} reg_hits={} fwd_reg_checked={} fwd_reg_mismatches={}\n",
+        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={} reg_checked={} reg_hits={} fwd_reg_checked={} fwd_reg_mismatches={} rk_checked={} rk_mismatches={}\n",
         pid, crate::signal::FORWARDER_CALLS.load(Ordering::Relaxed),
         crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed),
         crate::signal::FORWARDER_NESTED.load(Ordering::Relaxed),
@@ -1113,7 +1113,9 @@ pub fn dump_trap_stats() {
         REG_PROBE_CHECKED.load(Ordering::Relaxed),
         REG_PROBE_HITS.load(Ordering::Relaxed),
         crate::signal::FWD_REG_CHECKED.load(Ordering::Relaxed),
-        crate::signal::FWD_REG_MISMATCHES.load(Ordering::Relaxed)));
+        crate::signal::FWD_REG_MISMATCHES.load(Ordering::Relaxed),
+        crate::signal::RK_PROBE_CHECKED.load(Ordering::Relaxed),
+        crate::signal::RK_PROBE_MISMATCHES.load(Ordering::Relaxed)));
     watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };

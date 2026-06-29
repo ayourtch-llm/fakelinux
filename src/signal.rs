@@ -425,6 +425,15 @@ thread_local! {
     /// Layout: ([x0..x28; 29], fp, lr, sp, pc, frame_addr).
     static FWD_REG_PROBE: std::cell::Cell<Option<FwdRegSnap>> =
         const { std::cell::Cell::new(None) };
+    /// Round-key table snapshot, keyed by frame_addr. Full 240 bytes (30 u64
+    /// words) so do_rt_sigreturn can dump byte-level diff on a mismatch.
+    static RK_PROBE: std::cell::Cell<Option<RkSnap>> =
+        const { std::cell::Cell::new(None) };
+    /// Logged-once flag: dump x21 + first 32 bytes of the round-key table
+    /// on the first qualifying forwarder so we can confirm by eye that x21
+    /// really is the AES_KEY base (the repro's KEY = bytes(range(32))).
+    static RK_LOGGED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 /// DIAGNOSTIC: stomps observed in [x27+16..+32] across a single signal
 /// round-trip (signal ENTRY value vs do_rt_sigreturn EXIT value, same address).
@@ -436,8 +445,24 @@ pub static KS_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
 pub static FWD_REG_CHECKED: AtomicU64 = AtomicU64::new(0);
 pub static FWD_REG_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// DIAGNOSTIC: AES round-key table snapshot probe. AES-256 expanded round
+/// keys are 240 bytes (15 rounds × 16). With KS_PROBE proving keystream
+/// memory is preserved and FWD_REG_PROBE proving all guest GPRs are
+/// preserved across the round-trip, the round-key table is the only
+/// remaining AES input that could make openssl compute garbage in both
+/// scalar (armcap=0) and NEON-accelerated paths. Snapshot the 240 bytes
+/// at [x21..+240] at build_sigframe entry (x21 holds the AES_KEY base
+/// pointer per the disassembled call site: `MOV x2,x21` before the BLR
+/// into AES_encrypt). Compare full bytes at do_rt_sigreturn for matching
+/// frame — any byte difference = round-key stomp = root cause.
+pub static RK_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
+pub static RK_PROBE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Copy, Clone)]
 struct FwdRegSnap { x: [u64; 29], fp: u64, lr: u64, sp: u64, pc: u64, frame: u64 }
+
+#[derive(Copy, Clone)]
+struct RkSnap { x21: u64, frame: u64, words: [u64; 30] }
 
 // Lock-free ring buffer of recent signal build/restore events (no I/O so timing
 // is not perturbed); dumped by the crash handler.
@@ -641,6 +666,34 @@ pub unsafe fn build_sigframe_and_redirect(
             snap.x[i] = if i == 18 { crate::trap::get_thread_x18() } else { regs.x[i] };
         }
         FWD_REG_PROBE.with(|c| c.set(Some(snap)));
+
+        // Round-key table snapshot: x21 holds the AES_KEY base during
+        // openssl's CTR loop. Read 240 bytes (30 u64 words) if x21 is in
+        // the Python ET_EXEC heap range. We don't fault-guard the read —
+        // if x21 isn't actually pointing at AES_KEY this iteration, the
+        // CRC simply won't match a meaningful value but the comparison
+        // is harmless (we re-read the same bytes at sigreturn and they
+        // will be byte-identical absent a stomp).
+        let x21 = regs.x[21];
+        if (0x7_0000_0000..0x8_0000_0000).contains(&x21) {
+            let mut rk = RkSnap { x21, frame: frame_addr, words: [0u64; 30] };
+            for i in 0..30 {
+                rk.words[i] = ((x21 + (i as u64) * 8) as *const u64).read_volatile();
+            }
+            // One-shot log: dump x21 + first 32 bytes so we can confirm
+            // by eye this is the AES_KEY (KEY = bytes(range(32)) in the
+            // repro should appear at offset 0 OR somewhere in the snapshot).
+            if !RK_LOGGED.with(|c| c.replace(true)) {
+                let mut buf = [0u8; 320];
+                let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                    "fakelinux: RK_FIRST x21={:#x} bytes[0..32]={:016x}{:016x}{:016x}{:016x}\n",
+                    x21, rk.words[0], rk.words[1], rk.words[2], rk.words[3]));
+                libc::write(2, buf.as_ptr() as *const _, n);
+            }
+            RK_PROBE.with(|c| c.set(Some(rk)));
+        } else {
+            RK_PROBE.with(|c| c.set(None));
+        }
     }
 
     // Redirect guest execution to the handler
@@ -790,6 +843,42 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
                 }
                 if any { FWD_REG_MISMATCHES.fetch_add(1, Ordering::Relaxed); }
                 FWD_REG_PROBE.with(|c| c.set(None));
+            }
+        }
+    }
+
+    // DIAGNOSTIC: compare the openssl AES round-key table at [x21..+240]
+    // against the snapshot from build_sigframe entry for the matching
+    // frame. Any byte difference means the round-key table was stomped
+    // across the forwarded signal round-trip — root cause for "openssl
+    // computes garbage keystream with correct counter + correct registers"
+    // and works in both scalar (armcap=0) and NEON modes (both read the
+    // same round-key table).
+    if SIGTRACE.load(Ordering::Relaxed) {
+        if let Some(rk) = RK_PROBE.with(|c| c.get()) {
+            if rk.frame == frame_addr {
+                RK_PROBE_CHECKED.fetch_add(1, Ordering::Relaxed);
+                let mut diff_words: u32 = 0;
+                let mut first_diff: i32 = -1;
+                for i in 0..30 {
+                    let exit_w = ((rk.x21 + (i as u64) * 8) as *const u64).read_volatile();
+                    if exit_w != rk.words[i] {
+                        diff_words += 1;
+                        if first_diff < 0 { first_diff = i as i32; }
+                    }
+                }
+                if diff_words > 0 {
+                    RK_PROBE_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                    let fd = first_diff as usize;
+                    let entry_w = rk.words[fd];
+                    let exit_w = ((rk.x21 + (fd as u64) * 8) as *const u64).read_volatile();
+                    let mut buf = [0u8; 320];
+                    let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                        "fakelinux: RK_STOMP frame={:#x} x21={:#x} diff_words={}/30 first_diff_word={} entry={:#x} exit={:#x}\n",
+                        frame_addr, rk.x21, diff_words, fd, entry_w, exit_w));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
+                RK_PROBE.with(|c| c.set(None));
             }
         }
     }
