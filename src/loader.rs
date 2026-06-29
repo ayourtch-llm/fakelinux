@@ -640,7 +640,7 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
 // deadlock note in trap.rs above init_trace_flags).
 
 const PATCH_CACHE_MAGIC: u32 = 0x434C_5046; // "FPLC"
-const PATCH_CACHE_VERSION: u32 = 1;
+const PATCH_CACHE_VERSION: u32 = 2;
 
 static PATCH_CACHE_DIR: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static NO_X18_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -859,7 +859,9 @@ pub fn patch_new_code_file(start: u64, len: u64, fd: i32, offset: u64) {
     if try_patch_from_cache(start, len, fd, offset) {
         return;
     }
-    let sites = patch_new_code(start, len);
+    let code_ranges = extract_code_ranges_from_file_mapping(fd, start, len, offset)
+        .unwrap_or_else(|| extract_code_ranges_from_memory(start, len));
+    let sites = patch_new_code_with_ranges(start, len, code_ranges);
     if let Some(path) = patch_cache_path(fd, offset, len) {
         write_file_raw_atomic(&path, &encode_patch_cache(&sites));
     }
@@ -878,7 +880,10 @@ pub fn patch_new_code(start: u64, len: u64) -> Vec<u32> {
     // program headers + PT_DYNAMIC (fallback). This prevents x18 patching from
     // corrupting non-code data (e.g. .dynstr version strings) in the same mapping.
     let code_ranges = extract_code_ranges_from_memory(start, len);
+    patch_new_code_with_ranges(start, len, code_ranges)
+}
 
+fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>) -> Vec<u32> {
     let count = len / 4;
     let base = start as *mut u32;
     let mut svc_patched = 0u64;
@@ -945,6 +950,103 @@ pub fn patch_new_code(start: u64, len: u64) -> Vec<u32> {
     // text segment (loaded below brk). The probe was incorrectly "fixing" correct LRs
     // to wrong libapt-pkg addresses, CAUSING the fork child to run wrong code.
     sites
+}
+
+/// Extract executable section ranges for a runtime file-backed mapping.
+///
+/// Dynamic-linker mappings often start at an executable PT_LOAD offset, not at
+/// the ELF header. The in-memory extractor therefore sees non-ELF bytes and
+/// returns no ranges, which caused x18 patching to be skipped for DSOs such as
+/// cryptography's bundled `_rust.abi3.so`. Use section file offsets from the
+/// backing ELF to project SHF_EXECINSTR ranges into this mapping.
+fn extract_code_ranges_from_file_mapping(
+    fd: i32,
+    map_start: u64,
+    map_len: u64,
+    map_file_off: u64,
+) -> Option<Vec<(u64, u64)>> {
+    const EI_CLASS: usize = 4;
+    const EI_DATA: usize = 5;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const SHF_EXECINSTR: u64 = 4;
+
+    fn pread_exact(fd: i32, off: u64, buf: &mut [u8]) -> bool {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    buf[done..].as_mut_ptr() as *mut _,
+                    buf.len() - done,
+                    off as i64 + done as i64,
+                )
+            };
+            if n <= 0 {
+                return false;
+            }
+            done += n as usize;
+        }
+        true
+    }
+
+    let mut eh = [0u8; 64];
+    if !pread_exact(fd, 0, &mut eh) {
+        return None;
+    }
+    if &eh[0..4] != b"\x7fELF" || eh[EI_CLASS] != ELFCLASS64 || eh[EI_DATA] != ELFDATA2LSB {
+        return None;
+    }
+
+    let e_shoff = elf::read_u64_pub(&eh, 40);
+    let e_shentsize = elf::read_u16_pub(&eh, 58) as usize;
+    let e_shnum = elf::read_u16_pub(&eh, 60) as usize;
+    if e_shoff == 0 || e_shentsize < 64 || e_shnum == 0 {
+        return None;
+    }
+    let table_len = e_shentsize.checked_mul(e_shnum)?;
+    if table_len > 16 * 1024 * 1024 {
+        return None;
+    }
+
+    let mut shdrs = vec![0u8; table_len];
+    if !pread_exact(fd, e_shoff, &mut shdrs) {
+        return None;
+    }
+
+    let map_file_end = map_file_off.checked_add(map_len)?;
+    let mut ranges = Vec::new();
+    for i in 0..e_shnum {
+        let off = i * e_shentsize;
+        if off + 64 > shdrs.len() {
+            break;
+        }
+        let sh_flags = elf::read_u64_pub(&shdrs, off + 8);
+        if sh_flags & SHF_EXECINSTR == 0 {
+            continue;
+        }
+        let sh_offset = elf::read_u64_pub(&shdrs, off + 24);
+        let sh_size = elf::read_u64_pub(&shdrs, off + 32);
+        if sh_size == 0 {
+            continue;
+        }
+        let sh_end = sh_offset.checked_add(sh_size)?;
+        let overlap_start = sh_offset.max(map_file_off);
+        let overlap_end = sh_end.min(map_file_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        ranges.push((
+            map_start + (overlap_start - map_file_off),
+            overlap_end - overlap_start,
+        ));
+    }
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
 }
 
 /// Try to extract code ranges from ELF headers in mapped memory.
