@@ -995,7 +995,7 @@ fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>
     }
     crate::x18_trampoline::flush_all_islands();
     if svc_patched > 0 || tpidr_patched > 0 || x18_patched > 0 || x18_skipped > 0 {
-        eprintln!(
+        crate::vlog!(
             "fakelinux: runtime patch at {:#x}+{:#x}: {} SVC, {} TPIDR, {} x18{}",
             start, len, svc_patched, tpidr_patched, x18_patched,
             if x18_skipped > 0 { format!(" ({} x18 skipped, no code ranges)", x18_skipped) } else { String::new() }

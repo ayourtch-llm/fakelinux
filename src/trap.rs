@@ -1478,11 +1478,13 @@ fn init_fl_text_bounds() {
                     let end = start + seg.vmsize;
                     FL_TEXT_START.store(start, Ordering::Relaxed);
                     FL_TEXT_END.store(end, Ordering::Relaxed);
-                    let mut buf = [0u8; 128];
-                    let n = raw_fmt(&mut buf, format_args!(
-                        "fakelinux: __TEXT bounds {:#x}-{:#x} (slide={:#x})\n",
-                        start, end, slide));
-                    libc::write(2, buf.as_ptr() as *const _, n);
+                    if crate::diag::verbose() {
+                        let mut buf = [0u8; 128];
+                        let n = raw_fmt(&mut buf, format_args!(
+                            "fakelinux: __TEXT bounds {:#x}-{:#x} (slide={:#x})\n",
+                            start, end, slide));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
                     return;
                 }
             }
@@ -3447,10 +3449,12 @@ pub fn install_handler() {
         let hi = lo + stack_size as u64;
         ALTSTACK_LO.store(lo, Ordering::Relaxed);
         ALTSTACK_HI.store(hi, Ordering::Relaxed);
-        let mut buf = [0u8; 160];
-        let n = raw_fmt(&mut buf, format_args!(
-            "fakelinux: altstack {:#x}-{:#x} size={}\n", lo, hi, stack_size));
-        libc::write(2, buf.as_ptr() as *const _, n);
+        if crate::diag::verbose() {
+            let mut buf = [0u8; 160];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: altstack {:#x}-{:#x} size={}\n", lo, hi, stack_size));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
 
         // Install SIGILL handler FIRST (before unblocking — if SIGILL is
         // pending, unblocking would fire it with SIG_DFL=terminate!)
