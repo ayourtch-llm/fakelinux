@@ -843,6 +843,90 @@ static FL_TEXT_END: AtomicU64 = AtomicU64::new(0);
 // of whether it lives on the signal path or in synchronous trap_handler.
 pub static WATCH_X27_PENDING: AtomicBool = AtomicBool::new(false);
 
+// FAKELINUX_CHECK_REGS=1: callee-saved register probe. Snapshot x19..x28,
+// fp(x29), sp at trap_handler ENTRY; on EXIT (via Drop guard so every return
+// path is covered) compare. Any change to a callee-saved GPR in a sync trap
+// path (SVC syscall, x18 emul, TPIDR emul) is the smoking gun for "fakelinux
+// silently mutates a guest callee-saved register that openssl was holding
+// AES state in." Branches that LEGITIMATELY rewrite many regs (rt_sigreturn,
+// deliver_pending, signal-forwarding build_sigframe) call reg_probe_set_reason
+// to suppress the alarm — those are paths that, by design, rewrite mctx.
+static REG_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static REG_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static REG_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Copy, Clone)]
+struct RegSnapshot { x: [u64; 29], fp: u64, sp: u64, entry_pc: u64, x8: u64 }
+
+thread_local! {
+    static REG_SNAPSHOT: std::cell::Cell<Option<RegSnapshot>> =
+        const { std::cell::Cell::new(None) };
+    static REG_REASON: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("sync") };
+}
+
+fn reg_probe_enter(mctx: &MContext64) {
+    if !REG_PROBE_ENABLED.load(Ordering::Relaxed) { return; }
+    REG_SNAPSHOT.with(|c| c.set(Some(RegSnapshot {
+        x: mctx.ss.x, fp: mctx.ss.fp, sp: mctx.ss.sp,
+        entry_pc: mctx.ss.pc, x8: mctx.ss.x[8],
+    })));
+    REG_REASON.with(|c| c.set("sync"));
+}
+
+/// Called from legitimate-multi-reg-rewrite paths to suppress the alarm.
+/// Recognized reasons: "sigreturn", "deliver_pending", "build_sigframe".
+pub fn reg_probe_set_reason(reason: &'static str) {
+    REG_REASON.with(|c| c.set(reason));
+}
+
+/// Explicit check: call before any legitimate multi-reg mutation so the
+/// "sync" snapshot is consumed and Drop becomes a no-op. Returns void.
+pub unsafe fn reg_probe_check_now(mctx: &MContext64) { reg_probe_check_exit(mctx) }
+
+unsafe fn reg_probe_check_exit(mctx: &MContext64) {
+    if !REG_PROBE_ENABLED.load(Ordering::Relaxed) { return; }
+    let snap = match REG_SNAPSHOT.with(|c| c.take()) {
+        Some(s) => s, None => return,
+    };
+    let reason = REG_REASON.with(|c| { let r = c.get(); c.set("sync"); r });
+    if reason != "sync" { return; }
+    REG_PROBE_CHECKED.fetch_add(1, Ordering::Relaxed);
+    let mut hit = false;
+    for i in 19..29 {
+        if mctx.ss.x[i] != snap.x[i] {
+            let mut buf = [0u8; 256];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: TRAP_REG_CHANGE x{} {:#x} → {:#x} entry_pc={:#x} exit_pc={:#x} svc_nr={}\n",
+                i, snap.x[i], mctx.ss.x[i], snap.entry_pc, mctx.ss.pc, snap.x8));
+            libc::write(2, buf.as_ptr() as *const _, n);
+            hit = true;
+        }
+    }
+    if mctx.ss.fp != snap.fp {
+        let mut buf = [0u8; 256];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: TRAP_REG_CHANGE fp(x29) {:#x} → {:#x} entry_pc={:#x} exit_pc={:#x} svc_nr={}\n",
+            snap.fp, mctx.ss.fp, snap.entry_pc, mctx.ss.pc, snap.x8));
+        libc::write(2, buf.as_ptr() as *const _, n);
+        hit = true;
+    }
+    if mctx.ss.sp != snap.sp {
+        let mut buf = [0u8; 256];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: TRAP_REG_CHANGE sp {:#x} → {:#x} entry_pc={:#x} exit_pc={:#x} svc_nr={}\n",
+            snap.sp, mctx.ss.sp, snap.entry_pc, mctx.ss.pc, snap.x8));
+        libc::write(2, buf.as_ptr() as *const _, n);
+        hit = true;
+    }
+    if hit { REG_PROBE_HITS.fetch_add(1, Ordering::Relaxed); }
+}
+
+pub struct RegProbeGuard(pub *const MContext64);
+impl Drop for RegProbeGuard {
+    fn drop(&mut self) { unsafe { reg_probe_check_exit(&*self.0); } }
+}
+
 // Open-addressed PC histogram for ALL fault PCs hitting the watched page.
 // Captures rare writers that don't change the 8-byte watched slot.
 // Each slot holds (pc, count, last_offset_in_page).
@@ -993,15 +1077,17 @@ pub fn dump_trap_stats() {
         crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
         crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
         crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
-    let mut b2 = [0u8; 320];
+    let mut b2 = [0u8; 384];
     let n2 = raw_fmt(&mut b2, format_args!(
-        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={}\n",
+        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={} reg_checked={} reg_hits={}\n",
         pid, crate::signal::FORWARDER_CALLS.load(Ordering::Relaxed),
         crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed),
         crate::signal::FORWARDER_NESTED.load(Ordering::Relaxed),
         crate::signal::FORWARDER_MAX_DEPTH.load(Ordering::Relaxed),
         crate::signal::KS_PROBE_CHECKED.load(Ordering::Relaxed),
-        crate::signal::KS_PROBE_STOMPS.load(Ordering::Relaxed)));
+        crate::signal::KS_PROBE_STOMPS.load(Ordering::Relaxed),
+        REG_PROBE_CHECKED.load(Ordering::Relaxed),
+        REG_PROBE_HITS.load(Ordering::Relaxed)));
     watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
@@ -1058,6 +1144,8 @@ pub fn init_trace_flags() {
     crate::signal::SIGTRACE.store(std::env::var_os("FAKELINUX_SIGTRACE").is_some(), Ordering::Relaxed);
     WATCH_X27_PENDING.store(
         std::env::var_os("FAKELINUX_WATCH_X27").is_some(), Ordering::Relaxed);
+    REG_PROBE_ENABLED.store(
+        std::env::var_os("FAKELINUX_CHECK_REGS").is_some(), Ordering::Relaxed);
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
     init_fl_text_bounds();
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
@@ -2234,6 +2322,13 @@ unsafe extern "C" fn trap_handler(
     let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
 
+    // Callee-saved register probe: snapshot at entry; Drop guard checks at
+    // EVERY return path. Branches that legitimately rewrite many regs
+    // (sigreturn, deliver_pending, signal-forwarding build_sigframe) call
+    // reg_probe_set_reason to suppress the alarm. Gated by FAKELINUX_CHECK_REGS.
+    reg_probe_enter(mctx);
+    let _reg_guard = RegProbeGuard(mctx as *const _);
+
     // Check if libapt-pkg's B instruction has been corrupted.
     {
         let watch = LIBAPT_B_WATCH.load(Ordering::Relaxed);
@@ -2583,6 +2678,10 @@ unsafe extern "C" fn trap_handler(
                     // "currently being emulated" (stale values misled debugging).
                     unsafe { CURRENT_X18_INSTR = 0; CURRENT_X18_PC = 0; }
                     set_in_trap(false);
+                    // Check BEFORE deliver_pending so legitimate sigframe
+                    // changes don't false-alarm. x18 emul itself may have
+                    // legitimately written Rd; that's caught here.
+                    reg_probe_check_now(mctx);
                     crate::signal::deliver_pending_to_guest(mctx);
                     return;
                 }
@@ -2684,9 +2783,12 @@ unsafe extern "C" fn trap_handler(
         // Check if any trampoline was requested (fork, patch, etc.)
         if crate::trampoline::check_and_redirect(mctx, uctx, result, pc + 4) {
             // Trampoline activated — skip normal x0/pc update
+            reg_probe_set_reason("trampoline_redirect");
         } else if result == crate::signal::SIGRETURN_SENTINEL {
-            // rt_sigreturn: registers were already restored directly into mctx.
-            // Don't overwrite x0 or pc.
+            // rt_sigreturn: registers were already restored directly into mctx
+            // by do_rt_sigreturn. Don't overwrite x0 or pc. Suppress alarm —
+            // sigreturn legitimately rewrites all callee-saved regs.
+            reg_probe_set_reason("sigreturn");
         } else {
             mctx.ss.x[0] = result as u64;
             mctx.ss.pc = pc + 4;
@@ -2740,6 +2842,8 @@ unsafe extern "C" fn trap_handler(
         if sa.handler != 0 && sa.handler != 1 {
             // Guest has a SIGILL handler — let signal_forwarder handle it
             set_in_trap(false);
+            // Check BEFORE build_sigframe rewrites mctx for the handler.
+            reg_probe_check_now(mctx);
             // SIGILL: si_addr = faulting pc, si_code = ILL_ILLOPC.
             crate::signal::build_sigframe_and_redirect(
                 mctx, linux_sig as i32, sa.handler, sa.mask, mctx.ss.pc, 1);
@@ -2754,6 +2858,8 @@ unsafe extern "C" fn trap_handler(
     // Keep IN_TRAP=true while delivering pending signals: build_sigframe_and_redirect
     // mutates `mctx`, and another macOS signal arriving here would also try to
     // mutate it via signal_forwarder, racing with our writes.
+    // Check BEFORE deliver_pending — sigframe build legitimately rewrites regs.
+    reg_probe_check_now(mctx);
     crate::signal::deliver_pending_to_guest(mctx);
     set_in_trap(false);
 }
