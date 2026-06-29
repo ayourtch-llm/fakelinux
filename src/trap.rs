@@ -880,8 +880,24 @@ pub static RESUME_PROBE_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
 pub static P4_RK_DIFFS: AtomicU64 = AtomicU64::new(0);
 pub static P4_CTR_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 pub static P4_POINTER_LIKE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Code-integrity counters at the corrupting store.
+pub static P4_CODE_DIFFS: AtomicU64 = AtomicU64::new(0);
+pub static P4_AES_FN_DIFFS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     pub static P4_RK_REF: std::cell::Cell<Option<[u64; 30]>> =
+        const { std::cell::Cell::new(None) };
+    /// 256 instruction words (1 KB) centered on the watched STUR pc:
+    /// covers the calling function (CTR loop + the call to AES_encrypt).
+    /// Captured on first hit, compared every subsequent hit. Detects any
+    /// altered openssl code in the inner loop — e.g., a torn x18 trampoline
+    /// patch landing inside the AES path.
+    pub static P4_CODE_REF: std::cell::Cell<Option<[u32; 256]>> =
+        const { std::cell::Cell::new(None) };
+    /// First 64 instruction words at the AES_encrypt routine entry,
+    /// read from x20 (the function pointer used by the BLR in the call site).
+    /// If x20 ever differs run-to-run or the instruction bytes change, the
+    /// AES routine itself has been altered.
+    pub static P4_AES_FN_REF: std::cell::Cell<Option<(u64, [u32; 64])>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -1157,11 +1173,13 @@ pub fn dump_trap_stats() {
     let p4_rk = P4_RK_DIFFS.load(Ordering::Relaxed);
     let p4_ctr = P4_CTR_MISMATCHES.load(Ordering::Relaxed);
     let p4_ptr = P4_POINTER_LIKE_HITS.load(Ordering::Relaxed);
-    if p4_rk + p4_ctr + p4_ptr > 0 {
-        let mut b5 = [0u8; 192];
+    let p4_code = P4_CODE_DIFFS.load(Ordering::Relaxed);
+    let p4_aes = P4_AES_FN_DIFFS.load(Ordering::Relaxed);
+    if p4_rk + p4_ctr + p4_ptr + p4_code + p4_aes > 0 {
+        let mut b5 = [0u8; 256];
         let n5 = raw_fmt(&mut b5, format_args!(
-            "fakelinux: [{}] P4 rk_diffs={} ctr_mismatches={} ptr_like_hits={}\n",
-            pid, p4_rk, p4_ctr, p4_ptr));
+            "fakelinux: [{}] P4 rk_diffs={} ctr_mismatches={} ptr_like_hits={} code_diffs={} aes_fn_diffs={}\n",
+            pid, p4_rk, p4_ctr, p4_ptr, p4_code, p4_aes));
         unsafe { libc::write(2, b5.as_ptr() as *const _, n5); }
     }
     watch_dump_pc_histogram();
@@ -1606,12 +1624,7 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
                     x27, x27_w0, x27_w1, CTR_EXP_LO, CTR_EXP_HI));
                 libc::write(2, pbuf.as_ptr() as *const _, pn);
             }
-            // (c) Pointer-likeness check on the foreign value `cur`. Guest
-            //     heap pointers in fakelinux live at 0x7_0000_0000+, so the
-            //     high u32 is in 0x7_xxxx_xxxx range — top nibble = 0x7 and
-            //     the next nibble is small (0..F). If `cur` looks like
-            //     two stacked pointers OR one pointer + scratch, that's a
-            //     strong hint at an allocation/object-overlap stomp.
+            // (c) Pointer-likeness check on the foreign value `cur`.
             let hi32 = (cur >> 32) as u32;
             let lo32 = cur as u32;
             let hi_ptrlike = (hi32 & 0xF000_0000) == 0x7000_0000;
@@ -1623,6 +1636,90 @@ pub unsafe fn watch_handle_step(mctx: &mut MContext64) -> bool {
                     "fakelinux: P4_PTR_LIKE val={:#x} (hi32={:#x} lo32={:#x}) hi_ptrlike={} lo_ptrlike={}\n",
                     cur, hi32, lo32, hi_ptrlike, lo_ptrlike));
                 libc::write(2, pbuf.as_ptr() as *const _, pn);
+            }
+
+            // (d) Code-integrity check: snapshot 256 instruction words
+            //     centered on the watched STUR pc (covers the openssl CTR
+            //     calling-function with the BLR to AES_encrypt) and compare
+            //     to a first-hit reference. A torn x18 trampoline patch
+            //     landing inside this window would corrupt openssl's inner
+            //     loop and manifest exactly as wrong AES output.
+            let code_base = fpc.wrapping_sub(512);
+            let mut code_cur = [0u32; 256];
+            for i in 0..256 {
+                code_cur[i] = ((code_base + (i as u64) * 4) as *const u32).read_volatile();
+            }
+            let code_ref_opt = P4_CODE_REF.with(|c| c.get());
+            if let Some(code_ref) = code_ref_opt {
+                let mut first_diff: i32 = -1;
+                for i in 0..256 {
+                    if code_cur[i] != code_ref[i] { first_diff = i as i32; break; }
+                }
+                if first_diff >= 0 {
+                    P4_CODE_DIFFS.fetch_add(1, Ordering::Relaxed);
+                    let fi = first_diff as usize;
+                    let mut pbuf = [0u8; 320];
+                    let pn = raw_fmt(&mut pbuf, format_args!(
+                        "fakelinux: P4_CODE_DIFF pc-{:#x}+0x{:x} (addr={:#x}) ref={:#010x} cur={:#010x}\n",
+                        fpc.wrapping_sub(code_base), fi * 4, code_base + (fi as u64) * 4,
+                        code_ref[fi], code_cur[fi]));
+                    libc::write(2, pbuf.as_ptr() as *const _, pn);
+                }
+            } else {
+                P4_CODE_REF.with(|c| c.set(Some(code_cur)));
+            }
+
+            // (e) AES_encrypt routine integrity: x20 is the callee-saved
+            //     function pointer the CTR loop BLRs into. Snapshot 64
+            //     instructions there and compare. On the first hit, also
+            //     log the bytes so we can decode (by eye) which base
+            //     register the round-key LDRs actually use — verifying
+            //     that x21 is the right pointer for our RK CRC.
+            let x20 = r.x[20];
+            if x20 >= 0x1_0000_0000 && x20 < 0x8_0000_0000 {
+                let mut aes_cur = [0u32; 64];
+                for i in 0..64 {
+                    aes_cur[i] = ((x20 + (i as u64) * 4) as *const u32).read_volatile();
+                }
+                let aes_ref_opt = P4_AES_FN_REF.with(|c| c.get());
+                if let Some((ref_addr, aes_ref)) = aes_ref_opt {
+                    let mut first_diff: i32 = -1;
+                    let same_addr = ref_addr == x20;
+                    if same_addr {
+                        for i in 0..64 {
+                            if aes_cur[i] != aes_ref[i] { first_diff = i as i32; break; }
+                        }
+                    }
+                    if first_diff >= 0 || !same_addr {
+                        P4_AES_FN_DIFFS.fetch_add(1, Ordering::Relaxed);
+                        let mut pbuf = [0u8; 256];
+                        let pn = if !same_addr {
+                            raw_fmt(&mut pbuf, format_args!(
+                                "fakelinux: P4_AES_FN_DIFF x20_addr_changed ref={:#x} cur={:#x}\n",
+                                ref_addr, x20))
+                        } else {
+                            let fi = first_diff as usize;
+                            raw_fmt(&mut pbuf, format_args!(
+                                "fakelinux: P4_AES_FN_DIFF addr={:#x} insn[{}]={:#010x} ref={:#010x}\n",
+                                x20 + (fi as u64) * 4, fi, aes_cur[fi], aes_ref[fi]))
+                        };
+                        libc::write(2, pbuf.as_ptr() as *const _, pn);
+                    }
+                } else {
+                    P4_AES_FN_REF.with(|c| c.set(Some((x20, aes_cur))));
+                    // First-hit log: AES_encrypt entry + first 16 insns so
+                    // we can disassemble by eye and identify the actual
+                    // round-key LDR base register.
+                    let mut pbuf = [0u8; 384];
+                    let pn = raw_fmt(&mut pbuf, format_args!(
+                        "fakelinux: P4_AES_FN_FIRST x20={:#x} insn[0..16]={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                        x20,
+                        aes_cur[0], aes_cur[1], aes_cur[2], aes_cur[3],
+                        aes_cur[4], aes_cur[5], aes_cur[6], aes_cur[7],
+                        aes_cur[8], aes_cur[9], aes_cur[10], aes_cur[11],
+                        aes_cur[12], aes_cur[13], aes_cur[14], aes_cur[15]));
+                    libc::write(2, pbuf.as_ptr() as *const _, pn);
+                }
             }
         }
     }
