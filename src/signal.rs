@@ -397,6 +397,15 @@ pub static SIG_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
 /// guest), and how many were deferred because the thread was in trap context.
 pub static FORWARDER_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static FORWARDER_DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// DIAGNOSTIC (nested-forwarder corruption hypothesis): per-thread recursion
+/// depth in signal_forwarder. Nesting occurs when a second async signal
+/// arrives while signal_forwarder is mid-execution (sa_mask is empty so
+/// signals other than the one being delivered are not blocked).
+pub static FORWARDER_NESTED: AtomicU64 = AtomicU64::new(0);
+pub static FORWARDER_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static FWD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 // Lock-free ring buffer of recent signal build/restore events (no I/O so timing
 // is not perturbed); dumped by the crash handler.
@@ -738,6 +747,33 @@ unsafe extern "C" fn signal_forwarder(
     }
 
     FORWARDER_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    // Track signal_forwarder recursion: depth==0 on entry means we are the
+    // outer (top-level) invocation; depth>=1 means a nested signal landed
+    // while another signal_forwarder was running. Pure diagnostic — does
+    // NOT change delivery behavior.
+    let depth_on_entry = FWD_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
+    if depth_on_entry > 0 {
+        FORWARDER_NESTED.fetch_add(1, Ordering::Relaxed);
+        let new_depth = (depth_on_entry + 1) as u64;
+        let mut prev = FORWARDER_MAX_DEPTH.load(Ordering::Relaxed);
+        while new_depth > prev {
+            match FORWARDER_MAX_DEPTH.compare_exchange(
+                prev, new_depth, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(x) => prev = x,
+            }
+        }
+    }
+    // RAII-ish guard via a closure-free local: we must decrement on every exit
+    // path. Use a struct with Drop.
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            FWD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    let _depth_guard = DepthGuard;
 
     // If this thread is inside the trap handler, the ucontext has the handler's
     // native registers, NOT guest registers. Defer delivery only for the

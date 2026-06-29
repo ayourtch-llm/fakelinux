@@ -901,11 +901,13 @@ pub fn dump_trap_stats() {
         crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
         crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
         crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
-    let mut b2 = [0u8; 160];
+    let mut b2 = [0u8; 224];
     let n2 = raw_fmt(&mut b2, format_args!(
-        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={}\n",
+        "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={}\n",
         pid, crate::signal::FORWARDER_CALLS.load(Ordering::Relaxed),
-        crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed)));
+        crate::signal::FORWARDER_DEFERRED.load(Ordering::Relaxed),
+        crate::signal::FORWARDER_NESTED.load(Ordering::Relaxed),
+        crate::signal::FORWARDER_MAX_DEPTH.load(Ordering::Relaxed)));
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
     // Also write to a per-pid host file (robust vs. stderr capture). Diagnostic.
@@ -1016,7 +1018,12 @@ pub unsafe fn watch_handle_fault(mctx: &mut MContext64, fault_addr: u64) -> bool
     // behalf): unprotect, log, and disarm — patching host code would be
     // fatal. CURRENT_X18_INSTR identifies the emulated guest instruction.
     let host_anchor = watch_handle_fault as usize as u64;
-    if pc.wrapping_sub(host_anchor) < 0x8000000 || host_anchor.wrapping_sub(pc) < 0x8000000 {
+    // Fakelinux's own text is ~1 MB; use ±4 MB window to safely include
+    // adjacent system-library code called directly by fakelinux without
+    // misclassifying guest mappings allocated nearby (Python mmap() returns
+    // addresses near the process's existing mappings — guest openssl can
+    // land within 10-20 MB of host text and was falsely flagged as host).
+    if pc.wrapping_sub(host_anchor) < 0x400000 || host_anchor.wrapping_sub(pc) < 0x400000 {
         let mut buf = [0u8; 224];
         let n = raw_fmt(&mut buf, format_args!(
             "fakelinux: WATCH HOST-CODE write! host_pc={:#x} fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
