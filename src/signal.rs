@@ -582,6 +582,19 @@ pub unsafe fn build_sigframe_and_redirect(
 
     sigtrace("BUILD", linux_sig as u64, guest_sp, frame_addr, regs.pc);
 
+    // Second altstack probe: sp at the deepest point of build_sigframe's work
+    // (after all the GPR + NEON save loops + siginfo + ucontext writes).
+    // signal_forwarder's entry probe captured shallow depth; this one captures
+    // the real maximum stack consumption inside the forwarded round-trip.
+    {
+        let sp_now: u64;
+        unsafe { std::arch::asm!("mov {}, sp", out(reg) sp_now, options(nomem, nostack, preserves_flags)); }
+        let prev = crate::trap::ALTSTACK_MIN_SP.load(Ordering::Relaxed);
+        if sp_now < prev {
+            crate::trap::ALTSTACK_MIN_SP.store(sp_now, Ordering::Relaxed);
+        }
+    }
+
     // DIAGNOSTIC (gated by FAKELINUX_SIGTRACE): snapshot the openssl AES-GCM
     // keystream buffer at [x27+16..+32] iff x27 looks like an openssl-decryptor
     // heap pointer (0x700000000+ range = Python ET_EXEC brk). do_rt_sigreturn
@@ -887,6 +900,21 @@ unsafe extern "C" fn signal_forwarder(
     }
 
     FORWARDER_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    // Altstack depth probe: record current sp (we are running on the alt
+    // signal stack since install_forwarder sets SA_ONSTACK). Update the
+    // process-wide minimum. If min ever falls below ALTSTACK_LO, signal
+    // handler stack consumption has overflowed the altstack — which would
+    // stomp the kernel-saved mctx region the kernel placed at high addrs
+    // of the same altstack. Zero-cost: just a load of current sp + atomic.
+    {
+        let sp_now: u64;
+        std::arch::asm!("mov {}, sp", out(reg) sp_now, options(nomem, nostack, preserves_flags));
+        let prev = crate::trap::ALTSTACK_MIN_SP.load(Ordering::Relaxed);
+        if sp_now < prev {
+            crate::trap::ALTSTACK_MIN_SP.store(sp_now, Ordering::Relaxed);
+        }
+    }
 
     // Track signal_forwarder recursion: depth==0 on entry means we are the
     // outer (top-level) invocation; depth>=1 means a nested signal landed

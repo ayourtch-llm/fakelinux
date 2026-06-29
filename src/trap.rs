@@ -855,6 +855,15 @@ static REG_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static REG_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static REG_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
 
+/// Altstack bounds captured at sigaltstack install. Used by the depth probe
+/// in signal_forwarder to compute how close handler-stack consumption is
+/// getting to the altstack boundary. ss_lo = ss_sp (low addr); ss_hi = lo+size.
+pub static ALTSTACK_LO: AtomicU64 = AtomicU64::new(0);
+pub static ALTSTACK_HI: AtomicU64 = AtomicU64::new(0);
+/// Minimum sp ever observed at signal_forwarder entry (= maximum stack
+/// depth used by Rust signal-handler code before our own usage adds more).
+pub static ALTSTACK_MIN_SP: AtomicU64 = AtomicU64::new(u64::MAX);
+
 #[derive(Copy, Clone)]
 struct RegSnapshot { x: [u64; 29], fp: u64, sp: u64, entry_pc: u64, x8: u64 }
 
@@ -1077,6 +1086,21 @@ pub fn dump_trap_stats() {
         crate::x18_trampoline::EMIT_GPR_COUNT.load(Ordering::Relaxed),
         crate::signal::SIG_IN_ISLAND.load(Ordering::Relaxed),
         crate::signal::SIG_IN_WINDOW.load(Ordering::Relaxed)));
+    // Altstack consumption: ALTSTACK_HI = top of stack (sp starts here);
+    // ALTSTACK_LO = bottom; ALTSTACK_MIN_SP = deepest sp seen at
+    // signal_forwarder entry. Bytes used = hi - min_sp; bytes free below
+    // signal_forwarder = min_sp - lo (negative = overflowed).
+    let as_lo = ALTSTACK_LO.load(Ordering::Relaxed);
+    let as_hi = ALTSTACK_HI.load(Ordering::Relaxed);
+    let as_min = ALTSTACK_MIN_SP.load(Ordering::Relaxed);
+    let used = if as_hi > 0 && as_min != u64::MAX { as_hi.saturating_sub(as_min) } else { 0 };
+    let free = if as_min != u64::MAX { (as_min as i64) - (as_lo as i64) } else { 0 };
+    let mut b3 = [0u8; 224];
+    let n3 = raw_fmt(&mut b3, format_args!(
+        "fakelinux: [{}] ALTSTACK lo={:#x} hi={:#x} min_sp={:#x} used={} free_below={}\n",
+        pid, as_lo, as_hi, as_min, used, free));
+    unsafe { libc::write(2, b3.as_ptr() as *const _, n3); }
+
     let mut b2 = [0u8; 448];
     let n2 = raw_fmt(&mut b2, format_args!(
         "fakelinux: [{}] TRAP_STATS2 fwd_calls={} fwd_deferred={} fwd_nested={} fwd_max_depth={} ks_checked={} ks_stomps={} reg_checked={} reg_hits={} fwd_reg_checked={} fwd_reg_mismatches={}\n",
@@ -2936,8 +2960,15 @@ pub fn install_handler() {
     // handler must never touch std::env (env-lock self-deadlock).
     init_trace_flags();
     unsafe {
-        // Allocate a signal-handler stack
-        let stack_size: usize = 128 * 1024;
+        // Allocate a signal-handler stack. Default 128 KB; FAKELINUX_BIG_ALTSTACK=1
+        // bumps to 1.28 MB (10× factor) for the A/B test of whether altstack
+        // overflow by signal_forwarder + Rust deep stack is corrupting the
+        // kernel-saved mctx region.
+        let stack_size: usize = if std::env::var_os("FAKELINUX_BIG_ALTSTACK").is_some() {
+            1280 * 1024
+        } else {
+            128 * 1024
+        };
         let stack = libc::mmap(
             std::ptr::null_mut(),
             stack_size,
@@ -2957,6 +2988,14 @@ pub fn install_handler() {
         if libc::sigaltstack(&ss, std::ptr::null_mut()) != 0 {
             panic!("sigaltstack failed");
         }
+        let lo = stack as u64;
+        let hi = lo + stack_size as u64;
+        ALTSTACK_LO.store(lo, Ordering::Relaxed);
+        ALTSTACK_HI.store(hi, Ordering::Relaxed);
+        let mut buf = [0u8; 160];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: altstack {:#x}-{:#x} size={}\n", lo, hi, stack_size));
+        libc::write(2, buf.as_ptr() as *const _, n);
 
         // Install SIGILL handler FIRST (before unblocking — if SIGILL is
         // pending, unblocking would fire it with SIG_DFL=terminate!)
