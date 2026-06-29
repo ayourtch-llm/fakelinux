@@ -829,6 +829,14 @@ pub static WATCH_MMAP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_OFF: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_PAGE: AtomicU64 = AtomicU64::new(0);
+// Exact fakelinux image bounds, captured once at init via dladdr() on a known
+// fakelinux function. Replaces the ±N MB host_anchor heuristic in
+// watch_handle_fault: ±4 MB was tightened from ±128 MB but still caught guest
+// libraries that ASLR happened to load within 4 MB of fakelinux's text,
+// causing false-positive disarms. With exact bounds we only classify writers
+// in fakelinux's actual Mach-O __TEXT segment as host code.
+static FL_TEXT_START: AtomicU64 = AtomicU64::new(0);
+static FL_TEXT_END: AtomicU64 = AtomicU64::new(0);
 // FAKELINUX_WATCH_X27=1: single-shot mode. On the first signal_forwarder
 // call where x27 is in the Python ET_EXEC heap range, capture x27+16 and
 // arm WATCH on that page. Catches the keystream-buffer stomper regardless
@@ -866,6 +874,16 @@ pub fn watch_record_fault(pc: u64, off_in_page: u64) {
 }
 
 pub fn watch_dump_pc_histogram() {
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const libc::c_char,
+        dli_fbase: *mut libc::c_void,
+        dli_sname: *const libc::c_char,
+        dli_saddr: *mut libc::c_void,
+    }
+    extern "C" {
+        fn dladdr(addr: *const libc::c_void, info: *mut DlInfo) -> i32;
+    }
     let mut any = false;
     for i in 0..WATCH_PC_SLOTS {
         let pc = WATCH_PC_KEY[i].load(Ordering::Relaxed);
@@ -878,11 +896,29 @@ pub fn watch_dump_pc_histogram() {
         }
         let off = WATCH_PC_OFF[i].load(Ordering::Relaxed);
         let instr = unsafe { (pc as *const u32).read_volatile() };
-        let mut buf = [0u8; 160];
+        // Resolve via dladdr — identifies the owning dylib + nearest symbol.
+        let mut info: DlInfo = unsafe { std::mem::zeroed() };
+        let ok = unsafe { dladdr(pc as *const _, &mut info as *mut _) };
+        let (fname_p, sname_p, fbase, saddr) = if ok != 0 {
+            let fp = if info.dli_fname.is_null() { b"?\0".as_ptr() as *const i8 } else { info.dli_fname };
+            let sp = if info.dli_sname.is_null() { b"?\0".as_ptr() as *const i8 } else { info.dli_sname };
+            (fp, sp, info.dli_fbase as u64, info.dli_saddr as u64)
+        } else {
+            (b"?\0".as_ptr() as *const i8, b"?\0".as_ptr() as *const i8, 0u64, 0u64)
+        };
+        let fname_len = unsafe { libc::strlen(fname_p) };
+        let sname_len = unsafe { libc::strlen(sname_p) };
+        let mut buf = [0u8; 224];
         let n = raw_fmt(&mut buf, format_args!(
-            "  pc={:#x} instr={:#010x} count={} last_off={:#x}\n",
-            pc, instr, cnt, off));
-        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+            "  pc={:#x} instr={:#010x} count={} last_off={:#x} fbase={:#x} pc-saddr={:#x} ",
+            pc, instr, cnt, off, fbase, pc.wrapping_sub(saddr)));
+        unsafe {
+            libc::write(2, buf.as_ptr() as *const _, n);
+            libc::write(2, fname_p as *const _, fname_len);
+            libc::write(2, b" sym=".as_ptr() as *const _, 5);
+            libc::write(2, sname_p as *const _, sname_len);
+            libc::write(2, b"\n".as_ptr() as *const _, 1);
+        }
     }
 }
 static WATCH_STEP_PC: AtomicU64 = AtomicU64::new(0);
@@ -1023,6 +1059,7 @@ pub fn init_trace_flags() {
     WATCH_X27_PENDING.store(
         std::env::var_os("FAKELINUX_WATCH_X27").is_some(), Ordering::Relaxed);
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
+    init_fl_text_bounds();
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
         let parts: Vec<&str> = spec.split(':').collect();
         if parts.len() == 3 {
@@ -1036,6 +1073,63 @@ pub fn init_trace_flags() {
                 WATCH_OFF.store(off, Ordering::Relaxed);
                 eprintln!("fakelinux: WATCH armed-pending: seq={} len={:#x} off={:#x}", seq, len, off);
             }
+        }
+    }
+}
+
+/// Capture the runtime address range of fakelinux's own __TEXT segment by
+/// walking its Mach-O header found via dladdr() on a known fakelinux function.
+/// Replaces the ±N MB host_anchor heuristic in watch_handle_fault.
+fn init_fl_text_bounds() {
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const libc::c_char,
+        dli_fbase: *mut libc::c_void,
+        dli_sname: *const libc::c_char,
+        dli_saddr: *mut libc::c_void,
+    }
+    extern "C" {
+        fn dladdr(addr: *const libc::c_void, info: *mut DlInfo) -> i32;
+    }
+    // Mach-O 64-bit header + segment_command_64 fragments we need.
+    #[repr(C)]
+    struct MachHeader64 { magic: u32, cputype: u32, cpusubtype: u32, filetype: u32,
+        ncmds: u32, sizeofcmds: u32, flags: u32, reserved: u32 }
+    #[repr(C)]
+    struct LoadCommand { cmd: u32, cmdsize: u32 }
+    #[repr(C)]
+    struct SegmentCommand64 { cmd: u32, cmdsize: u32, segname: [u8; 16],
+        vmaddr: u64, vmsize: u64, fileoff: u64, filesize: u64,
+        maxprot: u32, initprot: u32, nsects: u32, flags: u32 }
+    const LC_SEGMENT_64: u32 = 0x19;
+    unsafe {
+        let mut info: DlInfo = std::mem::zeroed();
+        let probe = watch_arm_addr as *const libc::c_void;
+        if dladdr(probe, &mut info) == 0 || info.dli_fbase.is_null() { return; }
+        let fbase = info.dli_fbase as u64;
+        let hdr = &*(fbase as *const MachHeader64);
+        // Slide: vmaddr is link-time __TEXT base (typically 0x100000000), fbase
+        // is runtime base. slide = fbase - __TEXT.vmaddr.
+        let mut cur = fbase + std::mem::size_of::<MachHeader64>() as u64;
+        for _ in 0..hdr.ncmds {
+            let lc = &*(cur as *const LoadCommand);
+            if lc.cmd == LC_SEGMENT_64 {
+                let seg = &*(cur as *const SegmentCommand64);
+                if &seg.segname[..6] == b"__TEXT" {
+                    let slide = fbase.wrapping_sub(seg.vmaddr);
+                    let start = seg.vmaddr.wrapping_add(slide);
+                    let end = start + seg.vmsize;
+                    FL_TEXT_START.store(start, Ordering::Relaxed);
+                    FL_TEXT_END.store(end, Ordering::Relaxed);
+                    let mut buf = [0u8; 128];
+                    let n = raw_fmt(&mut buf, format_args!(
+                        "fakelinux: __TEXT bounds {:#x}-{:#x} (slide={:#x})\n",
+                        start, end, slide));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                    return;
+                }
+            }
+            cur += lc.cmdsize as u64;
         }
     }
 }
@@ -1094,23 +1188,19 @@ pub unsafe fn watch_handle_fault(mctx: &mut MContext64, fault_addr: u64) -> bool
     // fakelinux-internal stomper (x18 emul / syscall handler writing on the
     // guest's behalf) shows up in the histogram even if it disarms WATCH.
     watch_record_fault(pc, fault_addr - page);
-    // Host-code store (e.g. our own emulation writing on the guest's
-    // behalf): unprotect, log, and disarm — patching host code would be
-    // fatal. CURRENT_X18_INSTR identifies the emulated guest instruction.
-    let host_anchor = watch_handle_fault as usize as u64;
-    // Fakelinux's own text is ~1 MB; use ±4 MB window to safely include
-    // adjacent system-library code called directly by fakelinux without
-    // misclassifying guest mappings allocated nearby (Python mmap() returns
-    // addresses near the process's existing mappings — guest openssl can
-    // land within 10-20 MB of host text and was falsely flagged as host).
-    if pc.wrapping_sub(host_anchor) < 0x400000 || host_anchor.wrapping_sub(pc) < 0x400000 {
-        let delta = pc.wrapping_sub(host_anchor) as i64;
-        let nm_off = 0x1000183F4u64; // watch_handle_fault file/link addr
-        let file_addr = (nm_off as i64 + delta) as u64;
-        let mut buf = [0u8; 320];
+    // Host-code store: unprotect, log, and disarm. Patching host code is
+    // fatal. Classification uses the EXACT fakelinux Mach-O __TEXT range
+    // captured at init via dladdr+mach-o walk (init_fl_text_bounds), NOT
+    // a ±N MB heuristic around watch_handle_fault — that previously caught
+    // guest mappings (Python C extensions, openssl) that ASLR loaded
+    // within the window, producing spurious disarms (see plan §A.4.11).
+    let fl_lo = FL_TEXT_START.load(Ordering::Relaxed);
+    let fl_hi = FL_TEXT_END.load(Ordering::Relaxed);
+    if fl_lo != 0 && pc >= fl_lo && pc < fl_hi {
+        let mut buf = [0u8; 224];
         let n = raw_fmt(&mut buf, format_args!(
-            "fakelinux: WATCH HOST-CODE write! host_pc={:#x} (file_addr~{:#x}, whf+{:#x}) fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
-            pc, file_addr, delta, fault_addr, CURRENT_X18_INSTR, CURRENT_X18_PC));
+            "fakelinux: WATCH HOST-CODE write! host_pc={:#x} fakelinux_off={:#x} fault={:#x} emul_instr={:#010x} emul_pc={:#x} — disarming\n",
+            pc, pc - fl_lo, fault_addr, CURRENT_X18_INSTR, CURRENT_X18_PC));
         libc::write(2, buf.as_ptr() as *const _, n);
         libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
         WATCH_PAGE.store(0, Ordering::Relaxed);
