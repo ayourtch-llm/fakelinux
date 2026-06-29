@@ -111,6 +111,11 @@ Verified with the **generic fix alone** (signature guard compiled out):
 sha256/sha1/md5 correct; `tests/smoke/apt-get-update.sh` PASS; warm patch-cache
 (v3) run → 0 mismatches.
 
+GCM fix preserved on the **live VPP datapath** too: `make test-debug
+TEST=test_ipsec_esp` → 72/72 OK / 0 FAIL / 0 ERROR at stop (all AES-GCM
+128/192/256 NONE classes among them passing), confirming criterion 2 beyond the
+standalone repro.
+
 **Hypothesis #2 held** (modulo the libapt-pkg→libgcrypt correction); the deeper
 fix is the precise/function-aware code-range extraction.
 
