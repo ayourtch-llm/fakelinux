@@ -87,17 +87,32 @@ section-mode file path `f9f2f60` introduced.
 
 ## Fix
 
-`src/loader.rs`: added `find_crypto_const_tables(start, len)` — detects SHA-256
-(64×u32) and SHA-512 (80×u64) K-tables by their leading-constant signature and
-returns their byte ranges; `patch_new_code_with_ranges` now adds those ranges
-to the `literal_pools` exclusion so the x18 patcher skips them. Surgical,
-matches only exact crypto-constant signatures, never excludes real code.
+Two commits in `src/loader.rs`:
 
-Verification: `apt-get update` → 0 `Hash Sum mismatch` (19/19 indexes fetched
-& verified); `gcm_evp_fixed 8000 1970 200` → `bad=0`; standalone
-sha256/sha1/md5 correct; `tests/smoke/apt-get-update.sh` PASS.
+1. **Workaround (`a79bfb7`):** `find_crypto_const_tables()` detects SHA-256
+   (64×u32) / SHA-512 (80×u64) K-tables by their leading-constant signature and
+   adds them to the `literal_pools` exclusion. Surgical but per-algorithm.
 
-**Hypothesis #2 held** (modulo the libapt-pkg→libgcrypt correction).
+2. **Generic fix:** `extract_code_ranges_from_file_precise()` gives the
+   file-mapping patch path the same function-level precision the in-memory path
+   already had — code ranges = union of `.eh_frame` FDE ranges and
+   `.dynsym`/`.symtab` `STT_FUNC` symbol ranges (read from the backing file,
+   translated into the mapping's address space). `patch_new_code_file` now tries
+   precise → whole-section → in-memory. Any inter-function data table is
+   excluded generically, no signatures. Measured on libgcrypt: FDE∪symbol covers
+   1470/1494 x18-flagged words; the 24 dropped are all data (K-tables / vector
+   constants), zero real instructions. The signature guard from (1) is kept only
+   as a backstop for the whole-section fallback (fully-stripped, no-CFI objects).
+   `PATCH_CACHE_VERSION` bumped 2→3.
+
+Verified with the **generic fix alone** (signature guard compiled out):
+`apt-get update` → 0 `Hash Sum mismatch` (19/19 indexes). With everything in:
+`gcm_evp_fixed 8000 1970 200` → `bad=0` (GCM preserved); standalone
+sha256/sha1/md5 correct; `tests/smoke/apt-get-update.sh` PASS; warm patch-cache
+(v3) run → 0 mismatches.
+
+**Hypothesis #2 held** (modulo the libapt-pkg→libgcrypt correction); the deeper
+fix is the precise/function-aware code-range extraction.
 
 ## Grading rubric (preliminary)
 

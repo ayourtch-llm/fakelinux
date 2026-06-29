@@ -689,7 +689,7 @@ fn rewrite_svc_instructions(start: u64, size: u64, code_ranges: &[(u64, u64)]) {
 // deadlock note in trap.rs above init_trace_flags).
 
 const PATCH_CACHE_MAGIC: u32 = 0x434C_5046; // "FPLC"
-const PATCH_CACHE_VERSION: u32 = 2;
+const PATCH_CACHE_VERSION: u32 = 3;
 
 static PATCH_CACHE_DIR: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static NO_X18_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -908,7 +908,11 @@ pub fn patch_new_code_file(start: u64, len: u64, fd: i32, offset: u64) {
     if try_patch_from_cache(start, len, fd, offset) {
         return;
     }
-    let code_ranges = extract_code_ranges_from_file_mapping(fd, start, len, offset)
+    // Prefer function-level precision (FDE ∪ symbol ranges) so inter-function
+    // data tables in .text are not patched; fall back to whole-section ranges,
+    // then to the in-memory extractor.
+    let code_ranges = extract_code_ranges_from_file_precise(fd, start, len, offset)
+        .or_else(|| extract_code_ranges_from_file_mapping(fd, start, len, offset))
         .unwrap_or_else(|| extract_code_ranges_from_memory(start, len));
     let sites = patch_new_code_with_ranges(start, len, code_ranges);
     if let Some(path) = patch_cache_path(fd, offset, len) {
@@ -946,13 +950,13 @@ fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>
     let skip_x18 = NO_X18_RUNTIME.load(std::sync::atomic::Ordering::Relaxed);
     // Find embedded literal pools to exclude from x18 patching.
     let mut literal_pools = find_literal_pools(start, len);
-    // Also exclude well-known crypto round-constant tables (SHA-256/SHA-512).
-    // These live in .text in hand-written aarch64 crypto asm (e.g. libgcrypt's
-    // ARMv8-CE SHA transform), are NOT covered by any .eh_frame FDE, and several
-    // of their constants decode as x18-referencing instructions. The eh_frame
-    // code-range strategy excludes them, but the section-header/file-mapping
-    // strategy (used for DSOs mapped past their ELF header) does not — so we must
-    // detect them explicitly or the patcher corrupts the table (wrong hashes).
+    // Backstop: explicitly exclude well-known crypto round-constant tables
+    // (SHA-256/SHA-512). These live in .text in hand-written aarch64 crypto asm
+    // (e.g. libgcrypt's ARMv8-CE SHA transform), carry no .eh_frame FDE, and
+    // several of their constants decode as x18-referencing instructions. The
+    // function-level extractors (eh_frame FDE ∪ symbols) already exclude them,
+    // so this only matters on the whole-section fallback path used for a fully
+    // stripped, no-CFI object — there it prevents corrupting the table.
     literal_pools.extend(find_crypto_const_tables(start, len));
     for i in 0..count as usize {
         unsafe {
@@ -1103,6 +1107,187 @@ fn extract_code_ranges_from_file_mapping(
         None
     } else {
         Some(ranges)
+    }
+}
+
+/// Function-level code ranges for a file-backed mapping, read from the backing
+/// ELF file: the union of `.eh_frame` FDE ranges and `.dynsym`/`.symtab`
+/// `STT_FUNC` symbol ranges, translated into this mapping's address space.
+///
+/// WHY: `extract_code_ranges_from_file_mapping` (above) returns whole
+/// `SHF_EXECINSTR` *sections* — the entire `.text` as one blob. That includes
+/// inter-function data (constant tables, jump tables) whose words can decode as
+/// x18-referencing instructions, so the patcher corrupts them (see the
+/// libgcrypt SHA-256 K-table bug). The in-memory extractor avoids this with
+/// `.eh_frame` FDE function ranges; this gives the file-mapping path the same
+/// precision. Measured on libgcrypt: FDE∪symbol covers 1470/1494 x18-flagged
+/// words and the 24 it drops are ALL data (K-tables / vector constants) — no
+/// real instruction is lost.
+///
+/// Returns `None` (caller falls back to section mode) when the file carries no
+/// FDE *and* no function symbols, so fully-stripped no-CFI objects keep the
+/// previous broad behaviour rather than going unpatched.
+fn extract_code_ranges_from_file_precise(
+    fd: i32,
+    map_start: u64,
+    map_len: u64,
+    map_file_off: u64,
+) -> Option<Vec<(u64, u64)>> {
+    fn pread_exact(fd: i32, off: u64, buf: &mut [u8]) -> bool {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    buf[done..].as_mut_ptr() as *mut _,
+                    buf.len() - done,
+                    off as i64 + done as i64,
+                )
+            };
+            if n <= 0 {
+                return false;
+            }
+            done += n as usize;
+        }
+        true
+    }
+
+    let mut eh = [0u8; 64];
+    if !pread_exact(fd, 0, &mut eh) {
+        return None;
+    }
+    if &eh[0..4] != b"\x7fELF" || eh[4] != 2 /* ELFCLASS64 */ || eh[5] != 1 /* LSB */ {
+        return None;
+    }
+
+    // Program headers: find the first PT_LOAD's vaddr (the unwinder's base) and
+    // the PT_LOAD that backs this mapping (to translate vaddr → mapped address).
+    let e_phoff = elf::read_u64_pub(&eh, 32);
+    let e_phentsize = elf::read_u16_pub(&eh, 54) as usize;
+    let e_phnum = elf::read_u16_pub(&eh, 56) as usize;
+    if e_phoff == 0 || e_phnum == 0 || e_phentsize < 56 {
+        return None;
+    }
+    let ph_len = e_phentsize.checked_mul(e_phnum)?;
+    if ph_len > 1024 * 1024 {
+        return None;
+    }
+    let mut phbuf = vec![0u8; ph_len];
+    if !pread_exact(fd, e_phoff, &mut phbuf) {
+        return None;
+    }
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut seg: Option<(u64, u64)> = None; // (p_offset, p_vaddr) backing map_file_off
+    for i in 0..e_phnum {
+        let o = i * e_phentsize;
+        if o + 56 > phbuf.len() {
+            break;
+        }
+        if elf::read_u32_pub(&phbuf, o) != 1 {
+            continue; // PT_LOAD only
+        }
+        let p_offset = elf::read_u64_pub(&phbuf, o + 8);
+        let p_vaddr = elf::read_u64_pub(&phbuf, o + 16);
+        let p_filesz = elf::read_u64_pub(&phbuf, o + 32);
+        if first_load_vaddr.is_none() {
+            first_load_vaddr = Some(p_vaddr);
+        }
+        if p_offset <= map_file_off && map_file_off < p_offset + p_filesz {
+            // Prefer the closest-fitting (largest p_offset) segment.
+            if seg.map_or(true, |(so, _)| p_offset >= so) {
+                seg = Some((p_offset, p_vaddr));
+            }
+        }
+    }
+    let first_load_vaddr = first_load_vaddr?;
+    let (seg_off, seg_vaddr) = seg?;
+
+    // memory(vaddr) = vaddr + load_base, derived from the backing segment's
+    // file↔mem mapping: memory(fo) = map_start + (fo - map_file_off) and
+    // fo = p_offset + (vaddr - p_vaddr).
+    let load_base = map_start
+        .wrapping_add(seg_off)
+        .wrapping_sub(seg_vaddr)
+        .wrapping_sub(map_file_off);
+    // find_code_ranges_from_eh_frame() internally does (base_addr - first_load_vaddr).
+    let base_addr = first_load_vaddr.wrapping_add(load_base);
+
+    // Read the whole backing file (capped) so the FDE/section parsers can reach
+    // headers, shstrtab, .eh_frame and the symbol tables wherever they live.
+    let fsize = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return None;
+        }
+        st.st_size as u64
+    };
+    if fsize < 64 || fsize > 256 * 1024 * 1024 {
+        return None;
+    }
+    let mut filebuf = vec![0u8; fsize as usize];
+    if !pread_exact(fd, 0, &mut filebuf) {
+        return None;
+    }
+
+    // FDE function ranges (returned already in mapped-address space).
+    let mut ranges = elf::find_code_ranges_from_eh_frame(&filebuf, base_addr);
+
+    // Add STT_FUNC ranges from .dynsym (SHT_DYNSYM=11) and .symtab (SHT_SYMTAB=2).
+    let e_shoff = elf::read_u64_pub(&filebuf, 40) as usize;
+    let e_shentsize = elf::read_u16_pub(&filebuf, 58) as usize;
+    let e_shnum = elf::read_u16_pub(&filebuf, 60) as usize;
+    if e_shoff != 0
+        && e_shentsize >= 64
+        && e_shnum != 0
+        && e_shoff.saturating_add(e_shentsize * e_shnum) <= filebuf.len()
+    {
+        for i in 0..e_shnum {
+            let o = e_shoff + i * e_shentsize;
+            let sh_type = elf::read_u32_pub(&filebuf, o + 4);
+            if sh_type != 11 && sh_type != 2 {
+                continue;
+            }
+            let sh_offset = elf::read_u64_pub(&filebuf, o + 24) as usize;
+            let sh_size = elf::read_u64_pub(&filebuf, o + 32) as usize;
+            let sh_entsize = elf::read_u64_pub(&filebuf, o + 56) as usize;
+            if sh_entsize < 24 || sh_size == 0 || sh_offset.saturating_add(sh_size) > filebuf.len() {
+                continue;
+            }
+            let mut s = sh_offset;
+            while s + 24 <= sh_offset + sh_size {
+                let st_info = filebuf[s + 4];
+                if st_info & 0xf == 2 {
+                    // STT_FUNC
+                    let st_value = elf::read_u64_pub(&filebuf, s + 8);
+                    let st_size = elf::read_u64_pub(&filebuf, s + 16);
+                    if st_value != 0 && st_size != 0 {
+                        ranges.push((st_value.wrapping_add(load_base), st_size));
+                    }
+                }
+                s += sh_entsize;
+            }
+        }
+    }
+
+    if ranges.is_empty() {
+        return None;
+    }
+
+    // Clip to this mapping (FDE/symbol ranges may cover other segments).
+    let map_end = map_start.saturating_add(map_len);
+    let mut clipped = Vec::with_capacity(ranges.len());
+    for (rs, rl) in ranges {
+        let re = rs.saturating_add(rl);
+        let cs = rs.max(map_start);
+        let ce = re.min(map_end);
+        if cs < ce {
+            clipped.push((cs, ce - cs));
+        }
+    }
+    if clipped.is_empty() {
+        None
+    } else {
+        Some(clipped)
     }
 }
 
