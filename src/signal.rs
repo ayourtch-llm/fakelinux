@@ -461,7 +461,7 @@ pub static RK_PROBE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 #[derive(Copy, Clone)]
 struct FwdRegSnap {
     x: [u64; 29], fp: u64, lr: u64, sp: u64, pc: u64,
-    cpsr: u32, tpidr: u64, frame: u64,
+    cpsr: u32, tpidr: u64, fpsr: u32, fpcr: u32, frame: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -662,6 +662,8 @@ pub unsafe fn build_sigframe_and_redirect(
             x: [0; 29], fp: regs.fp, lr: regs.lr, sp: regs.sp, pc: regs.pc,
             cpsr: regs.cpsr,
             tpidr: crate::trap::get_thread_tpidr(),
+            fpsr: mctx.ns.fpsr,
+            fpcr: mctx.ns.fpcr,
             frame: frame_addr,
         };
         // Snapshot exactly what build_sigframe just wrote into the frame's
@@ -858,6 +860,29 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
                     let n = crate::trap::raw_fmt(&mut buf, format_args!(
                         "fakelinux: FWD_REG_DIVERGE frame={:#x} cpsr: entry={:#x} exit={:#x} (delta={:#x})\n",
                         frame_addr, snap.cpsr, regs.cpsr, regs.cpsr ^ snap.cpsr));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
+                // FPSR + FPCR: closes the last state-asymmetry — build_sigframe
+                // copies mctx.ns.v[] into the frame but does NOT touch
+                // mctx.ns.fpsr/fpcr; do_rt_sigreturn likewise restores v[]
+                // but not fpsr/fpcr. macOS captures fpsr/fpcr into mctx.ns
+                // automatically; this checks whether those values cross the
+                // round-trip intact regardless of fakelinux not explicitly
+                // touching them.
+                if snap.fpsr != mctx.ns.fpsr {
+                    any = true;
+                    let mut buf = [0u8; 256];
+                    let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                        "fakelinux: FWD_REG_DIVERGE frame={:#x} fpsr: entry={:#x} exit={:#x} (delta={:#x})\n",
+                        frame_addr, snap.fpsr, mctx.ns.fpsr, mctx.ns.fpsr ^ snap.fpsr));
+                    libc::write(2, buf.as_ptr() as *const _, n);
+                }
+                if snap.fpcr != mctx.ns.fpcr {
+                    any = true;
+                    let mut buf = [0u8; 256];
+                    let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                        "fakelinux: FWD_REG_DIVERGE frame={:#x} fpcr: entry={:#x} exit={:#x} (delta={:#x})\n",
+                        frame_addr, snap.fpcr, mctx.ns.fpcr, mctx.ns.fpcr ^ snap.fpcr));
                     libc::write(2, buf.as_ptr() as *const _, n);
                 }
                 if any { FWD_REG_MISMATCHES.fetch_add(1, Ordering::Relaxed); }
