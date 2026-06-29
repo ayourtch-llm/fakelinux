@@ -1,0 +1,196 @@
+diff --git a/src/loader.rs b/src/loader.rs
+index a9a8df2..4d2ba5a 100644
+--- a/src/loader.rs
++++ b/src/loader.rs
+@@ -856,14 +856,19 @@ fn try_patch_from_cache(start: u64, len: u64, fd: i32, offset: u64) -> bool {
+ /// patch_new_code for file-backed mappings: consult the persistent patch-site
+ /// cache first; on miss run the full scan and record the sites it patched.
+ pub fn patch_new_code_file(start: u64, len: u64, fd: i32, offset: u64) {
+-    if try_patch_from_cache(start, len, fd, offset) {
++    // EXPERIMENT: under FAKELINUX_FORCE_PHDR_RANGES bypass the cache entirely so
++    // the program-header range path actually runs and we don't pollute the cache.
++    let force_phdr = std::env::var_os("FAKELINUX_FORCE_PHDR_RANGES").is_some();
++    if !force_phdr && try_patch_from_cache(start, len, fd, offset) {
+         return;
+     }
+     let code_ranges = extract_code_ranges_from_file_mapping(fd, start, len, offset)
+         .unwrap_or_else(|| extract_code_ranges_from_memory(start, len));
+     let sites = patch_new_code_with_ranges(start, len, code_ranges);
+-    if let Some(path) = patch_cache_path(fd, offset, len) {
+-        write_file_raw_atomic(&path, &encode_patch_cache(&sites));
++    if !force_phdr {
++        if let Some(path) = patch_cache_path(fd, offset, len) {
++            write_file_raw_atomic(&path, &encode_patch_cache(&sites));
++        }
+     }
+ }
+ 
+@@ -952,13 +957,20 @@ fn patch_new_code_with_ranges(start: u64, len: u64, code_ranges: Vec<(u64, u64)>
+     sites
+ }
+ 
+-/// Extract executable section ranges for a runtime file-backed mapping.
++/// Extract executable code ranges for a runtime file-backed mapping.
+ ///
+ /// Dynamic-linker mappings often start at an executable PT_LOAD offset, not at
+ /// the ELF header. The in-memory extractor therefore sees non-ELF bytes and
+ /// returns no ranges, which caused x18 patching to be skipped for DSOs such as
+-/// cryptography's bundled `_rust.abi3.so`. Use section file offsets from the
+-/// backing ELF to project SHF_EXECINSTR ranges into this mapping.
++/// cryptography's bundled `_rust.abi3.so`. Read the backing ELF file directly:
++///  1. SHF_EXECINSTR section ranges (precise — excludes .rodata/.eh_frame).
++///  2. Fallback for STRIPPED DSOs (no usable section headers): PF_X PT_LOAD
++///     program-header segments (program headers survive `strip`). On modern
++///     toolchains .rodata lives in a separate read-only PT_LOAD, so the
++///     executable segment is essentially .text/.plt.
++/// (EXPERIMENT, currently in the working tree for adversarial review: the
++/// FAKELINUX_FORCE_PHDR_RANGES gate below forces strategy 2 for ALL DSOs to
++/// evaluate a single-codepath design.)
+ fn extract_code_ranges_from_file_mapping(
+     fd: i32,
+     map_start: u64,
+@@ -998,55 +1010,103 @@ fn extract_code_ranges_from_file_mapping(
+         return None;
+     }
+ 
++    let map_file_end = map_file_off.checked_add(map_len)?;
++
++    // Project a file byte-range [f_off, f_off+f_size) onto this mapping window,
++    // pushing the overlapping portion (in mapped addresses) onto `ranges`.
++    let project = |ranges: &mut Vec<(u64, u64)>, f_off: u64, f_size: u64| {
++        if f_size == 0 {
++            return;
++        }
++        let f_end = match f_off.checked_add(f_size) {
++            Some(v) => v,
++            None => return,
++        };
++        let lo = f_off.max(map_file_off);
++        let hi = f_end.min(map_file_end);
++        if lo < hi {
++            ranges.push((map_start + (lo - map_file_off), hi - lo));
++        }
++    };
++
++    // EXPERIMENT (FAKELINUX_FORCE_PHDR_RANGES): skip the precise section strategy
++    // and use only the PF_X PT_LOAD program-header strategy for ALL DSOs, to
++    // evaluate whether a single program-header codepath is sufficient.
++    let force_phdr = std::env::var_os("FAKELINUX_FORCE_PHDR_RANGES").is_some();
++
++    // Strategy 1 (precise): SHF_EXECINSTR section ranges from the backing file.
+     let e_shoff = elf::read_u64_pub(&eh, 40);
+     let e_shentsize = elf::read_u16_pub(&eh, 58) as usize;
+     let e_shnum = elf::read_u16_pub(&eh, 60) as usize;
+-    if e_shoff == 0 || e_shentsize < 64 || e_shnum == 0 {
+-        return None;
+-    }
+-    let table_len = e_shentsize.checked_mul(e_shnum)?;
+-    if table_len > 16 * 1024 * 1024 {
+-        return None;
+-    }
+-
+-    let mut shdrs = vec![0u8; table_len];
+-    if !pread_exact(fd, e_shoff, &mut shdrs) {
+-        return None;
++    if !force_phdr && e_shoff != 0 && e_shentsize >= 64 && e_shnum != 0 {
++        if let Some(table_len) = e_shentsize.checked_mul(e_shnum) {
++            if table_len <= 16 * 1024 * 1024 {
++                let mut shdrs = vec![0u8; table_len];
++                if pread_exact(fd, e_shoff, &mut shdrs) {
++                    let mut ranges = Vec::new();
++                    for i in 0..e_shnum {
++                        let off = i * e_shentsize;
++                        if off + 64 > shdrs.len() {
++                            break;
++                        }
++                        // SHT_PROGBITS + SHF_EXECINSTR = real on-file code (skip
++                        // NOBITS / non-code sections), matching the in-memory extractor.
++                        let sh_type = elf::read_u32_pub(&shdrs, off + 4);
++                        let sh_flags = elf::read_u64_pub(&shdrs, off + 8);
++                        if sh_type != 1 || sh_flags & SHF_EXECINSTR == 0 {
++                            continue;
++                        }
++                        let sh_offset = elf::read_u64_pub(&shdrs, off + 24);
++                        let sh_size = elf::read_u64_pub(&shdrs, off + 32);
++                        project(&mut ranges, sh_offset, sh_size);
++                    }
++                    if !ranges.is_empty() {
++                        return Some(ranges);
++                    }
++                }
++            }
++        }
+     }
+ 
+-    let map_file_end = map_file_off.checked_add(map_len)?;
+-    let mut ranges = Vec::new();
+-    for i in 0..e_shnum {
+-        let off = i * e_shentsize;
+-        if off + 64 > shdrs.len() {
+-            break;
+-        }
+-        let sh_flags = elf::read_u64_pub(&shdrs, off + 8);
+-        if sh_flags & SHF_EXECINSTR == 0 {
+-            continue;
+-        }
+-        let sh_offset = elf::read_u64_pub(&shdrs, off + 24);
+-        let sh_size = elf::read_u64_pub(&shdrs, off + 32);
+-        if sh_size == 0 {
+-            continue;
+-        }
+-        let sh_end = sh_offset.checked_add(sh_size)?;
+-        let overlap_start = sh_offset.max(map_file_off);
+-        let overlap_end = sh_end.min(map_file_end);
+-        if overlap_start >= overlap_end {
+-            continue;
++    // Strategy 2 (stripped DSOs / no usable sections; ALSO the forced path under
++    // FAKELINUX_FORCE_PHDR_RANGES): PF_X PT_LOAD program-header segments from the
++    // file. Program headers survive `strip`. On separate-code layouts the
++    // executable segment is .text/.plt only; on merged layouts it ALSO contains
++    // read-only data (.rodata/.interp strings) — see the experiment failure.
++    const PT_LOAD: u32 = 1;
++    const PF_X: u32 = 1;
++    let e_phoff = elf::read_u64_pub(&eh, 32);
++    let e_phentsize = elf::read_u16_pub(&eh, 54) as usize;
++    let e_phnum = elf::read_u16_pub(&eh, 56) as usize;
++    if e_phoff != 0 && e_phentsize >= 56 && e_phnum != 0 {
++        if let Some(ptab_len) = e_phentsize.checked_mul(e_phnum) {
++            if ptab_len <= 1024 * 1024 {
++                let mut phdrs = vec![0u8; ptab_len];
++                if pread_exact(fd, e_phoff, &mut phdrs) {
++                    let mut ranges = Vec::new();
++                    for i in 0..e_phnum {
++                        let off = i * e_phentsize;
++                        if off + 56 > phdrs.len() {
++                            break;
++                        }
++                        let p_type = elf::read_u32_pub(&phdrs, off);
++                        let p_flags = elf::read_u32_pub(&phdrs, off + 4);
++                        if p_type != PT_LOAD || p_flags & PF_X == 0 {
++                            continue;
++                        }
++                        let p_offset = elf::read_u64_pub(&phdrs, off + 8);
++                        let p_filesz = elf::read_u64_pub(&phdrs, off + 32);
++                        project(&mut ranges, p_offset, p_filesz);
++                    }
++                    if !ranges.is_empty() {
++                        return Some(ranges);
++                    }
++                }
++            }
+         }
+-        ranges.push((
+-            map_start + (overlap_start - map_file_off),
+-            overlap_end - overlap_start,
+-        ));
+     }
+ 
+-    if ranges.is_empty() {
+-        None
+-    } else {
+-        Some(ranges)
+-    }
++    None
+ }
+ 
+ /// Try to extract code ranges from ELF headers in mapped memory.
