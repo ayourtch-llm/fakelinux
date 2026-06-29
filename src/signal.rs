@@ -910,6 +910,22 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         libc::write(2, buf.as_ptr() as *const _, n);
     }
 
+    // RESUME_PROBE: hijack mctx.pc to a `udf #0xf001` page. macOS will
+    // restore hw from this mctx, immediately hit the UDF, and capture
+    // hw back into a fresh mctx that trap_handler can compare against
+    // the frame (the source of truth — what we used to populate mctx
+    // here). Any divergence is a hw-restore discrepancy. Gated by
+    // FAKELINUX_RESUME_PROBE. We stash the openssl resume PC and the
+    // frame addr in TLS so trap_handler can route correctly.
+    if crate::trap::RESUME_PROBE_ENABLED.load(Ordering::Relaxed) {
+        let probe = crate::trap::RESUME_PROBE_PAGE.load(Ordering::Relaxed);
+        if probe != 0 {
+            crate::trap::RESUME_OPENSSL_PC.with(|c| c.set(regs.pc));
+            crate::trap::RESUME_FRAME_ADDR.with(|c| c.set(frame_addr));
+            regs.pc = probe;
+        }
+    }
+
     true
 }
 

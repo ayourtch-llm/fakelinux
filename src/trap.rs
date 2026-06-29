@@ -855,6 +855,21 @@ static REG_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static REG_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static REG_PROBE_CHECKED: AtomicU64 = AtomicU64::new(0);
 
+/// FAKELINUX_RESUME_PROBE=1: hw-vs-frame fidelity probe. After do_rt_sigreturn
+/// has populated mctx from the sigframe (the values that ought to land in hw
+/// after macOS's signal return), hijack mctx.pc to point at a single `udf
+/// #0xf001` instruction. macOS restores hw from mctx; guest immediately
+/// executes the UDF; macOS captures hw back into a fresh mctx; trap_handler
+/// compares the captured mctx to the frame's bytes. Any field that differs
+/// is a hw vs. mctx-write discrepancy — the smoking gun for "fakelinux's
+/// sigreturn-trampoline chain produces a state macOS doesn't faithfully
+/// resume." Tests the full `ldr q0..q31; udf -> trap_handler -> mctx-rewrite
+/// -> return` chain end-to-end under fakelinux's actual signal path.
+pub static RESUME_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static RESUME_PROBE_PAGE: AtomicU64 = AtomicU64::new(0);
+pub static RESUME_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static RESUME_PROBE_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
+
 /// Altstack bounds captured at sigaltstack install. Used by the depth probe
 /// in signal_forwarder to compute how close handler-stack consumption is
 /// getting to the altstack boundary. ss_lo = ss_sp (low addr); ss_hi = lo+size.
@@ -1116,6 +1131,14 @@ pub fn dump_trap_stats() {
         crate::signal::FWD_REG_MISMATCHES.load(Ordering::Relaxed),
         crate::signal::RK_PROBE_CHECKED.load(Ordering::Relaxed),
         crate::signal::RK_PROBE_MISMATCHES.load(Ordering::Relaxed)));
+    if RESUME_PROBE_PAGE.load(Ordering::Relaxed) != 0 {
+        let mut b4 = [0u8; 160];
+        let n4 = raw_fmt(&mut b4, format_args!(
+            "fakelinux: [{}] RESUME_PROBE hits={} divergences={}\n",
+            pid, RESUME_PROBE_HITS.load(Ordering::Relaxed),
+            RESUME_PROBE_DIVERGENCES.load(Ordering::Relaxed)));
+        unsafe { libc::write(2, b4.as_ptr() as *const _, n4); }
+    }
     watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };
@@ -1174,6 +1197,9 @@ pub fn init_trace_flags() {
         std::env::var_os("FAKELINUX_WATCH_X27").is_some(), Ordering::Relaxed);
     REG_PROBE_ENABLED.store(
         std::env::var_os("FAKELINUX_CHECK_REGS").is_some(), Ordering::Relaxed);
+    let resume_on = std::env::var_os("FAKELINUX_RESUME_PROBE").is_some();
+    RESUME_PROBE_ENABLED.store(resume_on, Ordering::Relaxed);
+    if resume_on { init_resume_probe_page(); }
     TRACE_X18_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_X18").is_some(), Ordering::Relaxed);
     init_fl_text_bounds();
     if let Ok(spec) = std::env::var("FAKELINUX_WATCH") {
@@ -1190,6 +1216,118 @@ pub fn init_trace_flags() {
                 eprintln!("fakelinux: WATCH armed-pending: seq={} len={:#x} off={:#x}", seq, len, off);
             }
         }
+    }
+}
+
+/// Per-thread context for the resume probe: saved openssl PC + frame_addr
+/// stashed by do_rt_sigreturn when it hijacks mctx.pc, consumed by
+/// trap_handler at the UDF #0xf001 trap.
+thread_local! {
+    pub static RESUME_OPENSSL_PC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static RESUME_FRAME_ADDR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Compare mctx (= hw captured by macOS at the probe UDF) to the frame
+/// bytes (what do_rt_sigreturn used as source of truth). Log first
+/// divergent field. Restore mctx.pc to the openssl resume PC so the next
+/// macOS return resumes openssl normally.
+unsafe fn handle_resume_probe(mctx: &mut MContext64) {
+    RESUME_PROBE_HITS.fetch_add(1, Ordering::Relaxed);
+    let frame = RESUME_FRAME_ADDR.with(|c| { let f = c.get(); c.set(0); f });
+    let resume = RESUME_OPENSSL_PC.with(|c| { let p = c.get(); c.set(0); p });
+    if frame == 0 || resume == 0 {
+        let mut buf = [0u8; 128];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: RESUME_PROBE missing ctx frame={:#x} resume_pc={:#x}\n", frame, resume));
+        libc::write(2, buf.as_ptr() as *const _, n);
+        return;
+    }
+    let r = &mctx.ss;
+    let ns = &mctx.ns;
+    let mut found = false;
+    let mut log_diverge = |name: &str, hw: u64, exp: u64| {
+        let mut buf = [0u8; 256];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: RESUME_DIVERGE {} hw={:#x} exp={:#x} delta={:#x} resume_pc={:#x}\n",
+            name, hw, exp, hw ^ exp, resume));
+        libc::write(2, buf.as_ptr() as *const _, n);
+    };
+    // GPRs: frame slot at offset 8 + i*8 for i in 0..28 (regs.x[i]).
+    // Skip x18 (TSD-managed; hw x18 is macOS-zeroed and doesn't reflect
+    // what fakelinux set via set_thread_x18).
+    for i in 0..29usize {
+        if i == 18 { continue; }
+        let hw = r.x[i];
+        let exp = ((frame + 8 + (i as u64) * 8) as *const u64).read_volatile();
+        if hw != exp && !found {
+            found = true;
+            let n_buf: [u8; 16];
+            let nm: &str = match i {
+                0=>"x0",1=>"x1",2=>"x2",3=>"x3",4=>"x4",5=>"x5",6=>"x6",7=>"x7",
+                8=>"x8",9=>"x9",10=>"x10",11=>"x11",12=>"x12",13=>"x13",14=>"x14",15=>"x15",
+                16=>"x16",17=>"x17",19=>"x19",20=>"x20",21=>"x21",22=>"x22",23=>"x23",
+                24=>"x24",25=>"x25",26=>"x26",27=>"x27",28=>"x28",
+                _ => "x?",
+            };
+            let _ = n_buf;
+            log_diverge(nm, hw, exp);
+        }
+    }
+    // fp, lr, sp at frame[240, 248, 256]
+    for (nm, hw, off) in [
+        ("fp", r.fp, 240u64), ("lr", r.lr, 248), ("sp", r.sp, 256),
+    ] {
+        let exp = ((frame + off) as *const u64).read_volatile();
+        if hw != exp && !found { found = true; log_diverge(nm, hw, exp); }
+    }
+    // cpsr at frame[272] (u32)
+    {
+        let exp = ((frame + 272) as *const u32).read_volatile();
+        if r.cpsr != exp && !found { found = true; log_diverge("cpsr", r.cpsr as u64, exp as u64); }
+    }
+    // NEON q0..q31 at frame[296 + i*16]
+    for i in 0..32usize {
+        let hw_lo = ns.v[i] as u64;
+        let hw_hi = (ns.v[i] >> 64) as u64;
+        let exp_lo = ((frame + 296 + (i as u64) * 16) as *const u64).read_volatile();
+        let exp_hi = ((frame + 296 + (i as u64) * 16 + 8) as *const u64).read_volatile();
+        if (hw_lo != exp_lo || hw_hi != exp_hi) && !found {
+            found = true;
+            let mut buf = [0u8; 320];
+            let n = raw_fmt(&mut buf, format_args!(
+                "fakelinux: RESUME_DIVERGE q{} hw=({:#x},{:#x}) exp=({:#x},{:#x}) resume_pc={:#x}\n",
+                i, hw_lo, hw_hi, exp_lo, exp_hi, resume));
+            libc::write(2, buf.as_ptr() as *const _, n);
+        }
+    }
+    if found { RESUME_PROBE_DIVERGENCES.fetch_add(1, Ordering::Relaxed); }
+    // Restore mctx.pc so macOS resumes openssl.
+    mctx.ss.pc = resume;
+}
+
+/// Allocate a single-instruction (`udf #0xf001`) executable page that
+/// do_rt_sigreturn will hijack mctx.pc to. Called once from init_trace_flags.
+fn init_resume_probe_page() {
+    unsafe {
+        let page_size: usize = 16384;
+        let ptr = libc::mmap(
+            std::ptr::null_mut(), page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0);
+        if ptr == libc::MAP_FAILED { return; }
+        // udf #0xf001 = 0x0000_F001 (UDF encoding is just the 16-bit imm in
+        // the low halfword; the high halfword is all-zero, which is also
+        // unallocated and traps as SIGILL).
+        let p = ptr as *mut u32;
+        p.write(0x0000_F001);
+        libc::mprotect(ptr, page_size, libc::PROT_READ | libc::PROT_EXEC);
+        extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+        sys_icache_invalidate(ptr, page_size);
+        RESUME_PROBE_PAGE.store(ptr as u64, Ordering::SeqCst);
+        let mut buf = [0u8; 96];
+        let n = raw_fmt(&mut buf, format_args!(
+            "fakelinux: RESUME_PROBE page={:#x}\n", ptr as u64));
+        libc::write(2, buf.as_ptr() as *const _, n);
     }
 }
 
@@ -2349,6 +2487,24 @@ unsafe extern "C" fn trap_handler(
     let mctx = &mut *uctx.uc_mcontext;
     let pc = mctx.ss.pc;
     let instr = *(pc as *const u32);
+
+    // RESUME_PROBE: pc inside the probe page + UDF #0xf001 = the hw-vs-frame
+    // fidelity probe (do_rt_sigreturn hijacked mctx.pc to here). Compare the
+    // freshly-captured mctx (= hw at UDF = whatever macOS restored from the
+    // mctx we wrote) to the frame (the source of truth). Restore openssl PC
+    // and return. Must run before any other path can claim the trap.
+    {
+        let probe_base = RESUME_PROBE_PAGE.load(Ordering::Relaxed);
+        if probe_base != 0
+            && pc >= probe_base && pc < probe_base + 0x4000
+            && (instr & 0xFFFF) == 0xF001
+            && (instr >> 16) == 0
+        {
+            handle_resume_probe(mctx);
+            set_in_trap(false);
+            return;
+        }
+    }
 
     // Callee-saved register probe: snapshot at entry; Drop guard checks at
     // EVERY return path. Branches that legitimately rewrite many regs
