@@ -1188,6 +1188,17 @@ pub fn dump_trap_stats() {
             pid, p4_rk, p4_ctr, p4_ptr, p4_code, p4_aes));
         unsafe { libc::write(2, b5.as_ptr() as *const _, n5); }
     }
+    {
+        let mut b6 = [0u8; 200];
+        let n6 = raw_fmt(&mut b6, format_args!(
+            "fakelinux: [{}] CLOSE close_total={} socket_closes={} dup_scans={} dup_scan_fstats={}\n",
+            pid,
+            crate::syscall::CLOSE_TOTAL.load(Ordering::Relaxed),
+            crate::syscall::CLOSE_SOCKET.load(Ordering::Relaxed),
+            crate::syscall::DUP_SCANS.load(Ordering::Relaxed),
+            crate::syscall::DUP_SCAN_FSTATS.load(Ordering::Relaxed)));
+        unsafe { libc::write(2, b6.as_ptr() as *const _, n6); }
+    }
     watch_dump_pc_histogram();
     unsafe { libc::write(2, b2.as_ptr() as *const _, n2); }
     unsafe { libc::write(2, buf.as_ptr() as *const _, n) };

@@ -23,6 +23,22 @@ static SOCKET_WAITERS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
 static INTERRUPTIBLE_SOCKET_FDS: OnceLock<Box<[AtomicBool]>> = OnceLock::new();
 static SOCKET_CLOSE_GENERATIONS: OnceLock<Box<[AtomicUsize]>> = OnceLock::new();
 
+/// FAKELINUX_TRACE_SOCKET_CLOSE, cached once at startup. Reading env in the
+/// per-close (trap-context) path risks the env-lock deadlock and is a hot-path
+/// cost; cache it like the other trace flags.
+static TRACE_SOCKET_CLOSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_trace_socket_close(on: bool) {
+    TRACE_SOCKET_CLOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Diagnostic counters (FAKELINUX_TRAP_STATS): close() volume and the cost of
+/// the per-socket-close duplicate scan.
+pub static CLOSE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CLOSE_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DUP_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DUP_SCAN_FSTATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Initialize the sysroot from the environment variable.
 pub fn init_sysroot(sysroot: &str) {
     if !sysroot.is_empty() {
@@ -104,6 +120,19 @@ static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 
 pub fn set_trace(on: bool) {
     TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// TEMP diagnostic: log stat/open paths via FAKELINUX_TRACE_STAT=1
+static STAT_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_stat_trace(on: bool) {
+    STAT_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+fn stat_trace(tag: &str, pathname: u64) {
+    if STAT_TRACE.load(std::sync::atomic::Ordering::Relaxed) && pathname != 0 {
+        let p = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+        raw_eprintln_fmt(format_args!("fakelinux: {} {}\n", tag, p.to_string_lossy()));
+    }
 }
 
 pub fn trace_enabled() -> bool {
@@ -825,6 +854,7 @@ fn socket_has_duplicate_open_fd(fd: i32) -> bool {
         return false;
     }
 
+    DUP_SCANS.fetch_add(1, Ordering::Relaxed);
     let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     let open_max = if open_max > 0 {
         (open_max as i32).min(SOCKET_WAITER_FD_LIMIT as i32)
@@ -836,6 +866,7 @@ fn socket_has_duplicate_open_fd(fd: i32) -> bool {
             continue;
         }
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        DUP_SCAN_FSTATS.fetch_add(1, Ordering::Relaxed);
         if unsafe { libc::fstat(other, &mut st) } != 0 {
             continue;
         }
@@ -1013,6 +1044,7 @@ fn do_read(fd: u64, buf: u64, count: u64) -> u64 {
 
 fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u64 {
     if pathname == 0 { return (-14_i64) as u64; } // -EFAULT
+    stat_trace("OPEN", pathname);
     let path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
 
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1117,24 +1149,42 @@ fn wake_socket_before_close(fd: i32) {
     if fd < 0 {
         return;
     }
-    let trace_close = std::env::var_os("FAKELINUX_TRACE_SOCKET_CLOSE").is_some();
+    let trace_close = TRACE_SOCKET_CLOSE.load(std::sync::atomic::Ordering::Relaxed);
     if !fd_is_socket(fd) {
         return;
     }
+    CLOSE_SOCKET.fetch_add(1, Ordering::Relaxed);
     bump_socket_close_generation(fd);
     let has_waiter = socket_has_waiter(fd);
     let guest_threaded = thread::has_multiple_guest_threads();
-    let host_threaded = host_has_multiple_threads();
-    let has_recv_timeout = socket_has_recv_timeout(fd);
     let used_interruptible_wait = socket_used_interruptible_wait(fd);
-    let has_duplicate = socket_has_duplicate_open_fd(fd);
-    let host_threaded_control_socket =
-        !has_waiter && host_threaded && (has_recv_timeout || used_interruptible_wait);
+    // host_threaded_control_socket = !has_waiter && host_threaded
+    //   && (has_recv_timeout || used_interruptible_wait). Evaluate the cheap
+    //   atomic terms first and only make the host_has_multiple_threads() mach
+    //   call / SO_RCVTIMEO getsockopt when they can still flip the result.
+    let host_threaded_control_socket = !has_waiter
+        && (used_interruptible_wait || socket_has_recv_timeout(fd))
+        && host_has_multiple_threads();
+    // socket_has_duplicate_open_fd() is an O(open_max) fstat scan of the whole
+    // fd table — the single most expensive thing here. Its value only affects
+    // the decision when the cheap signals leave it ambiguous, i.e. a
+    // single-threaded guest with no waiter closing an interruptible/control
+    // socket. For the common case (ordinary socket, single thread, no waiter)
+    // we skip the scan entirely. See the gate logic below.
+    let need_dup = !guest_threaded
+        && !has_waiter
+        && (host_threaded_control_socket || used_interruptible_wait);
+    let has_duplicate = if need_dup {
+        socket_has_duplicate_open_fd(fd)
+    } else {
+        false
+    };
     if trace_close {
         let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!(
             "fakelinux: [{}] socket-close fd={} waiter={} guest_threads={} host_threads={} rcvtimeo={} waited={}\n",
-            pid, fd, has_waiter, guest_threaded, host_threaded, has_recv_timeout, used_interruptible_wait,
+            pid, fd, has_waiter, guest_threaded, host_has_multiple_threads(),
+            socket_has_recv_timeout(fd), used_interruptible_wait,
         ));
     }
     if !guest_threaded
@@ -1202,6 +1252,7 @@ fn host_has_multiple_threads() -> bool {
 }
 
 fn do_close(fd: i32) -> u64 {
+    CLOSE_TOTAL.fetch_add(1, Ordering::Relaxed);
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) && fd <= 10 {
         let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!("fakelinux: [{}] close({})\n", pid, fd));
@@ -1307,6 +1358,7 @@ fn do_fstat(fd: i32, statbuf: u64) -> u64 {
 }
 
 fn do_newfstatat(linux_dirfd: i32, pathname: u64, statbuf: u64, linux_flags: i32) -> u64 {
+    stat_trace("STAT", pathname);
     // AT_EMPTY_PATH (0x1000): if pathname is empty, operate on the fd directly
     const LINUX_AT_EMPTY_PATH: i32 = 0x1000;
     if linux_flags & LINUX_AT_EMPTY_PATH != 0 {

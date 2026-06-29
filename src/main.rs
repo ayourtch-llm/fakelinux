@@ -86,6 +86,12 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE").is_ok() {
         syscall::set_trace(true);
     }
+    if std::env::var("FAKELINUX_TRACE_STAT").is_ok() {
+        syscall::set_stat_trace(true);
+    }
+    if std::env::var("FAKELINUX_TRACE_SOCKET_CLOSE").is_ok() {
+        syscall::set_trace_socket_close(true);
+    }
     rootfs::init(&rootfs, &sysroot);
     syscall::init_sysroot(&sysroot);
 
