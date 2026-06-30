@@ -95,6 +95,9 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE_EXIT").is_ok() {
         syscall::set_trace_exit(true);
     }
+    if std::env::var("FAKELINUX_TRACE_SHUTDOWN").is_ok() {
+        syscall::set_trace_shutdown(true);
+    }
     rootfs::init(&rootfs, &sysroot);
     syscall::init_sysroot(&sysroot);
 

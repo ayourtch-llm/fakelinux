@@ -32,6 +32,79 @@ pub fn set_trace_socket_close(on: bool) {
     TRACE_SOCKET_CLOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// FAKELINUX_TRACE_SHUTDOWN=1 — log every shutdown(SHUT_RDWR) we issue on a
+/// socket close. Targeted at the parallel-run "manager death" bug: a managed-
+/// queue AF_UNIX connection returns EOF while both endpoints are still alive,
+/// which is what shutdown() on a dup'd/fork-inherited socket would cause. The
+/// log records pid, fd, the AF_UNIX sock/peer path (to identify *which*
+/// connection — the manager listen socket has a distinctive path), whether a
+/// within-process duplicate fd exists (fstat-detectable; fork-inherited dups in
+/// another process are NOT), and the threading signals that drove the decision.
+/// Low volume (only fires when we actually shutdown), so safe to leave on for a
+/// full run. See [[project_parallel_jobs_campaign]].
+static TRACE_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_trace_shutdown(on: bool) {
+    TRACE_SHUTDOWN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Format an AF_UNIX socket's local and peer path into `buf` for the shutdown
+/// trace. Returns true if the fd is AF_UNIX. Non-AF_UNIX sockets return false
+/// (the manager bug is AF_UNIX-only, so the trace can skip them). Abstract
+/// (Linux) names start with '@'; an empty/autobound name renders as "<unnamed>".
+fn afunix_endpoints(fd: i32) -> Option<(String, String)> {
+    fn name_of(
+        fd: i32,
+        f: unsafe extern "C" fn(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> i32,
+    ) -> Option<String> {
+        let mut su: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let rc = unsafe { f(fd, &mut su as *mut _ as *mut libc::sockaddr, &mut len) };
+        if rc != 0 {
+            return None;
+        }
+        if su.sun_family != libc::AF_UNIX as libc::sa_family_t {
+            return None;
+        }
+        // Path length = total addr len minus the offset of sun_path within the
+        // struct. Compute that offset directly: macOS prefixes a sun_len byte
+        // before sun_family, so it is NOT just size_of::<sa_family_t>().
+        let base = &su as *const _ as usize;
+        let path_off = (su.sun_path.as_ptr() as usize - base) as libc::socklen_t;
+        if len <= path_off {
+            return Some("<unnamed>".to_string());
+        }
+        let plen = (len - path_off) as usize;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(su.sun_path.as_ptr() as *const u8, plen.min(su.sun_path.len()))
+        };
+        // macOS reports a fixed-size addr with a zero-filled path for unnamed
+        // sockets, so an all-NUL path means "<unnamed>", not abstract. Only a
+        // leading NUL followed by real bytes is a Linux abstract name ('@').
+        let trimmed = {
+            let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            &bytes[..end]
+        };
+        if trimmed.is_empty() {
+            return Some("<unnamed>".to_string());
+        }
+        if trimmed[0] == 0 {
+            let s = String::from_utf8_lossy(&trimmed[1..]);
+            return Some(format!("@{}", s));
+        }
+        Some(String::from_utf8_lossy(trimmed).to_string())
+    }
+    let local = name_of(fd, libc::getsockname);
+    let peer = name_of(fd, libc::getpeername);
+    match (local.is_some(), peer.is_some()) {
+        (false, false) => None, // not AF_UNIX (or both calls failed)
+        _ => Some((
+            local.unwrap_or_else(|| "<n/a>".to_string()),
+            peer.unwrap_or_else(|| "<n/a>".to_string()),
+        )),
+    }
+}
+
 /// High-water mark of the highest fd number that has ever been a socket (from
 /// socket/socketpair/accept) or a duplicate of any fd (dup/dup2/dup3/F_DUPFD).
 /// A live socket fd can never exceed this, so the duplicate scan in
@@ -1256,6 +1329,24 @@ fn wake_socket_before_close(fd: i32) {
     // ordinary single-threaded close(): shutdown() affects the socket object,
     // so it can break forked children closing inherited descriptors or code
     // closing a dup while another fd still owns the socket.
+    if TRACE_SHUTDOWN.load(Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        // within-process dup: fork-inherited dups live in another process and
+        // are NOT detected here, so has_dup_local=false + AF_UNIX peer alive is
+        // the fork-inherited signature we're hunting.
+        let has_dup_local = socket_has_duplicate_open_fd(fd);
+        if let Some((local, peer)) = afunix_endpoints(fd) {
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] SHUTDOWN-AFUNIX fd={} local={} peer={} dup_local={} guest_threads={} waiter={} waited={}\n",
+                pid, fd, local, peer, has_dup_local, guest_threaded, has_waiter, used_interruptible_wait,
+            ));
+        } else {
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] SHUTDOWN-sock fd={} (non-AF_UNIX) dup_local={} guest_threads={} waiter={} waited={}\n",
+                pid, fd, has_dup_local, guest_threaded, has_waiter, used_interruptible_wait,
+            ));
+        }
+    }
     unsafe {
         if trace_close {
             let pid = libc::getpid();
@@ -4423,6 +4514,36 @@ mod tests {
         thread::set_live_guest_threads_for_test(1);
         unsafe {
             libc::close(peer_fd);
+        }
+    }
+
+    #[test]
+    fn afunix_endpoints_detects_unix_and_renders_unnamed() {
+        // socketpair sockets are AF_UNIX but unnamed: helper must report Some
+        // with "<unnamed>" so the shutdown trace doesn't crash on them.
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let ep = afunix_endpoints(sv[0]);
+        assert!(ep.is_some(), "AF_UNIX socket must be recognized");
+        let (local, peer) = ep.unwrap();
+        assert_eq!(local, "<unnamed>");
+        assert_eq!(peer, "<unnamed>");
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+    }
+
+    #[test]
+    fn afunix_endpoints_reports_none_for_non_unix() {
+        // A TCP socket is not AF_UNIX — helper returns None so the trace falls
+        // through to the non-AF_UNIX branch (the manager bug is AF_UNIX-only).
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket() failed");
+        assert!(afunix_endpoints(fd).is_none());
+        unsafe {
+            libc::close(fd);
         }
     }
 
