@@ -3064,6 +3064,29 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
         // Set final permissions (anonymous pages — mprotect is safe)
         unsafe { libc::mprotect(result_addr as *mut _, length as usize, mac_prot); }
 
+        // Register executable file-backed mappings (shared libraries loaded by
+        // the guest's ld.so) in procfs, with the backing path + file offset, so
+        // /proc/self/maps is complete AND guest-abort backtraces (signal::
+        // do_tgkill) can symbolize lr addresses via addr2line on the named .so.
+        if has_exec && fd >= 0 {
+            let mut pathbuf = [0u8; 1024];
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, pathbuf.as_mut_ptr()) } == 0 {
+                let len = pathbuf.iter().position(|&b| b == 0).unwrap_or(0);
+                if len > 0 {
+                    if let Ok(name) = std::str::from_utf8(&pathbuf[..len]) {
+                        procfs::add_mapping(procfs::MemMapping {
+                            start: result_addr,
+                            end: result_addr + length,
+                            prot: mac_prot,
+                            flags: libc::MAP_PRIVATE,
+                            offset,
+                            name: name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         if std::env::var_os("FAKELINUX_TRACE_MMAP").is_some() {
             let pid = unsafe { libc::getpid() };
             let mut pathbuf = [0u8; 1024];

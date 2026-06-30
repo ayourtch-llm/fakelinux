@@ -1546,8 +1546,36 @@ pub fn do_tgkill(tgid: i32, tid: i32, linux_sig: i32) -> u64 {
         let msg = "fakelinux: guest called abort (tgkill SIGABRT)\n";
         unsafe {
             libc::write(2, msg.as_ptr() as *const _, msg.len());
-            libc::_exit(134);
         }
+        // Dump the guest's frame-pointer chain so a guest abort()/assert/panic
+        // can be traced back to its call site. The lr values are relocated
+        // guest text addresses; subtract the ELF relocation offset (logged at
+        // load, e.g. 0x700400000 for ET_EXEC) and feed to addr2line on the
+        // guest binary to symbolize. Fault-safe reads (safe_read_u64).
+        let mut fp = crate::trap::LAST_SVC_FP.load(std::sync::atomic::Ordering::Relaxed);
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: guest abort backtrace (fp chain, lr = relocated guest pc):\n"));
+        for depth in 0..24 {
+            if fp == 0 || fp & 0x7 != 0 || fp >= 0x8000_0000_0000 {
+                break;
+            }
+            let (Some(next_fp), Some(lr)) =
+                (crate::trap::safe_read_u64(fp), crate::trap::safe_read_u64(fp + 8))
+            else {
+                break;
+            };
+            match crate::procfs::lookup_addr(lr) {
+                Some((name, off)) => crate::syscall::raw_eprintln_fmt(format_args!(
+                    "fakelinux:   #{:<2} lr={:#x}  {}+{:#x}\n", depth, lr, name, off)),
+                None => crate::syscall::raw_eprintln_fmt(format_args!(
+                    "fakelinux:   #{:<2} lr={:#x}\n", depth, lr)),
+            }
+            if next_fp <= fp {
+                break;
+            }
+            fp = next_fp;
+        }
+        unsafe { libc::_exit(134); }
     }
     if linux_sig == 0 {
         let ret = unsafe { libc::kill(tgid, 0) };

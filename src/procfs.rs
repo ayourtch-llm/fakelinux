@@ -85,6 +85,21 @@ pub fn add_mapping(m: MemMapping) {
     with(|pfs| pfs.mappings.push(m));
 }
 
+/// Look up a guest virtual address in the tracked mappings. Returns the
+/// mapping's name and the file offset (addr - start + mapping.offset) so a
+/// backtrace lr can be fed to addr2line on the named binary. Used by the
+/// guest-abort backtrace (signal::do_tgkill).
+pub fn lookup_addr(addr: u64) -> Option<(String, u64)> {
+    with(|pfs| {
+        for m in pfs.mappings.iter() {
+            if addr >= m.start && addr < m.end && !m.name.is_empty() {
+                return Some((m.name.clone(), addr - m.start + m.offset));
+            }
+        }
+        None
+    })
+}
+
 /// Store the raw auxv bytes (for /proc/self/auxv).
 pub fn set_auxv(data: Vec<u8>) {
     with(|pfs| pfs.auxv = data);
