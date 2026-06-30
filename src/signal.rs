@@ -529,8 +529,16 @@ pub unsafe fn build_sigframe_and_redirect(
         let (alt_sp, alt_flags, alt_size) = get_guest_sigaltstack();
         const SS_DISABLE: i32 = 2;
         if on_stack && alt_sp != 0 && alt_flags & SS_DISABLE == 0 && alt_size >= 0x1000 {
-            // Stack grows down; top of altstack is the starting SP.
-            alt_sp + alt_size
+            // If the interrupted SP is already inside the altstack range, a
+            // previous handler is still using it — push the new frame below
+            // the current SP rather than restarting from the top (that would
+            // overwrite the in-flight handler's frame). Real Linux tracks this
+            // via SS_ONSTACK; we infer it from SP position.
+            if regs.sp > alt_sp && regs.sp <= alt_sp + alt_size {
+                regs.sp
+            } else {
+                alt_sp + alt_size
+            }
         } else {
             regs.sp
         }
