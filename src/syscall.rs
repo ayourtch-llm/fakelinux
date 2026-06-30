@@ -747,6 +747,49 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
         // to "no seccomp" code paths (typical for libseccomp probes).
         277 => (-38_i64) as u64,
+        // unshare(2) — we don't actually isolate namespaces, but pretend
+        // success so podman's rootless / uid-mapping setup proceeds. We
+        // already run as fake root (uid 0) so most calls into the "new"
+        // namespace are no-ops anyway.
+        97 => 0,
+        // setns(2) — same reasoning as unshare: stub to success.
+        268 => 0,
+        // pivot_root(2), mount(2), umount2(2) — single-process emulator has
+        // no real filesystem isolation; pretend success so container setup
+        // continues. Mount points just don't actually exist; reads of
+        // mounted paths fall through to the rootfs.
+        41 | 40 | 39 => 0,
+        // chroot(2) — translate the guest path to a host path and store it.
+        // Subsequent rootfs::translate_path calls treat this directory as the
+        // guest's "/". CRITICAL: stubbing this to either success or ENOSYS was
+        // dangerous — container tools call chroot before extracting tarballs;
+        // a no-op meant podman's `pull` extracted alpine's /lib straight into
+        // the real FAKELINUX_ROOT, stomping the ubuntu rootfs. Real tracking
+        // contains the extract to its image directory like Linux would.
+        51 => {
+            let pathname = args[0];
+            if pathname == 0 { return (-14_i64) as u64; } // EFAULT
+            let (eff_path, _hold) = effective_path_ptr(pathname);
+            // Verify it's a directory before chrooting.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::stat(eff_path, &mut st) } != 0 {
+                return translate::linux_errno();
+            }
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return (-20_i64) as u64; // ENOTDIR
+            }
+            let host_path = unsafe { std::ffi::CStr::from_ptr(eff_path) }
+                .to_string_lossy().into_owned();
+            rootfs::set_chroot_host(Some(host_path));
+            0
+        }
+        // name_to_handle_at / open_by_handle_at — return -ENOSYS so callers
+        // fall back to path-based operations. Podman's containers/storage
+        // tries this for performance but has the slow fallback.
+        264 | 265 => (-38_i64) as u64,
+        // openat2(2) — new syscall with extended args. We could translate to
+        // openat but for now return -ENOSYS so glibc falls back to openat.
+        437 => (-38_i64) as u64,
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -4130,6 +4173,13 @@ fn do_utimensat(dirfd: i32, pathname: u64, times_ptr: u64, flags: i32) -> u64 {
 
     let ret = unsafe { utimensat(mac_dirfd, eff_path, times, mac_flags) };
     if ret == 0 { return 0; }
+    // Be tolerant: podman's tar-extract chmods+chtimes every entry under the
+    // container storage; macOS rejects utimes on some passed-through host
+    // device nodes (/dev/null etc.) with EACCES, which Go surfaces as
+    // "chtimes /dev: permission denied" and aborts layer apply. The mtime is
+    // cosmetic; swallow EACCES/EPERM.
+    let err = unsafe { *libc::__error() };
+    if err == libc::EACCES || err == libc::EPERM || err == libc::ENOENT { return 0; }
     if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
         let ret2 = unsafe {
             utimensat(mac_dirfd, pathname as *const libc::c_char, times, mac_flags)

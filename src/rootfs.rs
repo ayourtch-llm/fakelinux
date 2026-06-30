@@ -6,13 +6,32 @@
 //! When only FAKELINUX_SYSROOT is set, only library/linker paths are translated
 //! (the Phase 4 behavior).
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Full rootfs path (FAKELINUX_ROOT). When set, all absolute paths are translated.
 static ROOT: OnceLock<String> = OnceLock::new();
 
 /// Library-only sysroot path (FAKELINUX_SYSROOT). Only library paths are translated.
 static SYSROOT: OnceLock<String> = OnceLock::new();
+
+/// Per-process chroot HOST prefix. When set, this directory is the guest's
+/// effective "/" — all absolute guest paths get host-translated as
+/// `<chroot_host>/<guest_path>`, ignoring the original ROOT prefix.
+/// Set by the chroot(2) syscall handler; survives fork (TLS-like via guest
+/// process state). Without this, podman's tar-extract subprocess (which
+/// chroots into its image staging dir before unpacking) writes alpine's
+/// /lib files straight into the host rootfs, stomping it.
+static CHROOT_HOST: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set the current chroot host-path (called by SYS_CHROOT). None resets.
+pub fn set_chroot_host(host_path: Option<String>) {
+    *CHROOT_HOST.lock().unwrap() = host_path;
+}
+
+/// Get the current chroot host-path, if set.
+pub fn get_chroot_host() -> Option<String> {
+    CHROOT_HOST.lock().unwrap().clone()
+}
 
 /// Return the FAKELINUX_ROOT value if set.
 pub fn get_root() -> Option<&'static str> {
@@ -79,6 +98,18 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
         if !ROOT.get().map(|s| !s.is_empty()).unwrap_or(false) {
             return None;
         }
+    }
+
+    // If a chroot is active, the guest's "/" is at <chroot_host>; resolve
+    // guest paths there directly (do NOT also re-prepend FAKELINUX_ROOT —
+    // the chroot host path already lives inside the rootfs).
+    if let Some(chroot_host) = get_chroot_host() {
+        let resolved = resolve_in_rootfs(chroot_host.as_bytes(), path);
+        let mut result = casefold_full_path(chroot_host.as_bytes().len(), resolved);
+        if !result.ends_with(&[0]) {
+            result.push(0);
+        }
+        return Some(result);
     }
 
     // Try FAKELINUX_ROOT first (full path translation)
