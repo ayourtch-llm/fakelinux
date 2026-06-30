@@ -137,13 +137,17 @@ pub fn do_epoll_pwait(
     timeout_ms: i32,
     sigmask_ptr: u64,
 ) -> u64 {
-    // Look up the kqueue fd and registrations
-    let (kq, registrations) = {
+    // Look up the kqueue fd — do NOT clone registrations here. We need to
+    // look up user_data PER KEVENT at writeback time against the LIVE state.
+    // Cloning at entry froze a snapshot that became stale while we slept in
+    // kevent(): another thread could epoll_ctl_ADD a fresh fd (often the
+    // same fd number reused after close), and the event for it came back
+    // with user_data=0 from our snapshot, causing Go's runtime netpoll to
+    // dereference a NULL pollDesc and SIGSEGV.
+    let kq = {
         let guard = EPOLL_STATE.lock().unwrap();
         match guard.as_ref().and_then(|s| s.get(&epfd)) {
-            Some(inst) => {
-                (inst.kqueue_fd, inst.registrations.clone())
-            }
+            Some(inst) => inst.kqueue_fd,
             None => return (-9_i64) as u64, // -EBADF
         }
     };
@@ -221,14 +225,27 @@ pub fn do_epoll_pwait(
     let out = events_ptr as *mut u8;
     let mut count = 0i32;
 
+    // Look up user_data per-kevent against the LIVE registrations state.
+    let user_data_lookup = |fd: i32| -> Option<u64> {
+        let guard = EPOLL_STATE.lock().unwrap();
+        guard.as_ref()
+            .and_then(|s| s.get(&epfd))
+            .and_then(|inst| inst.registrations.get(&fd).map(|&(_, d)| d))
+    };
+
     for i in 0..n as usize {
         let kev = &kevents[i];
         let fd = kev.ident as i32;
 
-        // Look up the user data for this fd
-        let user_data = match registrations.get(&fd) {
-            Some(&(_, data)) => data,
-            None => 0,
+        let user_data = match user_data_lookup(fd) {
+            Some(d) => d,
+            None => {
+                // kqueue can deliver tail events for a fd we've already DEL'd
+                // (race with sibling thread's epoll_ctl_DEL, or queued event
+                // racing close). Drop them silently — surfacing user_data=0
+                // makes Go's netpoll dereference a NULL pollDesc.
+                continue;
+            }
         };
 
         let mut epoll_events: u32 = 0;
