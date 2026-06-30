@@ -2633,8 +2633,23 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let resolved_path = {
         let path_bytes = path.to_bytes();
         if path_bytes == b"/proc/self/exe" {
-            // Direct /proc/self/exe → use our guest binary
-            procfs::with(|pfs| std::ffi::CString::new(pfs.exe_path.clone()).unwrap())
+            // Direct /proc/self/exe → use our guest binary, translated to a
+            // HOST path. The re-exec'd fakelinux opens this as a host file
+            // (main.rs: std::fs::read), so handing it a bare guest path like
+            // /usr/bin/podman fails with ENOENT and bootstrap dies before any
+            // syscall translation can kick in. Podman uses this path for its
+            // layer-extract subprocess (re-execs itself in a uid-namespace).
+            let guest_exe = procfs::with(|pfs| pfs.exe_path.clone());
+            let host_exe = if let Some(root) = rootfs::get_root() {
+                if !root.is_empty() && guest_exe.starts_with('/') {
+                    format!("{}{}", root.trim_end_matches('/'), guest_exe)
+                } else {
+                    guest_exe
+                }
+            } else {
+                guest_exe
+            };
+            std::ffi::CString::new(host_exe).unwrap()
         } else {
             // Try rootfs-translated path first, then original
             let check_path = if let Some(translated) = translate_guest_path(pathname) {
