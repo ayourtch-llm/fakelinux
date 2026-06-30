@@ -2427,15 +2427,63 @@ unsafe fn collect_guest_env<'a>(envp_ptr: u64) -> Vec<&'a std::ffi::CStr> {
 /// Note: the owned `String` keys are held in `StaticKeys`; we leak them so
 /// the `&'static str` lifetime on the returned tuple keys is valid. These
 /// leaks are bounded (once per unique FAKELINUX_* name seen per process).
+/// The three FAKELINUX_* vars that are recomputed per-execve (not snapshotted).
+const DYNAMIC_EXEC_KEYS: [&str; 3] =
+    ["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK", "FAKELINUX_ARGV0"];
+
+/// Snapshot of the static FAKELINUX_* environment, taken ONCE at startup while
+/// single-threaded and pre-fork. The execve path reads this instead of
+/// std::env::vars() so it never takes Rust's ENV_LOCK in fork-fragile context
+/// (a process that inherited that lock held — see set_child_env — would
+/// otherwise deadlock building the child envp). Excludes the per-exec dynamic
+/// keys, which are recomputed each execve.
+static FAKELINUX_ENV_SNAPSHOT: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Capture FAKELINUX_* host env into the snapshot. Call once at startup AFTER
+/// pidns init (so FAKELINUX_INIT_PID is present), before the guest can fork.
+pub fn snapshot_fakelinux_env() {
+    let v: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("FAKELINUX_") && !DYNAMIC_EXEC_KEYS.contains(&k.as_str()))
+        .collect();
+    let _ = FAKELINUX_ENV_SNAPSHOT.set(v);
+}
+
 fn fakelinux_env_overrides() -> Vec<(&'static str, Option<String>)> {
-    let mut v: Vec<(&'static str, Option<String>)> = Vec::new();
-    for (key, val) in std::env::vars() {
-        if key.starts_with("FAKELINUX_") {
-            let static_key: &'static str = Box::leak(key.into_boxed_str());
-            v.push((static_key, Some(val)));
+    if let Some(snap) = FAKELINUX_ENV_SNAPSHOT.get() {
+        return snap.iter().map(|(k, v)| (k.as_str(), Some(v.clone()))).collect();
+    }
+    // Fallback for paths that run before the snapshot (e.g. unit tests): read
+    // env directly. NOT used on the hot execve path once snapshot is taken.
+    std::env::vars()
+        .filter(|(k, _)| k.starts_with("FAKELINUX_") && !DYNAMIC_EXEC_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (Box::leak(k.into_boxed_str()) as &str, Some(v)))
+        .collect()
+}
+
+/// Build the full FAKELINUX_* override set for an execve child's envp WITHOUT
+/// any std::env access: the snapshot for static vars, plus the per-exec
+/// SIG_IGN bitmask, signal mask, and original argv[0] computed directly. `None`
+/// values remove the var (merge_envp omits them). This replaces the old
+/// set_var/remove_var-then-read-back dance, which deadlocked under parallel
+/// load when the process had inherited a locked ENV_LOCK across fork.
+fn build_exec_overrides(argv0: Option<Vec<u8>>) -> Vec<(&'static str, Option<String>)> {
+    let mut o = fakelinux_env_overrides();
+    let mut ign_mask: u64 = 0;
+    for sig in 1..65u64 {
+        if signal::guest_sigaction(sig as usize).handler == 1 {
+            ign_mask |= 1u64 << (sig - 1);
         }
     }
-    v
+    o.push(("FAKELINUX_SIGIGN",
+        if ign_mask != 0 { Some(format!("{:#x}", ign_mask)) } else { None }));
+    let sigmask = signal::sigmask_get();
+    o.push(("FAKELINUX_SIGMASK",
+        if sigmask != 0 { Some(format!("{:#x}", sigmask)) } else { None }));
+    let argv0_val = argv0.and_then(|b| {
+        if b.is_empty() { None } else { Some(String::from_utf8_lossy(&b).into_owned()) }
+    });
+    o.push(("FAKELINUX_ARGV0", argv0_val));
+    o
 }
 
 /// Re-apply FD_CLOEXEC that was stripped before macOS fork (Linux semantics:
@@ -2563,34 +2611,15 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     }
                     shebang_argv.push(std::ptr::null());
 
-                    // Encode signal state for the new process
-                    {
-                        let mut ign_mask: u64 = 0;
-                        for sig in 1..65u64 {
-                            let sa = signal::guest_sigaction(sig as usize);
-                            if sa.handler == 1 { ign_mask |= 1u64 << (sig - 1); }
-                        }
-                        if ign_mask != 0 { std::env::set_var("FAKELINUX_SIGIGN", format!("{:#x}", ign_mask)); }
-                        else { std::env::remove_var("FAKELINUX_SIGIGN"); }
-                        let sigmask = signal::sigmask_get();
-                        if sigmask != 0 { std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask)); }
-                        else { std::env::remove_var("FAKELINUX_SIGMASK"); }
-                    }
-
-                    // Shebang: Linux passes the interpreter path VERBATIM as
-                    // argv[0] — interp_resolved above has been symlink-resolved
-                    // through the rootfs (a venv's /tmp/v/bin/python3 becomes
-                    // /usr/bin/python3.12), which breaks CPython's pyvenv.cfg
-                    // discovery (PEP 668 error in VPP's dpdk meson-venv).
-                    // Carry the unresolved guest path as the guest argv[0].
-                    std::env::set_var("FAKELINUX_ARGV0", interp);
-
-                    // Merge guest env (DEBIAN_HAS_FRONTEND etc.) with FAKELINUX_* host overrides.
-                    // fakelinux_env_overrides() walks the host environment and picks up ALL
-                    // FAKELINUX_* vars — including FAKELINUX_SIGIGN / _SIGMASK that were just
-                    // set above, and any debug knobs like FAKELINUX_DUMP_WRITE_FD.
+                    // Merge guest env with FAKELINUX_* overrides (signal state +
+                    // argv[0]), computed WITHOUT std::env writes (fork-deadlock
+                    // safe). Shebang: Linux passes the interpreter path VERBATIM
+                    // as argv[0] — interp_resolved was symlink-resolved through
+                    // the rootfs (a venv's bin/python3 -> /usr/bin/python3.12),
+                    // which breaks CPython's pyvenv.cfg discovery; carry the
+                    // unresolved guest path as argv[0].
                     let guest_env = unsafe { collect_guest_env(envp_ptr) };
-                    let overrides = fakelinux_env_overrides();
+                    let overrides = build_exec_overrides(Some(interp.as_bytes().to_vec()));
                     let merged = merge_envp(&guest_env, &overrides);
                     let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
                         .chain(std::iter::once(std::ptr::null()))
@@ -2645,20 +2674,17 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // bin/python3.12 symlink resolved to /usr/bin/python3.12, never found
     // pyvenv.cfg, and Debian's ensurepip then refused to run ("disabled for
     // the system python") during VPP's dpdk meson-venv setup.
-    unsafe {
+    // Capture the guest's original argv[0] to carry across the re-exec (handled
+    // below via build_exec_overrides — no std::env writes in fork-fragile code).
+    let exec_argv0: Option<Vec<u8>> = unsafe {
         let argv0 = *(argv_ptr as *const *const i8);
-        if !argv0.is_null() {
-            let a0 = std::ffi::CStr::from_ptr(argv0);
-            if !a0.to_bytes().is_empty() {
-                use std::os::unix::ffi::OsStrExt;
-                std::env::set_var("FAKELINUX_ARGV0", std::ffi::OsStr::from_bytes(a0.to_bytes()));
-            } else {
-                std::env::remove_var("FAKELINUX_ARGV0");
-            }
+        if argv0.is_null() {
+            None
         } else {
-            std::env::remove_var("FAKELINUX_ARGV0");
+            let a0 = std::ffi::CStr::from_ptr(argv0);
+            if a0.to_bytes().is_empty() { None } else { Some(a0.to_bytes().to_vec()) }
         }
-    }
+    };
 
     // Then the guest's original argv (skip argv[0] since resolved_path serves as
     // the binary path argument to fakelinux — fakelinux passes &args[1..] to the
@@ -2675,38 +2701,14 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
     new_argv.push(std::ptr::null());
 
-    // Communicate SIG_IGN signals to the new fakelinux process via env var.
-    // POSIX requires SIG_IGN to be preserved across execve. Since re-exec
-    // gives us fresh statics, we pass the SIG_IGN set as a bitmask.
-    // Also communicate the current signal mask (POSIX: preserved across execve).
-    {
-        let mut ign_mask: u64 = 0;
-        for sig in 1..65u64 {
-            let sa = signal::guest_sigaction(sig as usize);
-            if sa.handler == 1 { // SIG_IGN
-                ign_mask |= 1u64 << (sig - 1);
-            }
-        }
-        if ign_mask != 0 {
-            std::env::set_var("FAKELINUX_SIGIGN", format!("{:#x}", ign_mask));
-        } else {
-            std::env::remove_var("FAKELINUX_SIGIGN");
-        }
-        let sigmask = signal::sigmask_get();
-        if sigmask != 0 {
-            std::env::set_var("FAKELINUX_SIGMASK", format!("{:#x}", sigmask));
-        } else {
-            std::env::remove_var("FAKELINUX_SIGMASK");
-        }
-    }
-
-    // Build the final envp by merging the guest's environment (which
-    // carries guest-set vars like DEBIAN_HAS_FRONTEND, LD_LIBRARY_PATH, ...)
-    // with the FAKELINUX_* overrides that must reach the re-exec'd supervisor.
-    // fakelinux_env_overrides() picks up all FAKELINUX_* host vars, including
-    // FAKELINUX_SIGIGN/_SIGMASK just set above.
+    // Build the final envp by merging the guest's environment (which carries
+    // guest-set vars like DEBIAN_HAS_FRONTEND, LD_LIBRARY_PATH, ...) with the
+    // FAKELINUX_* overrides that must reach the re-exec'd supervisor. The
+    // overrides carry SIG_IGN/SIGMASK (POSIX: preserved across execve, passed as
+    // bitmasks since re-exec gets fresh statics) and the original argv[0], all
+    // computed WITHOUT std::env writes (fork-deadlock safe).
     let guest_env = unsafe { collect_guest_env(envp_ptr) };
-    let overrides = fakelinux_env_overrides();
+    let overrides = build_exec_overrides(exec_argv0);
     let merged = merge_envp(&guest_env, &overrides);
     let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
         .chain(std::iter::once(std::ptr::null()))

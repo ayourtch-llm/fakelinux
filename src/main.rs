@@ -214,6 +214,11 @@ fn main() {
         }
     }
 
+    // Snapshot FAKELINUX_* env now (single-threaded, pre-fork, after pidns set
+    // FAKELINUX_INIT_PID) so the execve path can rebuild the child envp without
+    // touching std::env in fork-fragile context (ENV_LOCK deadlock avoidance).
+    syscall::snapshot_fakelinux_env();
+
     // Load segments, patch SVCs, set up stack
     let loaded = loader::load(&elf, &data, &args[guest_arg_start..], &sysroot).unwrap_or_else(|e| {
         eprintln!("fakelinux: {}", e);
