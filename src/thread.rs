@@ -1079,6 +1079,22 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
             libc::write(2, msg.as_ptr() as *const _, msg.len());
         }
     }
+    // EXIT trace: log children that died by SIGNAL or non-zero exit — the
+    // high-signal cases for finding a silently-dying process (e.g. the
+    // multiprocessing manager). Reaper pid + child pid + cause.
+    if ret > 0 && crate::syscall::trace_exit_enabled() {
+        let s = status;
+        let signaled = unsafe { libc::WIFSIGNALED(s) };
+        let exited = unsafe { libc::WIFEXITED(s) };
+        let code = if exited { unsafe { libc::WEXITSTATUS(s) } } else { 0 };
+        if signaled || (exited && code != 0) {
+            let sig = if signaled { unsafe { libc::WTERMSIG(s) } } else { 0 };
+            let reaper = unsafe { libc::getpid() };
+            crate::syscall::raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] REAPED child={} signaled={} sig={} exitcode={}\n",
+                reaper, ret, signaled, sig, code));
+        }
+    }
     if ret < 0 {
         return crate::translate::linux_errno();
     }

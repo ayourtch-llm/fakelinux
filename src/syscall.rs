@@ -138,6 +138,26 @@ pub fn set_trace(on: bool) {
     TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Diagnostic: log process exits and reaped-child statuses via
+/// FAKELINUX_TRACE_EXIT=1 — pinpoints WHICH process died and HOW (exit code vs
+/// terminating signal), e.g. a silently-dying multiprocessing manager.
+static TRACE_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_trace_exit(on: bool) {
+    TRACE_EXIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn trace_exit_enabled() -> bool {
+    TRACE_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[inline]
+pub fn log_exit(code: i32, kind: &str) {
+    if trace_exit_enabled() {
+        let pid = unsafe { libc::getpid() };
+        let ppid = unsafe { libc::getppid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] EXIT {} code={} ppid={}\n", pid, kind, code, ppid));
+    }
+}
+
 /// TEMP diagnostic: log stat/open paths via FAKELINUX_TRACE_STAT=1
 static STAT_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn set_stat_trace(on: bool) {
@@ -181,6 +201,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_FSTAT => do_fstat(args[0] as i32, args[1]),
         SYS_NEWFSTATAT => do_newfstatat(args[0] as i32, args[1], args[2], args[3] as i32),
         SYS_EXIT_GROUP => unsafe {
+            log_exit(args[0] as i32, "exit_group");
             crate::trap::dump_trap_stats();
             libc::_exit(args[0] as i32)
         },
@@ -189,6 +210,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             // If this is the main thread (or there's only one thread), it acts like exit_group.
             // For child threads, call thread_exit() which does CLEARTID + pthread_exit.
             if thread::current_tid() == thread::main_tid() {
+                log_exit(args[0] as i32, "exit");
                 crate::trap::dump_trap_stats();
                 unsafe { libc::_exit(args[0] as i32) }
             } else {
