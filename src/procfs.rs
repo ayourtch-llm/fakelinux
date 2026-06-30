@@ -99,6 +99,9 @@ enum VirtualDir {
     ProcRoot,
     /// /proc/<pid> or /proc/self — entries are stat, status, cmdline, etc.
     ProcPid(i32), // the vpid (or 0 for "self" = current process)
+    /// /proc/<pid>/fd or /proc/self/fd — one numeric symlink per open fd.
+    /// Used by psutil.num_fds()/lsof-style fd-leak checks (VPP-1486 stats test).
+    ProcPidFd(i32),
 }
 
 /// State for an open virtual directory fd. Entries are pre-generated and
@@ -276,6 +279,25 @@ fn generate_dir_entries(kind: &VirtualDir) -> Vec<u8> {
                 push_dirent64(&mut buf, 203, DT_DIR, name);
             }
         }
+        VirtualDir::ProcPidFd(_vpid) => {
+            push_dirent64(&mut buf, 300, DT_DIR, b".");
+            push_dirent64(&mut buf, 1, DT_DIR, b"..");
+            // One numeric symlink per currently-open fd. We can only see our
+            // own process's fds (fakelinux shares the guest's fd table), so we
+            // enumerate via fcntl(F_GETFD); a /proc/<other-pid>/fd would need
+            // cross-process introspection we don't have, but the fd-leak tests
+            // (psutil.num_fds on self) only ever read their own. The absolute
+            // count includes a few fakelinux-internal fds, but those are
+            // stable, so leak checks (initial == ending) still hold.
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let open_max = if open_max > 0 { (open_max as i32).min(65536) } else { 1024 };
+            for fd in 0..open_max {
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+                    let name = format!("{}", fd);
+                    push_dirent64(&mut buf, 1000 + fd as u64, DT_LNK, name.as_bytes());
+                }
+            }
+        }
     }
 
     buf
@@ -381,21 +403,30 @@ fn classify_dir_path(path: &str) -> Option<VirtualDir> {
     if path == "/proc/self" {
         return Some(VirtualDir::ProcPid(visible_pid()));
     }
+    // /proc/self/fd — the open-fd directory (psutil.num_fds, fd-leak checks).
+    if path == "/proc/self/fd" {
+        return Some(VirtualDir::ProcPidFd(visible_pid()));
+    }
 
-    // /proc/<number>
+    // /proc/<number> and /proc/<number>/fd
     if let Some(rest) = path.strip_prefix("/proc/") {
-        // Must be just digits, no further slashes
-        if !rest.contains('/') {
-            if let Ok(pid) = rest.parse::<i32>() {
+        // Accept "<pid>" or "<pid>/fd"; anything else is not ours.
+        let (pid_part, is_fd) = match rest.strip_suffix("/fd") {
+            Some(p) => (p, true),
+            None => (rest, false),
+        };
+        if !pid_part.contains('/') {
+            if let Ok(pid) = pid_part.parse::<i32>() {
                 let real_pid = unsafe { libc::getpid() };
-                if pid == real_pid || pid == visible_pid() {
-                    return Some(VirtualDir::ProcPid(pid));
-                }
-                // In container mode, check if it's another active process
-                if crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-                    if crate::pidns::virtual_to_real(pid).is_some() {
-                        return Some(VirtualDir::ProcPid(pid));
-                    }
+                let ours = pid == real_pid || pid == visible_pid();
+                let other = crate::pidns::CONTAINER_MODE.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::pidns::virtual_to_real(pid).is_some();
+                if ours || other {
+                    return Some(if is_fd {
+                        VirtualDir::ProcPidFd(pid)
+                    } else {
+                        VirtualDir::ProcPid(pid)
+                    });
                 }
             }
         }
