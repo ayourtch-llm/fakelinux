@@ -2948,7 +2948,17 @@ fn do_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) 
     // Linux guests may place 4KB guard pages (PROT_NONE) that would clobber
     // adjacent data if applied at 16KB granularity. Skip these.
     let addr_misaligned = addr & (page - 1) != 0;
-    if is_fixed && (addr_misaligned || length < page) {
+    // A page-ALIGNED MAP_SHARED file mapping whose only "sub-page" trait is a
+    // length < 16KB must NOT take the anon+pread snapshot path below: that gives
+    // each process a PRIVATE copy, so writes never reach the backing file and
+    // cross-process sharing silently breaks. (memif's region 0 is a ~2.5KB
+    // memfd mapped MAP_FIXED|MAP_SHARED at a 16K-aligned base; the writer's ring
+    // cookie stayed private and the peer read garbage -> "wrong cookie on tx
+    // ring".) Let it fall through to the native MAP_SHARED path, which maps the
+    // file's page directly. Only the genuinely misaligned case needs emulation.
+    let shared_file_aligned = (flags & 0x1 != 0) && (flags & 0x20 == 0)
+        && fd >= 0 && !addr_misaligned && offset & (page - 1) == 0;
+    if is_fixed && (addr_misaligned || length < page) && !shared_file_aligned {
         if prot == 0 {
             // PROT_NONE guard page smaller than a macOS page — skip it
             return addr;
