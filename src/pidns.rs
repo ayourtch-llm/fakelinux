@@ -139,10 +139,23 @@ pub fn translate_pid_arg(vpid: i32) -> i32 {
 }
 
 /// Set env vars for a child about to execve, so re-exec'd fakelinux can attach.
-/// With simplified PIDs, we only need to propagate the init PID.
+///
+/// No-op: `FAKELINUX_INIT_PID` is set ONCE in `init_container()` (and inherited
+/// from the parent's environ by `attach_container`), and its value — the
+/// container init's real PID — never changes for the container's lifetime.
+/// fork() copies the environ verbatim, so every descendant already carries the
+/// correct value; re-setting it here is redundant.
+///
+/// Crucially it is also UNSAFE: this runs on the forking thread inside the fork
+/// trampoline, and `std::env::set_var` takes Rust's process-wide `ENV_LOCK`
+/// (a RwLock backed by a libdispatch semaphore on macOS). If this process was
+/// itself forked while another thread held `ENV_LOCK`, the inherited lock is
+/// stuck locked forever (its owner thread didn't survive the fork) and the
+/// write() here deadlocks in `_dispatch_semaphore_wait_slow` — observed wedging
+/// whole parallel (TEST_JOBS>1) test runs. Touching `std::env` in fork context
+/// is exactly what the cached-trace-flag rule exists to prevent.
 pub fn set_child_env() {
-    let init_pid = INIT_REAL_PID.load(Ordering::Relaxed);
-    std::env::set_var("FAKELINUX_INIT_PID", init_pid.to_string());
+    // Intentionally empty — see doc comment. FAKELINUX_INIT_PID is inherited.
 }
 
 /// No-op for compatibility — parent env doesn't need restoring
