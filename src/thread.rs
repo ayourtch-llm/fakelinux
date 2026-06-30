@@ -189,6 +189,16 @@ pub fn signal_guest_thread(tid: i32, mac_sig: i32) -> Option<i32> {
     if host == 0 {
         return None;
     }
+    // FAKELINUX_TRACE_SIGUSR1: hunt the intermittent "clang: User defined
+    // signal 1" link failures — log every SIGUSR1 (macOS 30) delivered to a
+    // guest thread, with the target tid + host pthread, so the sender/target
+    // misroute can be caught.
+    if mac_sig == 30 && std::env::var_os("FAKELINUX_TRACE_SIGUSR1").is_some() {
+        let pid = unsafe { libc::getpid() };
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] SIGUSR1 -> guest tid={} host_pthread={:#x}\n",
+            pid, tid, host));
+    }
     Some(unsafe { libc::pthread_kill(host as libc::pthread_t, mac_sig) })
 }
 
@@ -875,6 +885,7 @@ extern "C" fn fork_trampoline_entry() -> ! {
         crate::trap::init_child_after_fork();
         reset_main_thread_after_fork();
         crate::syscall::reset_socket_waiters_after_fork();
+        crate::timers::reset_after_fork();
         IS_FORK_CHILD.store(true, Ordering::Relaxed);
         // A fork child is never vpid 1 — clear the COW-inherited init flag so
         // getpid() returns the child's own pid (not 1), keeping job-control

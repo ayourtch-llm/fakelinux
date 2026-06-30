@@ -133,6 +133,11 @@ fn fire_timer(id: usize, t: GuestTimer) {
             crate::signal::PENDING_SIGNALS.fetch_or(1u64 << (t.signo - 1), Ordering::SeqCst);
         }
     } else if let Some(mac_sig) = crate::signal::linux_to_mac(t.signo) {
+        if mac_sig == 30 && std::env::var_os("FAKELINUX_TRACE_SIGUSR1").is_some() {
+            crate::syscall::raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] SIGUSR1 from timer FIRE id={} signo={}\n",
+                unsafe { libc::getpid() }, id, t.signo));
+        }
         unsafe {
             libc::kill(libc::getpid(), mac_sig);
         }
@@ -171,6 +176,22 @@ fn dispatcher_loop() {
         let (g, _timeout) = TIMERS_CV.wait_timeout(guard, wait).unwrap();
         guard = g;
     }
+}
+
+/// Reset all timer state in a freshly-forked child. POSIX: a child does NOT
+/// inherit its parent's POSIX/interval timers across fork. fakelinux's TIMERS
+/// array and the DISPATCHER_RUNNING flag live in process memory, so a fork
+/// would copy armed timers + DISPATCHER_RUNNING=true into the child WITHOUT the
+/// dispatcher thread (fork copies only the calling thread) — leaving the child
+/// with timers that never fire AND a flag that blocks ever spawning one. Clear
+/// both so the child starts clean (a later timer_settime re-arms + respawns).
+pub fn reset_after_fork() {
+    if let Ok(mut timers) = TIMERS.lock() {
+        for t in timers.iter_mut() {
+            *t = GuestTimer { in_use: false, signo: 0, sival: 0, deadline_ns: None, interval_ns: 0 };
+        }
+    }
+    DISPATCHER_RUNNING.store(false, Ordering::SeqCst);
 }
 
 fn ensure_dispatcher() {

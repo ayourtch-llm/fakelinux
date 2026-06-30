@@ -1507,6 +1507,11 @@ pub fn do_kill(pid: i64, linux_sig: i32) -> u64 {
             "fakelinux: kill(real_pid={}, mac_sig={}) from pid={}\n",
             pid, mac_sig, unsafe { libc::getpid() }));
     }
+    if mac_sig == 30 && std::env::var_os("FAKELINUX_TRACE_SIGUSR1").is_some() {
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] SIGUSR1 kill -> pid={}\n",
+            unsafe { libc::getpid() }, pid));
+    }
     let ret = unsafe { libc::kill(pid as i32, mac_sig) };
     if crate::syscall::trace_enabled() {
         crate::syscall::raw_eprintln_fmt(format_args!(
