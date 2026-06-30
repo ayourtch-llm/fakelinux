@@ -248,6 +248,12 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
             // pre-adjusting would cause double relocation).
             fixup_exec_pointers_skip_dynamic(elf, base_offset);
 
+            // Apply R_AARCH64_RELATIVE for slid ET_EXEC. ld-linux normally
+            // applies these with B=0 for ET_EXEC (no slide expected), so the
+            // _skip_dynamic heuristic above leaves them at link-time values.
+            // RELA semantics are absolute-assignment so idempotent vs ld-linux.
+            apply_relocations_from_memory(elf, base_offset);
+
             // Enable lazy relocation: SIGSEGV handler will fix up remaining
             // unrelocated pointers on demand (addresses in the original ET_EXEC
             // range that have no RELA entries and weren't caught by the scan).
@@ -269,6 +275,9 @@ pub fn load(elf: &Elf, data: &[u8], guest_args: &[String], sysroot: &str) -> Res
         } else {
             fixup_exec_pointers(elf, base_offset);
         }
+        // Go binaries: pcHeader.textStart lives in read-only .gopclntab,
+        // missed by both the .rodata scan and the writable-segment scan.
+        fixup_exec_gopclntab(elf, data, base_offset);
     }
 
     // Set up the guest stack
@@ -1758,7 +1767,12 @@ fn setup_stack(
 /// recovered by the lazy-relocation fault handler on first dereference,
 /// but a relocated non-pointer is silent memory corruption.
 fn plausible_unrelocated_pointer(val: u64, orig_lo: u64, orig_hi: u64) -> bool {
-    if val < orig_lo || val >= orig_hi {
+    // Inclusive upper bound: Go's firstmoduledata.end (and enoptrbss) hold
+    // the exact one-past-end address of all loaded segments — that's a
+    // legitimate pointer value the runtime compares against, so it must be
+    // relocated. Excluding it stranded those fields at link-time, breaking
+    // stkobjinit's module-bounds lookup for addresses in .noptrbss.
+    if val < orig_lo || val > orig_hi {
         return false;
     }
     let sparse = val.to_le_bytes().iter().filter(|&&b| b != 0).count() <= 2;
@@ -2213,6 +2227,92 @@ fn fixup_exec_pointers(elf: &Elf, base_offset: u64) {
     }
     if fixed > 0 {
         crate::vlog!("fakelinux: fixed up {} absolute pointers in ET_EXEC data", fixed);
+    }
+}
+
+/// Patch the Go runtime's pcHeader.textStart in `.gopclntab` after sliding
+/// an ET_EXEC binary off PAGEZERO. Go's `moduledataverify1` aborts with
+/// "invalid function symbol table" if pcHeader.textStart != mod.text — the
+/// latter is in writable data and gets fixed by fixup_exec_pointers, but
+/// pcHeader lives in read-only .gopclntab which neither scan touches.
+/// Only textStart is absolute; the rest of pcHeader is offsets within the
+/// table, and per-func entryoff stays valid under uniform relocation.
+fn fixup_exec_gopclntab(elf: &Elf, data: &[u8], base_offset: u64) {
+    let e_shoff = elf::read_u64_pub(data, 40) as usize;
+    let e_shentsize = elf::read_u16_pub(data, 58) as usize;
+    let e_shnum = elf::read_u16_pub(data, 60) as usize;
+    let e_shstrndx = elf::read_u16_pub(data, 62) as usize;
+    if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 || e_shstrndx >= e_shnum {
+        return;
+    }
+    let str_off = e_shoff + e_shstrndx * e_shentsize;
+    if str_off + 64 > data.len() {
+        return;
+    }
+    let shstr_offset = elf::read_u64_pub(data, str_off + 24) as usize;
+
+    let page: u64 = 16384;
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        if off + 64 > data.len() { break; }
+        let sh_name = elf::read_u32_pub(data, off) as usize;
+        let sh_addr = elf::read_u64_pub(data, off + 16);
+        let sh_size = elf::read_u64_pub(data, off + 32);
+        if sh_addr == 0 || sh_size < 0x20 { continue; }
+        let name_pos = shstr_offset + sh_name;
+        if name_pos >= data.len() { continue; }
+        if !data[name_pos..].starts_with(b".gopclntab\0") {
+            continue;
+        }
+
+        // Verify pcHeader magic — covers Go 1.18 (0xfffffff0), 1.20+ (0xfffffff1).
+        // Older Go versions don't have an absolute textStart in pcHeader.
+        let hdr_addr = base_offset + sh_addr;
+        let magic = unsafe { *(hdr_addr as *const u32) };
+        if magic != 0xfffffff0 && magic != 0xfffffff1 {
+            crate::vlog!("fakelinux: .gopclntab present but unknown magic {:#x}, skipping", magic);
+            return;
+        }
+        // pcHeader layout (Go 1.18+):
+        //   0x00 magic u32 | 0x04 pad1/pad2/minLC/ptrSize | 0x08 nfunc | 0x10 nfiles
+        //   0x18 textStart uintptr
+        let text_start_addr = hdr_addr + 0x18;
+        let cur = unsafe { *(text_start_addr as *const u64) };
+        if cur >= base_offset {
+            // Already relocated (or not absolute) — nothing to do.
+            return;
+        }
+
+        let prot_lo = text_start_addr & !(page - 1);
+        let prot_hi = (text_start_addr + 8 + page - 1) & !(page - 1);
+        let r = unsafe {
+            libc::mprotect(prot_lo as *mut _, (prot_hi - prot_lo) as usize,
+                           libc::PROT_READ | libc::PROT_WRITE)
+        };
+        if r != 0 {
+            eprintln!("fakelinux: gopclntab fixup: mprotect RW failed, skipping");
+            return;
+        }
+        unsafe { *(text_start_addr as *mut u64) = cur + base_offset; }
+
+        // Restore protections from covering PT_LOAD per page.
+        let mut pg = prot_lo;
+        while pg < prot_hi {
+            let vaddr = pg - base_offset;
+            let mut prot = libc::PROT_READ;
+            for phdr in &elf.phdrs {
+                if phdr.p_type != PT_LOAD { continue; }
+                if vaddr + page > phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_memsz {
+                    if phdr.p_flags & 1 != 0 { prot |= libc::PROT_EXEC; }
+                    if phdr.p_flags & 2 != 0 { prot |= libc::PROT_WRITE; }
+                }
+            }
+            unsafe { libc::mprotect(pg as *mut _, page as usize, prot); }
+            pg += page;
+        }
+        crate::vlog!("fakelinux: patched Go .gopclntab pcHeader.textStart {:#x} → {:#x}",
+                     cur, cur + base_offset);
+        return;
     }
 }
 
