@@ -125,6 +125,7 @@ pub const SYS_MEMBARRIER: u64 = 283;
 pub const SYS_FLOCK: u64 = 32;
 pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
+pub const SYS_TRUNCATE: u64 = 45;
 pub const SYS_FTRUNCATE: u64 = 46;
 pub const SYS_SENDFILE: u64 = 71;
 pub const SYS_SPLICE: u64 = 76;

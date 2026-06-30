@@ -612,6 +612,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_LINKAT => do_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as i32),
         SYS_FLOCK => do_flock(args[0] as i32, args[1] as i32),
         SYS_UTIMENSAT => do_utimensat(args[0] as i32, args[1], args[2], args[3] as i32),
+        SYS_TRUNCATE => do_truncate(args[0], args[1] as i64),
         SYS_FTRUNCATE => do_ftruncate(args[0] as i32, args[1] as i64),
         SYS_NANOSLEEP => do_nanosleep(args[0], args[1]),
         SYS_CLOCK_GETRES => do_clock_getres(args[0] as i32, args[1]),
@@ -4092,6 +4093,25 @@ fn do_ftruncate(fd: i32, length: i64) -> u64 {
     if ret < 0 { translate::linux_errno() } else { 0 }
 }
 
+/// truncate(path, length) — by path, with rootfs translation. VPP's mapped-pcap
+/// (mpcap_close) shrinks the file with truncate(path,...) after munmap; without
+/// this the file stays at its full mmap size (TestMpcap got 10485760 vs 2184).
+/// Mirrors the chdir/mkdirat idiom: try the rootfs-translated path, and when a
+/// pass-through path (e.g. /tmp maps to host /tmp) leaves the translated path
+/// nonexistent outside full-rootfs mode, retry the original guest path.
+fn do_truncate(path_ptr: u64, length: i64) -> u64 {
+    let (eff_path, hold) = effective_path_ptr(path_ptr);
+    let ret = unsafe { libc::truncate(eff_path, length) };
+    if ret == 0 {
+        0
+    } else if hold.is_some() && !rootfs::in_full_rootfs_mode() {
+        let ret2 = unsafe { libc::truncate(path_ptr as *const i8, length) };
+        if ret2 < 0 { translate::linux_errno() } else { 0 }
+    } else {
+        translate::linux_errno()
+    }
+}
+
 fn do_nanosleep(req_ptr: u64, rem_ptr: u64) -> u64 {
     // Linux and macOS struct timespec have the same layout on aarch64
     let req = req_ptr as *const libc::timespec;
@@ -4513,6 +4533,30 @@ mod tests {
         unsafe {
             libc::close(peer_fd);
         }
+    }
+
+    #[test]
+    fn do_truncate_shrinks_file_by_path() {
+        // SYS_TRUNCATE was unimplemented (ENOSYS), so VPP's mpcap_close
+        // truncate(path, actual_size) silently failed and the mapped-pcap file
+        // stayed at its full 10 MiB mmap size (TestMpcap: 10485760 vs 2184).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fakelinux_trunc_test_{}.bin", unsafe { libc::getpid() }));
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // Create a 4096-byte file via ftruncate.
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644) };
+        assert!(fd >= 0, "open failed");
+        assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
+        unsafe { libc::close(fd) };
+
+        // Shrink by PATH through do_truncate (the syscall path).
+        let ret = do_truncate(cpath.as_ptr() as u64, 100);
+        assert_eq!(ret, 0, "do_truncate returned errno {}", ret as i64);
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::stat(cpath.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_size, 100, "file not truncated to 100 bytes");
+        unsafe { libc::unlink(cpath.as_ptr()) };
     }
 
     #[test]
