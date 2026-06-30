@@ -1273,31 +1273,16 @@ fn wake_socket_before_close(fd: i32) {
         return;
     }
     CLOSE_SOCKET.fetch_add(1, Ordering::Relaxed);
+    // Peer-SAFE wake: bumping the close generation wakes any fakelinux-mediated
+    // interruptible waiter (the recv/poll loop in wait_ready_interruptible) on
+    // this fd WITHOUT touching the socket object, so it never affects the peer
+    // or a process sharing the fd via fork. This is the primary wake mechanism
+    // and covers every real guest blocking recv (do_read/do_recvfrom/do_recvmsg
+    // all route through wait_ready_interruptible).
     bump_socket_close_generation(fd);
     let has_waiter = socket_has_waiter(fd);
     let guest_threaded = thread::has_multiple_guest_threads();
     let used_interruptible_wait = socket_used_interruptible_wait(fd);
-    // host_threaded_control_socket = !has_waiter && host_threaded
-    //   && (has_recv_timeout || used_interruptible_wait). Evaluate the cheap
-    //   atomic terms first and only make the host_has_multiple_threads() mach
-    //   call / SO_RCVTIMEO getsockopt when they can still flip the result.
-    let host_threaded_control_socket = !has_waiter
-        && (used_interruptible_wait || socket_has_recv_timeout(fd))
-        && host_has_multiple_threads();
-    // socket_has_duplicate_open_fd() is an O(open_max) fstat scan of the whole
-    // fd table — the single most expensive thing here. Its value only affects
-    // the decision when the cheap signals leave it ambiguous, i.e. a
-    // single-threaded guest with no waiter closing an interruptible/control
-    // socket. For the common case (ordinary socket, single thread, no waiter)
-    // we skip the scan entirely. See the gate logic below.
-    let need_dup = !guest_threaded
-        && !has_waiter
-        && (host_threaded_control_socket || used_interruptible_wait);
-    let has_duplicate = if need_dup {
-        socket_has_duplicate_open_fd(fd)
-    } else {
-        false
-    };
     if trace_close {
         let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!(
@@ -1306,14 +1291,24 @@ fn wake_socket_before_close(fd: i32) {
             socket_has_recv_timeout(fd), used_interruptible_wait,
         ));
     }
-    if !guest_threaded
-        && !has_waiter
-        && !host_threaded_control_socket
-        && !(used_interruptible_wait && !has_duplicate)
-    {
+    // shutdown(SHUT_RDWR) is the ONLY way to wake a sibling blocked in a RAW
+    // host recv that the generation bump can't reach (macOS close() alone does
+    // not wake another thread's blocked recv). But shutdown() acts on the shared
+    // socket object: it sends EOF to the peer AND to any process holding the fd
+    // via fork. So issue it ONLY when a local sibling is currently registered as
+    // waiting on THIS fd (has_waiter). With no live waiter there is nothing to
+    // wake, and shutting down only damages a still-live peer — THAT was the
+    // parallel-run "manager death" bug: forked, multithreaded VPP test children
+    // closing their fork-inherited copy of a Python multiprocessing Manager
+    // AF_UNIX connection (waiter=false) issued shutdown() and EOF'd the live
+    // Manager/runner in another process. See [[project_parallel_jobs_campaign]].
+    if !has_waiter {
         return;
     }
-    if !guest_threaded && !has_waiter && has_duplicate {
+    // Even with a live waiter, never shutdown a socket that still has a
+    // duplicate open fd in this process: Linux close() of one dup does not tear
+    // down the socket, so shutdown would wrongly EOF the dup's peer.
+    if socket_has_duplicate_open_fd(fd) {
         if trace_close {
             let pid = unsafe { libc::getpid() };
             raw_eprintln_fmt(format_args!(
@@ -1323,12 +1318,9 @@ fn wake_socket_before_close(fd: i32) {
         }
         return;
     }
-    // Linux close() wakes another thread blocked in recv/send on the same
-    // socket fd. macOS close() alone often does not; shutdown() provides the
-    // wakeup before the descriptor is actually closed. Avoid doing this for
-    // ordinary single-threaded close(): shutdown() affects the socket object,
-    // so it can break forked children closing inherited descriptors or code
-    // closing a dup while another fd still owns the socket.
+    // A local sibling is blocked in recv on this exact fd with no other
+    // reference: emulate Linux close()-wakes-recv via shutdown() before the
+    // descriptor is actually closed.
     if TRACE_SHUTDOWN.load(Ordering::Relaxed) {
         let pid = unsafe { libc::getpid() };
         // within-process dup: fork-inherited dups live in another process and
@@ -4489,6 +4481,12 @@ mod tests {
         let peer_fd = sv[1];
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
+            // A guest thread blocked in recv registers a SocketWaiter (real
+            // recvs go through wait_ready_interruptible, which does this). The
+            // live waiter is what authorizes close() to shutdown()-wake it —
+            // distinguishing a genuine local sibling from a fork-inherited /
+            // peer socket with no waiter (the manager-death case).
+            let _waiter = SocketWaiter::new(recv_fd).expect("waiter should register");
             let mut byte = 0u8;
             let ret = unsafe {
                 libc::recv(
@@ -4574,6 +4572,53 @@ mod tests {
         assert_eq!(recvd, 1, "recv after dup close failed");
         assert_eq!(got, byte);
 
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+    }
+
+    #[test]
+    fn threaded_close_of_dup_socket_does_not_shutdown_peer() {
+        // Repro of the parallel-run "manager death" bug. A MULTITHREADED guest
+        // (guest_threads > 1) closes a fd that is one reference to a connected
+        // AF_UNIX socket while another reference (here a dup; in the real bug a
+        // fork-inherited copy in another process) keeps the connection alive,
+        // and NO local thread is waiting on it (waiter=false). close() must not
+        // shutdown(SHUT_RDWR) the socket: doing so EOFs the still-live peer,
+        // which is what broke Python multiprocessing Manager connections in the
+        // VPP test framework. Same as single_thread_close_of_dup_socket_* but
+        // with a threaded guest — the threaded path used to skip the dup guard
+        // and shutdown unconditionally. See [[project_parallel_jobs_campaign]].
+        let mut sv = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        thread::set_live_guest_threads_for_test(4);
+        // The manager sockets had waited=true (used in an interruptible wait)
+        // but no CURRENT waiter — reproduce that exactly.
+        mark_interruptible_socket_fd(sv[0]);
+
+        let dup_fd = unsafe { libc::dup(sv[0]) };
+        assert!(dup_fd >= 0, "dup failed");
+        assert_eq!(do_close(dup_fd), 0);
+
+        let byte = 0x7eu8;
+        let sent = unsafe {
+            libc::send(
+                sv[1],
+                &byte as *const _ as *const libc::c_void,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, 1, "send over peer after threaded dup close failed");
+
+        let mut got = 0u8;
+        let recvd = unsafe { libc::recv(sv[0], &mut got as *mut _ as *mut libc::c_void, 1, 0) };
+        assert_eq!(recvd, 1, "recv after threaded dup close failed (peer was shut down)");
+        assert_eq!(got, byte);
+
+        thread::set_live_guest_threads_for_test(1);
         unsafe {
             libc::close(sv[0]);
             libc::close(sv[1]);
