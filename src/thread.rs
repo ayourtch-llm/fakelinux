@@ -458,23 +458,14 @@ fn setup_thread_signal_stack() {
         libc::sigfillset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
 
-        // Also install crash handlers
-        let mut sa2: libc::sigaction = std::mem::zeroed();
-        sa2.sa_sigaction = crash_handler_ptr();
-        sa2.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa2.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
-        libc::sigaction(libc::SIGBUS, &sa2, std::ptr::null_mut());
+        // SIGSEGV/SIGBUS handlers are PROCESS-WIDE on macOS (sigaction affects
+        // all threads). We must NOT reinstall them here: doing so with SIG_DFL
+        // (the historical placeholder) silently demoted the process-wide
+        // fakelinux SIGSEGV/SIGBUS handler to default-abort the first time any
+        // guest thread spawned, then the next lazy-reloc fault (or any
+        // forwarded fault) killed the process. The process-wide install in
+        // trap.rs is the only one needed.
     }
-}
-
-fn crash_handler_ptr() -> libc::sighandler_t {
-    // Re-use the crash handler from trap.rs — it's the same function pointer.
-    // We just need the extern "C" fn pointer. Since it's not pub, we'll
-    // re-install via the same pattern as install_handler.
-    // Actually, trap.rs crash_handler is not pub. Let's just skip re-installing
-    // crash handlers; they're process-wide on macOS anyway.
-    0 as libc::sighandler_t // SIG_DFL — will use whatever was installed
 }
 
 extern "C" fn clone_entry(arg: *mut libc::c_void) -> *mut libc::c_void {

@@ -4289,23 +4289,37 @@ fn do_guest_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     // sigtramp running with SP inside gsignal range, satisfying its check.
     use crate::signal;
 
+    const SS_ONSTACK: i32 = 1;
+    const SS_DISABLE: i32 = 2;
+
     if old_ss_ptr != 0 {
         let old = old_ss_ptr as *mut u8;
         unsafe {
             let (sp, flags, size) = signal::get_guest_sigaltstack();
+            // Report SS_ONSTACK if a SA_ONSTACK handler is currently active on
+            // this thread's altstack — matches Linux sigaltstack(2) semantics.
+            let reported = if signal::altstack_depth() > 0 { flags | SS_ONSTACK }
+                           else { flags };
             (old as *mut u64).write_unaligned(sp);
-            (old.add(8) as *mut i32).write_unaligned(flags);
+            (old.add(8) as *mut i32).write_unaligned(reported);
             // pad 4 bytes
             (old.add(16) as *mut u64).write_unaligned(size);
         }
     }
     if ss_ptr != 0 {
+        // Linux refuses sigaltstack() while already on the altstack — EPERM.
+        // Preserves the invariant that a running handler's stack can't be
+        // pulled out from under it.
+        if signal::altstack_depth() > 0 {
+            return (-1_i64) as u64; // -EPERM
+        }
         let ss = ss_ptr as *const u8;
         unsafe {
             let sp = (ss as *const u64).read_unaligned();
             let flags = (ss.add(8) as *const i32).read_unaligned();
             let size = (ss.add(16) as *const u64).read_unaligned();
-            signal::set_guest_sigaltstack(sp, flags, size);
+            // Strip the read-only SS_ONSTACK bit if the guest passed it back.
+            signal::set_guest_sigaltstack(sp, flags & !SS_ONSTACK, size);
         }
     }
     0

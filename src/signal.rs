@@ -15,6 +15,12 @@ thread_local! {
     static GUEST_ALTSTACK_SP: Cell<u64> = const { Cell::new(0) };
     static GUEST_ALTSTACK_FLAGS: Cell<i32> = const { Cell::new(2) }; // SS_DISABLE
     static GUEST_ALTSTACK_SIZE: Cell<u64> = const { Cell::new(0) };
+    /// Per-thread depth of currently-active SA_ONSTACK handler frames on
+    /// the guest altstack. Real Linux exposes this as the SS_ONSTACK bit
+    /// in sigaltstack(2)'s readback flags and refuses to swap the altstack
+    /// while >0. Set by build_sigframe_and_redirect when it places a frame
+    /// on the altstack, cleared by do_rt_sigreturn when that frame returns.
+    static ALTSTACK_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Guest signal mask — PER-THREAD, matching Linux (pthread_sigmask affects
     /// only the calling thread). A const-initialized thread_local is safe to
     /// touch from the SIGILL trap context (no lazy init / malloc), like the
@@ -72,6 +78,21 @@ pub fn set_guest_sigaltstack(sp: u64, flags: i32, size: u64) {
     GUEST_ALTSTACK_SP.with(|s| s.set(sp));
     GUEST_ALTSTACK_FLAGS.with(|f| f.set(flags));
     GUEST_ALTSTACK_SIZE.with(|s| s.set(size));
+}
+
+#[inline]
+pub fn altstack_depth() -> u32 {
+    ALTSTACK_DEPTH.with(|d| d.get())
+}
+
+#[inline]
+pub fn altstack_depth_inc() {
+    ALTSTACK_DEPTH.with(|d| d.set(d.get() + 1));
+}
+
+#[inline]
+pub fn altstack_depth_dec() {
+    ALTSTACK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 }
 
 /// Guest signal handler entry.
@@ -521,6 +542,7 @@ pub unsafe fn build_sigframe_and_redirect(
     // because fakelinux's own trap handler is already standing on its altstack
     // (EPERM from inside the trap), so we honor SA_ONSTACK in software here.
     const SA_ONSTACK: u64 = 0x0800_0000;
+    let mut used_altstack = false;
     let guest_sp = {
         let on_stack = linux_sig > 0 && linux_sig <= 64 && {
             let sa = GUEST_SIGACTIONS[linux_sig as usize].load();
@@ -529,12 +551,13 @@ pub unsafe fn build_sigframe_and_redirect(
         let (alt_sp, alt_flags, alt_size) = get_guest_sigaltstack();
         const SS_DISABLE: i32 = 2;
         if on_stack && alt_sp != 0 && alt_flags & SS_DISABLE == 0 && alt_size >= 0x1000 {
-            // If the interrupted SP is already inside the altstack range, a
-            // previous handler is still using it — push the new frame below
-            // the current SP rather than restarting from the top (that would
-            // overwrite the in-flight handler's frame). Real Linux tracks this
-            // via SS_ONSTACK; we infer it from SP position.
-            if regs.sp > alt_sp && regs.sp <= alt_sp + alt_size {
+            used_altstack = true;
+            // Nested SA_ONSTACK delivery: an outer handler is already on the
+            // altstack (depth > 0). Push the new frame BELOW the interrupted
+            // SP rather than restarting from altstack top — restarting would
+            // overwrite the in-flight handler's frame. Real Linux does the
+            // same via SS_ONSTACK.
+            if altstack_depth() > 0 {
                 regs.sp
             } else {
                 alt_sp + alt_size
@@ -733,6 +756,16 @@ pub unsafe fn build_sigframe_and_redirect(
         }
     }
 
+    // Stash "this frame consumed an altstack slot" in the pad at offset 276
+    // (between cpsr at 272 and tpidr at 280; was always zeroed). do_rt_sigreturn
+    // reads this back to decrement ALTSTACK_DEPTH so we keep an accurate count
+    // of currently-active SA_ONSTACK handlers per thread, matching Linux's
+    // SS_ONSTACK semantics.
+    (p.add(276) as *mut u32).write_unaligned(if used_altstack { 1 } else { 0 });
+    if used_altstack {
+        altstack_depth_inc();
+    }
+
     // Redirect guest execution to the handler
     regs.sp = frame_addr;
     regs.pc = handler;
@@ -758,6 +791,14 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         let msg = "fakelinux: rt_sigreturn: invalid sigframe trampoline\n";
         libc::write(2, msg.as_ptr() as *const _, msg.len());
         return false;
+    }
+
+    // If this frame was placed on the guest altstack (SA_ONSTACK), decrement
+    // the per-thread depth so future signals know whether to start a fresh
+    // altstack frame at the top or push below an in-flight handler. Marker
+    // stored in the pad at offset 276 by build_sigframe_and_redirect.
+    if (p.add(276) as *const u32).read_unaligned() == 1 {
+        altstack_depth_dec();
     }
 
     // DIAGNOSTIC (gated): verify the saved register region was not overwritten
