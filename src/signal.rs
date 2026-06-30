@@ -511,8 +511,30 @@ pub unsafe fn build_sigframe_and_redirect(
     si_code: i32,
 ) {
     let regs = &mut mctx.ss;
-    let guest_sp = regs.sp;
     let guest_tpidr = crate::trap::get_thread_tpidr();
+    // If the guest installed this handler with SA_ONSTACK and registered an
+    // alternate signal stack, place the sigframe on the alt stack rather than
+    // on the interrupted goroutine/thread stack. Go's runtime sigtramp checks
+    // that its SP is inside [gsignal.lo, gsignal.hi) and aborts otherwise —
+    // "non-Go code set up signal handler without SA_ONSTACK flag" — on the
+    // first SIGURG preemption. We can't mirror via macOS sigaltstack(2)
+    // because fakelinux's own trap handler is already standing on its altstack
+    // (EPERM from inside the trap), so we honor SA_ONSTACK in software here.
+    const SA_ONSTACK: u64 = 0x0800_0000;
+    let guest_sp = {
+        let on_stack = linux_sig > 0 && linux_sig <= 64 && {
+            let sa = GUEST_SIGACTIONS[linux_sig as usize].load();
+            sa.flags & SA_ONSTACK != 0
+        };
+        let (alt_sp, alt_flags, alt_size) = get_guest_sigaltstack();
+        const SS_DISABLE: i32 = 2;
+        if on_stack && alt_sp != 0 && alt_flags & SS_DISABLE == 0 && alt_size >= 0x1000 {
+            // Stack grows down; top of altstack is the starting SP.
+            alt_sp + alt_size
+        } else {
+            regs.sp
+        }
+    };
     // If a ppoll-style temp mask swap is in flight, the sigframe must restore
     // the ORIGINAL (pre-ppoll) mask — Linux TIF_RESTORE_SIGMASK semantics.
     let old_sigmask = if SWAP_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {

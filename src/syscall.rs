@@ -744,6 +744,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_COPY_FILE_RANGE => do_copy_file_range(args[0] as i32, args[1], args[2] as i32, args[3], args[4], args[5] as u32),
         // Keyring syscalls — stub to -ENOSYS silently (used by apt/gpg, not critical)
         216 | 217 | 219 => (-38_i64) as u64,
+        // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
+        // to "no seccomp" code paths (typical for libseccomp probes).
+        277 => (-38_i64) as u64,
         _ => {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: unimplemented syscall {} (x0={:#x} x1={:#x} x2={:#x})\n",
@@ -4278,8 +4281,12 @@ fn do_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> u64 {
 
 fn do_guest_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     // Linux sigaltstack: struct { void *ss_sp; int ss_flags; size_t ss_size; }
-    // We store the guest's sigaltstack in thread-local state.
-    // For now, just report "not active" and accept the set.
+    // We record the guest's altstack in TLS; we do NOT call macOS sigaltstack()
+    // because fakelinux's own trap handlers run on their own altstack and macOS
+    // returns EPERM when called from inside an active alt-signal frame. Instead,
+    // build_sigframe_and_redirect honors SA_ONSTACK by placing the sigframe at
+    // the top of the recorded guest altstack — Go's runtime then sees its
+    // sigtramp running with SP inside gsignal range, satisfying its check.
     use crate::signal;
 
     if old_ss_ptr != 0 {
