@@ -158,7 +158,30 @@ var/lib/containers/storage run/containers/storage etc/containers` + a minimal
 `etc/containers/storage.conf` with the vfs driver. If missing, `podman info` hits
 "Error: no such file or directory".
 
-**`podman run --rm alpine echo hi` still crashes** with a Go runtime panic:
+### Container-in-container achieved (via direct chroot)
+
+While podman *run* still crashes (below), the alpine layer that `podman pull` extracted
+into `roots/ubuntu/var/lib/containers/storage/vfs/dir/<digest>/` IS a working rootfs. Ran
+directly by pointing fakelinux at it:
+
+```
+$ ALPINE=roots/ubuntu/var/lib/containers/storage/vfs/dir/b2848.../409
+$ FAKELINUX_ROOT=$ALPINE ./target/release/fakelinux --container $ALPINE/bin/sh -c \
+    'echo "hello from alpine!"; cat /etc/os-release | head -3'
+hello from alpine!
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=3.24.1
+```
+
+That's container-in-container: Ubuntu rootfs (level 1, fakelinux) → podman pulls alpine
+image → alpine rootfs (level 2, fakelinux). `apk update` however hits a fakelinux
+`EmulClass::Other` panic on `br x18` (0xd61f0240) at PC in alpine's busybox — a code
+path our x18 trampolines don't cover yet. Add support for `br x18` (register-indirect
+branch through x18) as the next fakelinux fix; then apk should work and we can install
+build-base + git and clone VPP.
+
+### `podman run --rm alpine echo hi` still crashes
 ```
 runtime: bad pointer in frame github.com/containers/common/libimage.(*Runtime).Pull at 0x14000347538: 0x4
 fatal error: invalid pointer found on stack

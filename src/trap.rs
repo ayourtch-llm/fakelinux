@@ -417,6 +417,33 @@ fn emulate_x18_instruction(orig_instr: u32, mctx: &mut MContext64) -> bool {
             if orig_instr & 0x9FE0_8400 == 0x0E00_0400 {
                 return emul_simd_copy(orig_instr, mctx);
             }
+            // BR/BLR/RET Xn — unconditional branches through a register.
+            // When Xn=x18 the x18-trampoline patcher intentionally falls
+            // through to UDF emulation (island can't relocate the branch
+            // target). Alpine's busybox uses `br x18` in its dispatch
+            // stubs. Field layout:
+            //   BR :  0xD61F_0000 | (Rn << 5)
+            //   BLR:  0xD63F_0000 | (Rn << 5)
+            //   RET:  0xD65F_0000 | (Rn << 5)
+            let branch_mask = orig_instr & 0xFFFF_FC1F;
+            if branch_mask == 0xD61F_0000 || branch_mask == 0xD63F_0000
+                || branch_mask == 0xD65F_0000
+            {
+                let rn = ((orig_instr >> 5) & 0x1F) as usize;
+                let target = if rn == 18 {
+                    get_thread_x18()
+                } else if rn == 30 {
+                    mctx.ss.lr
+                } else {
+                    mctx.ss.x[rn]
+                };
+                // BLR: link — save return address (pc+4) into LR.
+                if branch_mask == 0xD63F_0000 {
+                    mctx.ss.lr = mctx.ss.pc + 4;
+                }
+                mctx.ss.pc = target;
+                return true;
+            }
             let pc = mctx.ss.pc;
             panic!(
                 "fakelinux: UNHANDLED EmulClass::{:?} for instr={:#010x} at pc={:#x}",
