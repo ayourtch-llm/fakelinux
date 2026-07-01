@@ -4,6 +4,30 @@ _Supersedes the 2026-06-29 cluster-A..E handoff. Memory index:
 `~/.claude/projects/-Users-ayourtch-rust-fakelinux/memory/MEMORY.md`; campaign detail in
 `project_parallel_jobs_campaign.md`. Branch `main`._
 
+## 2026-07-01 loop cycle 2 — podman-pull EACCES investigation, waitid tweaks
+
+**Blocker**: `podman pull` consistently hits `mkdir /temp-storage-extract...: permission denied`
+in the layer-extract subprocess, despite:
+- Same UID/EUID (my user, 501)
+- Parent dir b2848 exists at mkdirat time
+- Manual shell `mkdir` works on same path
+- The fakelinux subprocess can mkdir in /tmp fine
+- `libc::mkdir` in the parent → errno 13 (EACCES)
+
+macOS is refusing writes specifically to
+`roots/ubuntu/var/lib/containers/storage/vfs/dir/<subdir>/` from the fakelinux
+subprocess after chroot. Timing-dependent — with slow diagnostic writes enabled,
+sometimes succeeds; without them, consistently fails.
+
+Suspected: macOS App Sandbox / Endpoint Security tracking process provenance
+(`com.apple.provenance` xattr present; `xattr -rc` didn't clear it). See loop
+cycle 2 details in the main body below.
+
+**waitid stub** (commit `4a7bb26`): hybrid approach — try macOS waitid, map
+EINVAL→ECHILD so Go moves on. -ENOSYS broke Go stack scan earlier; naive
+translation broke pull. Current form lets pull complete without crash but the
+extracted image isn't saved.
+
 ## 2026-07-01 SESSION — podman works end-to-end under fakelinux
 
 User asked "let's have a look why podman crashes" and "make it work" autonomously.
