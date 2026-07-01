@@ -118,6 +118,13 @@ fn main() {
         std::process::exit(1);
     });
 
+    // execveat(memfd, AT_EMPTY_PATH) materializes the fd to a temp file for the
+    // re-exec (see syscall::do_execveat). Now that we've read it into memory,
+    // unlink it so it doesn't leak (one per crun memfd self-re-exec).
+    if elf_path.contains("/fakelinux_execveat_") {
+        let _ = std::fs::remove_file(&elf_path);
+    }
+
     let elf = elf::parse(&data).unwrap_or_else(|e| {
         eprintln!("fakelinux: {}", e);
         std::process::exit(1);
