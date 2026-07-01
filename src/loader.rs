@@ -1,6 +1,10 @@
 use crate::elf::{self, Elf, ElfError};
 use crate::linux::*;
 use crate::procfs;
+
+/// Diagnostic gate (FAKELINUX_RELOC_ALL=1): relocate every in-range value in
+/// the ET_EXEC pointer scan, bypassing the sparse-integer heuristic.
+pub static RELOC_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use crate::syscall;
 use crate::trap;
 
@@ -1774,6 +1778,12 @@ fn plausible_unrelocated_pointer(val: u64, orig_lo: u64, orig_hi: u64) -> bool {
     // stkobjinit's module-bounds lookup for addresses in .noptrbss.
     if val < orig_lo || val > orig_hi {
         return false;
+    }
+    // FAKELINUX_RELOC_ALL=1: diagnostic — relocate every in-range value,
+    // bypassing the sparse-integer heuristic below. Used to test whether a
+    // legit pointer is being wrongly rejected (alpine musl cc1 HUGE MMAP).
+    if RELOC_ALL.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
     }
     let sparse = val.to_le_bytes().iter().filter(|&&b| b != 0).count() <= 2;
     !(sparse && val >= 0x100_0000 && val & 0xFF_0000 == 0)

@@ -86,6 +86,9 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE").is_ok() {
         syscall::set_trace(true);
     }
+    if std::env::var("FAKELINUX_RELOC_ALL").is_ok() {
+        loader::RELOC_ALL.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if std::env::var("FAKELINUX_TRACE_STAT").is_ok() {
         syscall::set_stat_trace(true);
     }
