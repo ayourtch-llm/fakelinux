@@ -375,6 +375,7 @@ const NEON_SAVE_OFFSET: usize = 296;
 const SIGINFO_OFFSET: usize = 816;
 const UCONTEXT_OFFSET: usize = 944;
 const UCONTEXT_MCONTEXT: usize = 176; // offsetof(ucontext_t, uc_mcontext) on aarch64
+                                       // (verified via gcc -E on the guest)
 // aarch64 Linux ucontext_t is 4432 bytes — includes 4K of extended state
 // blocks (uc_mcontext.__reserved[4096] for FP/SVE state). Undersizing this
 // let Go's sigtramp write past our allocated region and land in whatever
