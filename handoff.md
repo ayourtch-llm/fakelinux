@@ -4,6 +4,27 @@ _Supersedes the 2026-06-29 cluster-A..E handoff. Memory index:
 `~/.claude/projects/-Users-ayourtch-rust-fakelinux/memory/MEMORY.md`; campaign detail in
 `project_parallel_jobs_campaign.md`. Branch `main`._
 
+## 2026-07-01 loop cycle 4 — podman pull END-TO-END (mkdir 0555 fix)
+
+**`podman pull docker.io/library/alpine` completes cleanly and stores the image.**
+
+Root cause of the last blocker (mkdir EACCES): podman creates its storage subdir with
+mode 0555 (r-x r-x r-x, no write for anyone). Then chroots into it, then tries mkdir
+`/temp-storage-extract...` inside. Real Linux root bypasses directory permission
+checks — that mkdir succeeds. Under fakelinux we run as macOS uid 501 (not root), so
+macOS honors 0555 and returns EACCES.
+
+Fix (commit `400fd46`): on mkdirat EACCES, stat the parent — if u+w bit is missing,
+chmod add it, retry, keep the bit set (real Linux root has unconditional dir-write).
+
+Verified: `podman pull` → image ID `1991bd789d71` visible in `podman images`. `podman
+run` still hits a separate Go-runtime crash (below).
+
+Related detour: tried reading sp/pc from uc_mcontext on sigreturn (176 offset,
+verified via gcc `offsetof(ucontext_t, uc_mcontext)`). Broke pull's download with
+gzip-checksum failures — Go's write to those slots wasn't matching semantics, and
+downloads got corrupted. Reverted in `0248a5a`.
+
 ## 2026-07-01 loop cycle 3 — Go stack crash FIXED (huge)
 
 Commit `b7e0fb7` "signal: restore sp/pc from uc_mcontext, not internal buffer".
