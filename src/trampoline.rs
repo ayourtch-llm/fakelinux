@@ -193,6 +193,12 @@ impl Trampoline {
         unsafe { (*self.regs.get()).x[0] = val; }
     }
 
+    /// Override the saved SP (e.g. to place a vfork/posix_spawn child on the
+    /// caller-provided child stack instead of the parent's SP).
+    pub fn set_sp(&self, val: u64) {
+        unsafe { (*self.regs.get()).sp = val; }
+    }
+
     /// Restore all guest registers and jump to the saved PC. Never returns.
     /// Call this at the end of a trampoline entry function after completing
     /// the deferred work.

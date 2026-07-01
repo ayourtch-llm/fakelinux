@@ -312,9 +312,10 @@ pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 /// Called from trap_handler via syscall::emulate. The `regs` parameter contains
 /// the guest's full register state at the point of the clone syscall.
 pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64, regs: &crate::trap::ThreadState64) -> u64 {
-    // Fork: clone without CLONE_VM
+    // Fork: clone without CLONE_VM. Plain fork gives the child its own copy of
+    // the parent's stack — child_stack is unused (and normally 0).
     if flags & CLONE_VM == 0 {
-        return do_fork(flags, child_tid_ptr);
+        return do_fork(flags, child_tid_ptr, 0);
     }
 
     // CLONE_VM | CLONE_VFORK (without CLONE_THREAD): vfork-like clone.
@@ -322,8 +323,14 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
     // parent's address space and the parent blocks until the child execs or
     // exits. We treat this as a regular fork — the child will re-exec
     // fakelinux anyway, so sharing the address space briefly is fine.
+    //
+    // CRITICAL: honor child_stack. musl's __clone runs the child function on
+    // the caller-provided stack: `ldp x1,x0,[sp]; blr x1`. If the child keeps
+    // the parent's SP (plain fork), that ldp reads a garbage fn pointer and
+    // blr branches into the stack → SIGBUS. Pass child_stack so the child
+    // resumes on the right stack.
     if flags & CLONE_VFORK != 0 && flags & CLONE_THREAD == 0 {
-        return do_fork(flags, child_tid_ptr);
+        return do_fork(flags, child_tid_ptr, child_stack);
     }
 
     // Thread creation requires CLONE_THREAD
@@ -398,7 +405,7 @@ pub fn do_clone_with_regs(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls
 pub fn do_clone(flags: u64, child_stack: u64, parent_tid_ptr: u64, tls: u64, child_tid_ptr: u64) -> u64 {
     // Fork path doesn't need regs — it uses the trampoline.
     if flags & CLONE_VM == 0 {
-        return do_fork(flags, child_tid_ptr);
+        return do_fork(flags, child_tid_ptr, 0);
     }
     // Thread creation without regs: cannot work properly.
     // This should not be called for CLONE_THREAD; syscall.rs should use do_clone_with_regs.
@@ -568,8 +575,12 @@ pub fn init_trampolines(base_addr: u64) {
 /// used outside signal context after sigreturn).
 static FORK_FLAGS: AtomicU64 = AtomicU64::new(0);
 static FORK_CHILD_TID_PTR: AtomicU64 = AtomicU64::new(0);
+/// Child stack for vfork/posix_spawn-style clone (CLONE_VM|CLONE_VFORK). Zero
+/// for a plain fork (child keeps the parent's SP). See do_fork / the child
+/// branch of fork_trampoline_entry.
+static FORK_CHILD_STACK: AtomicU64 = AtomicU64::new(0);
 
-fn do_fork(flags: u64, child_tid_ptr: u64) -> u64 {
+fn do_fork(flags: u64, child_tid_ptr: u64, child_stack: u64) -> u64 {
     // Don't fork here (signal context). Mark pending and return a sentinel.
     // The trap handler will redirect sigreturn to the fork trampoline.
     // IMPORTANT: No heap allocation (format!/String) in signal context!
@@ -590,6 +601,7 @@ fn do_fork(flags: u64, child_tid_ptr: u64) -> u64 {
     }
     FORK_FLAGS.store(flags, Ordering::SeqCst);
     FORK_CHILD_TID_PTR.store(child_tid_ptr, Ordering::SeqCst);
+    FORK_CHILD_STACK.store(child_stack, Ordering::SeqCst);
     FORK.mark_pending();
     0xFFFF_FFFF_0000_F0C0
 }
@@ -969,6 +981,16 @@ extern "C" fn fork_trampoline_entry() -> ! {
         pid as u64
     };
     FORK.set_x0(return_pid);
+    // vfork/posix_spawn child: resume on the caller-provided child stack rather
+    // than the parent's SP. musl's __clone child path does `ldp x1,x0,[sp];
+    // blr x1` — sp MUST be the child stack or it branches into garbage. Only the
+    // child (pid == 0); FORK_CHILD_STACK is 0 for a plain fork.
+    if pid == 0 {
+        let child_stack = FORK_CHILD_STACK.load(Ordering::SeqCst);
+        if child_stack != 0 {
+            FORK.set_sp(child_stack);
+        }
+    }
     if crate::syscall::trace_enabled() {
         // Use raw write only — no heap allocation (format!/String) after fork.
         // Rust's allocator may have poisoned locks inherited from the parent.
