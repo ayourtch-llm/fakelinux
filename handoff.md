@@ -187,13 +187,35 @@ panics as soon as `apk update` runs. After the fix:
 - `apk add --no-cache cmake ninja python3 py3-pip openssl-dev ...` — 38 more
 - `git clone --depth 1 https://gerrit.fd.io/r/vpp` — **VPP cloned into Alpine, 5005 files**
 
-**Compiling VPP inside the Alpine container hits SIGBUS in gcc** —
-`echo 'int main(){}' > t.c && gcc -o t t.c` faults at pc=0x7ff07fdcf0 which is IN the
-stack region. Likely alpine's musl or busybox's fork+exec puts trampoline code on the
-stack that our loader/patcher doesn't intercept. Investigating this is the next step
-toward the user's goal of "compile VPP inside a podman container." The path is proven —
-we're chroot'd into a valid container rootfs — just need to fix whatever prevents native
-compilation in an Alpine/musl environment.
+**Compiling inside the Alpine container hits toolchain issues** —
+`gcc -o t t.c` faults with SIGBUS at pc in the stack region (`fp=0x0`,
+`x18(emu)=0xffff` — bogus/uninitialized). `clang -o t t.c` hangs (30s timeout).
+`gcc --version` runs fine standalone. So the failure is in gcc's subprocess
+chain (cc1, as, ld) — either fakelinux's fork+exec + musl trampolines, or
+Alpine's ld-musl doing something our loader doesn't handle. Standalone
+binaries (busybox, git, apk, gcc-driver-with-just-args) all work.
+
+### Next steps ranked
+1. **Investigate gcc SIGBUS**: `x18=0xffff` on entry looks like the guest x18
+   TSD wasn't initialized when the exec'd cc1 process started under musl. Compare
+   against `set_thread_x18` init in `clone_entry` and any code path from
+   `do_execve` that runs at Alpine startup.
+2. Once cc1 runs, `apk add cmake ninja python3 ...` is done (installed earlier)
+   and `cd /root/vpp && make install-dep` (VPP's ubuntu path won't work on
+   alpine — will need `apk`-mapped equivalents).
+3. **Alternative**: skip the alpine layer and try `podman pull ubuntu:24.04`,
+   which uses glibc — should sidestep the musl issues.
+4. The Go GC "invalid pointer" crash in `podman run` is a separate axis and
+   probably subtler; direct-chroot workaround is fine for now.
+
+### Working direct-chroot invocation (for reference)
+```bash
+ALPINE=roots/ubuntu/var/lib/containers/storage/vfs/dir/b2848c02ac6ff53d265469b5b30f649f335e546a83330cd8916d54e65e640409
+FAKELINUX_ROOT=$ALPINE ./target/release/fakelinux --container $ALPINE/bin/sh -c '<cmd>'
+```
+Alpine's ID/name/version-id file: `$ALPINE/etc/os-release`; VPP source cloned
+at `$ALPINE/root/vpp`. `/etc/resolv.conf` was added with 8.8.8.8/1.1.1.1 so
+`apk update` and `git clone` reach the network.
 
 ### `podman run --rm alpine echo hi` still crashes
 ```
