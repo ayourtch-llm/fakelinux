@@ -628,6 +628,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             }
         }
         SYS_EXECVE => do_execve(args[0], args[1], args[2]),
+        SYS_EXECVEAT => do_execveat(args[0] as i32, args[1], args[2], args[3], args[4] as i32),
         SYS_MEMBARRIER => do_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
         SYS_STATFS => do_statfs(args[0], args[1]),
         SYS_FSTATFS => do_fstatfs(args[0] as i32, args[1]),
@@ -1266,6 +1267,21 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
         raw_eprintln_fmt(format_args!("fakelinux: openat({}, {:?}, {:#x})\n",
             linux_dirfd, path, linux_flags));
+    }
+
+    // /proc/self/exe (or /proc/<pid>/exe for us): open the REAL host binary so
+    // the guest can read its own executable. crun copies /proc/self/exe into a
+    // memfd for a sealed re-exec ("Failed to re-execute libcrun via memory file
+    // descriptor" when this returns ENOENT). readlink is handled elsewhere.
+    if let Some(host_exe) = procfs::self_exe_host_path(path.to_bytes()) {
+        let mac_flags = translate::translate_open_flags(linux_flags);
+        if let Ok(cs) = std::ffi::CString::new(host_exe) {
+            let ret = unsafe { libc::open(cs.as_ptr(), mac_flags, mode) };
+            if ret >= 0 {
+                return ret as u64;
+            }
+            return translate::linux_errno();
+        }
     }
 
     // Check if this is a /proc path we handle virtually
@@ -2950,6 +2966,123 @@ fn do_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         );
     }
     // execve only returns on failure
+    translate::linux_errno()
+}
+
+/// execveat(dirfd, pathname, argv, envp, flags).
+///
+/// The case we must support is AT_EMPTY_PATH with an empty pathname: exec the
+/// file referred to by `dirfd` itself. crun uses this to re-exec its own binary
+/// from a sealed memfd (memfd_create + copy /proc/self/exe + execveat). Our
+/// memfd is an unlinked tmpfile, so there is no host path to hand to execve —
+/// we read the fd's bytes and materialize them into a fresh temp file, then
+/// re-exec fakelinux on that, mirroring do_execve's ELF tail.
+///
+/// For a non-empty pathname we resolve dirfd+pathname to a guest path and defer
+/// to do_execve (flags other than AT_EMPTY_PATH — e.g. AT_SYMLINK_NOFOLLOW —
+/// are not meaningfully different for our loader).
+fn do_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, flags: i32) -> u64 {
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    let path_empty = pathname == 0 || unsafe {
+        std::ffi::CStr::from_ptr(pathname as *const i8).to_bytes().is_empty()
+    };
+
+    if !(flags & AT_EMPTY_PATH != 0 && path_empty) {
+        // Non-empty path: build the absolute guest path (only AT_FDCWD /
+        // absolute paths are exercised by our guests) and defer to do_execve.
+        if dirfd == -100 || (pathname != 0 && unsafe {
+            *(pathname as *const u8) == b'/'
+        }) {
+            return do_execve(pathname, argv_ptr, envp_ptr);
+        }
+        return (-38_i64) as u64; // -ENOSYS: dirfd-relative execveat unsupported
+    }
+
+    // AT_EMPTY_PATH: materialize the fd's contents into a temp file.
+    let size = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(dirfd, &mut st) != 0 { return translate::linux_errno(); }
+        st.st_size as usize
+    };
+    let mut data = vec![0u8; size];
+    let mut off: usize = 0;
+    while off < size {
+        let n = unsafe {
+            libc::pread(dirfd, data[off..].as_mut_ptr() as *mut _,
+                        (size - off) as usize, off as libc::off_t)
+        };
+        if n <= 0 { break; }
+        off += n as usize;
+    }
+    data.truncate(off);
+    if data.len() < 4 || data[..4] != [0x7f, b'E', b'L', b'F'] {
+        // Not an ELF (or unreadable) — nothing we can exec.
+        return (-8_i64) as u64; // -ENOEXEC
+    }
+
+    // Write to a fresh executable temp file. It leaks (one per container
+    // create); acceptable for now — the alternative (unlink-after-reexec)
+    // needs the re-exec'd supervisor to clean up. TODO: reap these.
+    let mut tmpl = b"/tmp/fakelinux_execveat_XXXXXX\0".to_vec();
+    let tfd = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if tfd < 0 { return translate::linux_errno(); }
+    let mut w: usize = 0;
+    while w < data.len() {
+        let n = unsafe { libc::write(tfd, data[w..].as_ptr() as *const _, data.len() - w) };
+        if n <= 0 { unsafe { libc::close(tfd); } return translate::linux_errno(); }
+        w += n as usize;
+    }
+    unsafe {
+        libc::fchmod(tfd, 0o755);
+        libc::close(tfd);
+    }
+    let host_path = std::ffi::CStr::from_bytes_with_nul(&tmpl)
+        .ok().and_then(|c| c.to_str().ok()).unwrap_or("").to_string();
+
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] execveat AT_EMPTY_PATH fd={} → {} ({} bytes)\n",
+            pid, dirfd, host_path, data.len()));
+    }
+
+    // Re-exec fakelinux on the materialized host binary, mirroring do_execve's
+    // ELF tail: argv = [self, host_path, guest_argv[1..]], carry original argv0.
+    let self_exe = std::env::current_exe().unwrap_or_default();
+    let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap_or("fakelinux")).unwrap();
+    let host_path_c = match std::ffi::CString::new(host_path) {
+        Ok(c) => c,
+        Err(_) => return (-14_i64) as u64,
+    };
+    let mut new_argv: Vec<*const i8> = vec![self_exe_c.as_ptr(), host_path_c.as_ptr()];
+
+    let exec_argv0: Option<Vec<u8>> = unsafe {
+        let argv0 = *(argv_ptr as *const *const i8);
+        if argv0.is_null() { None } else {
+            let a0 = std::ffi::CStr::from_ptr(argv0);
+            if a0.to_bytes().is_empty() { None } else { Some(a0.to_bytes().to_vec()) }
+        }
+    };
+    let mut guest_argv = argv_ptr as *const *const i8;
+    unsafe {
+        if !(*guest_argv).is_null() { guest_argv = guest_argv.add(1); }
+        while !(*guest_argv).is_null() {
+            new_argv.push(*guest_argv);
+            guest_argv = guest_argv.add(1);
+        }
+    }
+    new_argv.push(std::ptr::null());
+
+    let guest_env = unsafe { collect_guest_env(envp_ptr) };
+    let overrides = build_exec_overrides(exec_argv0);
+    let merged = merge_envp(&guest_env, &overrides);
+    let merged_ptrs: Vec<*const i8> = merged.iter().map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null())).collect();
+    reapply_saved_cloexec_for_exec();
+    unsafe {
+        libc::execve(self_exe_c.as_ptr(), new_argv.as_ptr() as *const *const i8,
+                     merged_ptrs.as_ptr());
+    }
     translate::linux_errno()
 }
 
