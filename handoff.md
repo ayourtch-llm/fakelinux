@@ -4,6 +4,36 @@ _Supersedes the 2026-06-29 cluster-A..E handoff. Memory index:
 `~/.claude/projects/-Users-ayourtch-rust-fakelinux/memory/MEMORY.md`; campaign detail in
 `project_parallel_jobs_campaign.md`. Branch `main`._
 
+## 2026-07-01 loop cycle 3 — Go stack crash FIXED (huge)
+
+Commit `b7e0fb7` "signal: restore sp/pc from uc_mcontext, not internal buffer".
+
+**Root cause found and fixed**: Go's goroutine preemption writes new pc (and sometimes
+sp) into `uc_mcontext` during a signal handler. `rt_sigreturn` is supposed to divert the
+interrupted goroutine to that PC on return. Our do_rt_sigreturn was restoring pc/sp
+from fakelinux's own internal save area, ignoring Go's ucontext writes. Silently
+dropping them left Go with `preemption happened` book-keeping while execution actually
+resumed at the original site → the GC's next stack scan found the interrupted frame
+inconsistent and threw `invalid pointer found on stack` (with 0x4 as the sentinel value
+that happened to sit in the pointer slot).
+
+Fix is minimal — read sp/pc from ucontext.mcontext at offsets 256/264, everything else
+still from internal buffer. Also increased RT_SIGFRAME_SIZE from 1424 to 5376 to match
+sizeof(ucontext_t) on aarch64 Linux (Go's sigtramp had been writing past our alloc).
+
+`podman run --rm alpine echo hi` no longer crashes; podman version/images/info all still
+work.
+
+**Follow-up open**: `podman pull` still fails at `mkdir /temp-storage-extract...: permission
+denied` in the fresh chroot dir. Same behaviour as loop cycle 2 — investigation there
+narrowed it to fakelinux's own libc::mkdirat returning EACCES from the storage subprocess,
+though a manual mkdir on the same path from a shell works. Native C binary from macOS
+also succeeds. Something specific about the fakelinux subprocess after chroot triggers
+macOS's kauth to deny mkdir on child dirs of the chroot target. Not a code path issue —
+the value being asked to mkdir, the parent that must exist, and the uid all check out.
+Might be a macOS sandbox/provenance interaction that a codesigning tweak or entitlement
+would unblock.
+
 ## 2026-07-01 loop cycle 2 — podman-pull EACCES investigation, waitid tweaks
 
 **Blocker**: `podman pull` consistently hits `mkdir /temp-storage-extract...: permission denied`
