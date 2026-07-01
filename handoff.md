@@ -175,11 +175,25 @@ VERSION_ID=3.24.1
 ```
 
 That's container-in-container: Ubuntu rootfs (level 1, fakelinux) → podman pulls alpine
-image → alpine rootfs (level 2, fakelinux). `apk update` however hits a fakelinux
-`EmulClass::Other` panic on `br x18` (0xd61f0240) at PC in alpine's busybox — a code
-path our x18 trampolines don't cover yet. Add support for `br x18` (register-indirect
-branch through x18) as the next fakelinux fix; then apk should work and we can install
-build-base + git and clone VPP.
+image → alpine rootfs (level 2, fakelinux).
+
+**`br x18` fix (commit `92610fc`)** — trap.rs EmulClass::Other catch-all now recognizes
+BR/BLR/RET Xn generically (mask `0xFFFF_FC1F` matches `0xD61F_0000`/`0xD63F_0000`/
+`0xD65F_0000`). Alpine's busybox uses `br x18` in dispatch stubs; without this fakelinux
+panics as soon as `apk update` runs. After the fix:
+
+- `apk update` — 28537 packages available
+- `apk add --no-cache build-base git` — 33 packages installed
+- `apk add --no-cache cmake ninja python3 py3-pip openssl-dev ...` — 38 more
+- `git clone --depth 1 https://gerrit.fd.io/r/vpp` — **VPP cloned into Alpine, 5005 files**
+
+**Compiling VPP inside the Alpine container hits SIGBUS in gcc** —
+`echo 'int main(){}' > t.c && gcc -o t t.c` faults at pc=0x7ff07fdcf0 which is IN the
+stack region. Likely alpine's musl or busybox's fork+exec puts trampoline code on the
+stack that our loader/patcher doesn't intercept. Investigating this is the next step
+toward the user's goal of "compile VPP inside a podman container." The path is proven —
+we're chroot'd into a valid container rootfs — just need to fix whatever prevents native
+compilation in an Alpine/musl environment.
 
 ### `podman run --rm alpine echo hi` still crashes
 ```
