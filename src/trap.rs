@@ -1281,6 +1281,11 @@ pub fn init_trace_flags() {
     X18_STORE_TRACE.store(v, Ordering::Relaxed);
     TRACE_LR_ENABLED.store(std::env::var_os("FAKELINUX_TRACE_LR").is_some(), Ordering::Relaxed);
     crate::signal::SIGTRACE.store(std::env::var_os("FAKELINUX_SIGTRACE").is_some(), Ordering::Relaxed);
+    // Restore registers from uc_mcontext on sigreturn (honor Go's handler
+    // edits). Default OFF pending validation; set FAKELINUX_UCTX_RESTORE=1.
+    crate::signal::UCTX_RESTORE.store(
+        std::env::var("FAKELINUX_UCTX_RESTORE").map(|v| v != "0").unwrap_or(false),
+        Ordering::Relaxed);
     WATCH_X27_PENDING.store(
         std::env::var_os("FAKELINUX_WATCH_X27").is_some(), Ordering::Relaxed);
     REG_PROBE_ENABLED.store(

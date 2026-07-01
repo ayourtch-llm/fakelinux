@@ -416,6 +416,11 @@ thread_local! {
 
 /// DIAGNOSTIC: enable compact signal build/restore tracing (FAKELINUX_SIGTRACE).
 pub static SIGTRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// On rt_sigreturn, restore GPRs/sp/pc/lr from the ucontext mcontext (honoring
+/// Go's signal-handler edits) instead of fakelinux's internal save buffer.
+/// A/B gate while validating podman run (needs it) vs pull (regressed by the
+/// old inconsistent variant). Toggle with FAKELINUX_UCTX_RESTORE=0/1.
+pub static UCTX_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// DIAGNOSTIC: signals that interrupted the guest inside a trampoline island /
 /// in the sp-raised danger window.
 pub static SIG_IN_ISLAND: AtomicU64 = AtomicU64::new(0);
@@ -489,6 +494,8 @@ pub static RK_PROBE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 struct FwdRegSnap {
     x: [u64; 29], fp: u64, lr: u64, sp: u64, pc: u64,
     cpsr: u32, tpidr: u64, fpsr: u32, fpcr: u32, frame: u64,
+    v: [u128; 32], // NEON q0..q31 — Go's memmove/memclr use these; not covered
+                   // by the GPR checks, and a candidate for cross-signal corruption
 }
 
 #[derive(Copy, Clone)]
@@ -663,6 +670,13 @@ pub unsafe fn build_sigframe_and_redirect(
     let trampoline_addr = SIGRETURN_TRAMPOLINE.load(Ordering::SeqCst);
 
     sigtrace("BUILD", linux_sig as u64, guest_sp, frame_addr, regs.pc);
+    if SIGTRACE.load(Ordering::Relaxed) {
+        let mut buf = [0u8; 128];
+        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+            "fakelinux: SIGBUILD sig={} altstack={} frame={:#x} guest_sp={:#x} pc={:#x}\n",
+            linux_sig, used_altstack as u32, frame_addr, guest_sp, regs.pc));
+        libc::write(2, buf.as_ptr() as *const _, n);
+    }
 
     // Second altstack probe: sp at the deepest point of build_sigframe's work
     // (after all the GPR + NEON save loops + siginfo + ucontext writes).
@@ -719,6 +733,7 @@ pub unsafe fn build_sigframe_and_redirect(
             fpsr: mctx.ns.fpsr,
             fpcr: mctx.ns.fpcr,
             frame: frame_addr,
+            v: mctx.ns.v,
         };
         // Snapshot exactly what build_sigframe just wrote into the frame's
         // GPR save slots — for slot 18 that's the TSD guest x18, not mctx.x[18]
@@ -825,24 +840,43 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         }
     }
 
+    // Restore path selection. Go's signal handlers (sigpanic, async-preempt,
+    // pushCall) rewrite the *ucontext* mcontext — pc, sp, lr and GPRs together —
+    // and expect rt_sigreturn to honor them (Linux ABI). Historically we
+    // restored everything from our own internal save buffer, ignoring those
+    // edits; that made `podman run` corrupt a caller stack slot (Go's stack
+    // scanner then found "bad pointer 0x4"). An earlier fix restored ONLY sp/pc
+    // from uc_mcontext but kept GPRs from the internal buffer — an inconsistent
+    // mix that broke `podman pull` downloads (Go edits a GPR and pc TOGETHER for
+    // a redirect; honoring pc but not the mate GPR yields garbage). The correct
+    // approach is to restore ALL registers from uc_mcontext consistently: when
+    // Go leaves them untouched they equal what we wrote at build time, so this
+    // is a no-op for the common case; when Go edits them we honor the whole set.
+    let uctx_restore = UCTX_RESTORE.load(Ordering::Relaxed);
+    let src = if uctx_restore {
+        // uc_mcontext.regs base = frame + UCONTEXT_OFFSET + uc_mcontext + 8
+        // (mc+0 is fault_address; regs[0] at mc+8). Our internal layout mirrors
+        // mcontext exactly from regs[0] onward, so pointing `src` at mc+8-8=mc
+        // reuses the identical offset arithmetic below (p.add(8+i*8), 240, 248…).
+        p.add(UCONTEXT_OFFSET + UCONTEXT_MCONTEXT)
+    } else {
+        p
+    };
+
     // Restore x0..x28. x18 goes back to the per-thread TSD slot (guest x18),
     // undoing any clobbering by the handler's own x18 usage.
     for i in 0..29usize {
-        let val = (p.add(8 + i * 8) as *const u64).read_unaligned();
+        let val = (src.add(8 + i * 8) as *const u64).read_unaligned();
         if i == 18 {
             crate::trap::set_thread_x18(val);
         }
         regs.x[i] = val;
     }
-    // Restore fp, lr, sp, pc, cpsr from our internal save buffer.
-    // Reading sp/pc from uc_mcontext (theoretical Go-preemption support)
-    // caused download corruption in podman's Pull path — Go must be
-    // relying on our internal-buffer semantics, not the Linux ABI.
-    regs.fp = (p.add(240) as *const u64).read_unaligned();
-    regs.lr = (p.add(248) as *const u64).read_unaligned();
-    regs.sp = (p.add(256) as *const u64).read_unaligned();
-    regs.pc = (p.add(264) as *const u64).read_unaligned();
-    regs.cpsr = (p.add(272) as *const u32).read_unaligned();
+    regs.fp = (src.add(240) as *const u64).read_unaligned();
+    regs.lr = (src.add(248) as *const u64).read_unaligned();
+    regs.sp = (src.add(256) as *const u64).read_unaligned();
+    regs.pc = (src.add(264) as *const u64).read_unaligned();
+    regs.cpsr = (src.add(272) as *const u32).read_unaligned();
     // Restore tpidr
     let saved_tpidr = (p.add(280) as *const u64).read_unaligned();
     crate::trap::set_thread_tpidr(saved_tpidr);
@@ -958,6 +992,20 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
                         "fakelinux: FWD_REG_DIVERGE frame={:#x} fpcr: entry={:#x} exit={:#x} (delta={:#x})\n",
                         frame_addr, snap.fpcr, mctx.ns.fpcr, mctx.ns.fpcr ^ snap.fpcr));
                     libc::write(2, buf.as_ptr() as *const _, n);
+                }
+                // NEON v[] — Go uses q0..q31 for memmove/memclr; corruption here
+                // is invisible to the GPR checks yet can write garbage (e.g. 0x4)
+                // into a pointer slot via a mid-flight memmove interrupted by the
+                // signal. Compare every q register across the round-trip.
+                for i in 0..32usize {
+                    if snap.v[i] != mctx.ns.v[i] {
+                        any = true;
+                        let mut buf = [0u8; 256];
+                        let n = crate::trap::raw_fmt(&mut buf, format_args!(
+                            "fakelinux: FWD_REG_DIVERGE frame={:#x} v{}: entry={:#x} exit={:#x}\n",
+                            frame_addr, i, snap.v[i] as u64, mctx.ns.v[i] as u64));
+                        libc::write(2, buf.as_ptr() as *const _, n);
+                    }
                 }
                 if any { FWD_REG_MISMATCHES.fetch_add(1, Ordering::Relaxed); }
                 FWD_REG_PROBE.with(|c| c.set(None));
