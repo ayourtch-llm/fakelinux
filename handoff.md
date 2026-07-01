@@ -133,6 +133,51 @@ final counter looks sane (≥1210 OK), regression is clean — close out task #8
   R_AARCH64_RELATIVE). Kept because it's correct, defensive, idempotent vs ld-linux —
   but no test exercises it.
 
+## 2026-07-01 continued — podman pull works, run has Go GC crash
+
+Two more commits (`3e5e29c`, `e505a15`, `7ba3afa`) — SIGNIFICANT PROGRESS:
+
+**`podman pull docker.io/library/alpine` completes cleanly** and the ubuntu rootfs stays
+intact. Previously the chroot stub let alpine's `/lib/ld-musl-aarch64.so.1` +
+`/etc/alpine-release` stomp `roots/ubuntu/` (twice tonight). Fixed by:
+
+1. `execve` translates `/proc/self/exe` to a HOST path (was passing guest path, causing
+   main.rs to ENOENT and die during podman's re-exec for layer-extract).
+2. **Real chroot tracking.** `rootfs::CHROOT_HOST` Mutex; `translate_path` prefixes it
+   before FAKELINUX_ROOT; `do_chroot` stat-verifies + stores; persists across `execve` via
+   `FAKELINUX_CHROOT` env var picked up by `init_chroot_from_env()` at startup + carried
+   through `build_exec_overrides`.
+3. Stubs for `unshare(97)`, `setns(268)`, `pivot_root(41)`, `mount(40)`, `umount2(39)`,
+   `waitid(95)`, `name_to_handle_at(264)/open_by_handle_at(265)`, `openat2(437)`,
+   `seccomp(277)`.
+4. `utimensat` swallows `EACCES/EPERM/ENOENT` — podman's tar-extract chtimes device nodes
+   and stale /proc paths inside the container image; mtime is cosmetic.
+
+Guest-side setup for this to work (same as before session): `mkdir -p sys/fs/cgroup
+var/lib/containers/storage run/containers/storage etc/containers` + a minimal
+`etc/containers/storage.conf` with the vfs driver. If missing, `podman info` hits
+"Error: no such file or directory".
+
+**`podman run --rm alpine echo hi` still crashes** with a Go runtime panic:
+```
+runtime: bad pointer in frame github.com/containers/common/libimage.(*Runtime).Pull at 0x14000347538: 0x4
+fatal error: invalid pointer found on stack
+```
+Deterministic; the value `0x4` sits in a stack slot Go's GC expects to hold a pointer.
+Reproduces on every attempt. Not caused by this session's changes — was there before
+we added waitid/etc. stubs. Likely a fakelinux side effect (signal handling? syscall
+clobbering a caller-saved reg?) in the podman `Runtime.Pull` code path that only runs
+during `podman run` (image lookup / mount preparation), not during pull itself. The
+next dig-in should trace which syscall runs just before Go's GC catches the corruption
+— specifically look at whether the frame slot was written by a syscall wrapper.
+
+### Rootfs restoration note
+The chroot stub had already stomped `roots/ubuntu/` twice by the time real chroot went
+in. Both damaged trees preserved as `roots/ubuntu-DAMAGED-014710/` (kept for
+`root/vpp` source; 11G). Fresh `scripts/fetch-rootfs.sh ubuntu` regenerated a clean
+Ubuntu 24.04 rootfs; VPP source copied back via
+`cp -r roots/ubuntu-DAMAGED-014710/root/vpp roots/ubuntu/root/`.
+
 ## TL;DR — the LIVE thread (resume here)
 
 Working on **pty-8** = a REAL aarch64 Linux box (`gx10-be8b`, NVIDIA DGX Spark, kernel
