@@ -375,7 +375,12 @@ const NEON_SAVE_OFFSET: usize = 296;
 const SIGINFO_OFFSET: usize = 816;
 const UCONTEXT_OFFSET: usize = 944;
 const UCONTEXT_MCONTEXT: usize = 176; // offsetof(ucontext_t, uc_mcontext) on aarch64
-const RT_SIGFRAME_SIZE: usize = UCONTEXT_OFFSET + 480;
+// aarch64 Linux ucontext_t is 4432 bytes — includes 4K of extended state
+// blocks (uc_mcontext.__reserved[4096] for FP/SVE state). Undersizing this
+// let Go's sigtramp write past our allocated region and land in whatever
+// came after — the interrupted goroutine's stack in some layouts, which
+// showed up as an "invalid pointer" 0x4 during the next GC scan.
+const RT_SIGFRAME_SIZE: usize = UCONTEXT_OFFSET + 4432;
 
 /// Red-zone gap left between the guest sp and the top of the synthesized signal
 /// frame. AArch64 defines no ABI red zone, but fakelinux's x18 trampoline
@@ -552,11 +557,6 @@ pub unsafe fn build_sigframe_and_redirect(
         const SS_DISABLE: i32 = 2;
         if on_stack && alt_sp != 0 && alt_flags & SS_DISABLE == 0 && alt_size >= 0x1000 {
             used_altstack = true;
-            // Nested SA_ONSTACK delivery: an outer handler is already on the
-            // altstack (depth > 0). Push the new frame BELOW the interrupted
-            // SP rather than restarting from altstack top — restarting would
-            // overwrite the in-flight handler's frame. Real Linux does the
-            // same via SS_ONSTACK.
             if altstack_depth() > 0 {
                 regs.sp
             } else {
@@ -833,12 +833,21 @@ pub unsafe fn do_rt_sigreturn(mctx: &mut crate::trap::MContext64) -> bool {
         }
         regs.x[i] = val;
     }
-    // Restore fp, lr, sp, pc
+    // Restore fp, lr
     regs.fp = (p.add(240) as *const u64).read_unaligned();
     regs.lr = (p.add(248) as *const u64).read_unaligned();
-    regs.sp = (p.add(256) as *const u64).read_unaligned();
-    regs.pc = (p.add(264) as *const u64).read_unaligned();
-    // Restore cpsr
+    // Restore sp and pc — prefer the values in Linux uc_mcontext because
+    // Go's runtime writes new pc (and sometimes sp) there to divert the
+    // interrupted goroutine on return from a signal handler (its preemption
+    // scheme). Silently dropping those meant Go thought preemption had
+    // happened while execution actually resumed at the original site → the
+    // GC's next stack scan found the frame in an inconsistent shape and
+    // threw "invalid pointer found on stack" with the sentinel 0x4.
+    let uc = p.add(UCONTEXT_OFFSET);
+    let mc = uc.add(UCONTEXT_MCONTEXT);
+    regs.sp = (mc.add(256) as *const u64).read_unaligned();
+    regs.pc = (mc.add(264) as *const u64).read_unaligned();
+    // Restore cpsr from our internal save (handler doesn't modify pstate).
     regs.cpsr = (p.add(272) as *const u32).read_unaligned();
     // Restore tpidr
     let saved_tpidr = (p.add(280) as *const u64).read_unaligned();

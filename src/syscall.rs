@@ -756,47 +756,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
         // to "no seccomp" code paths (typical for libseccomp probes).
         277 => (-38_i64) as u64,
-        // waitid(2) — attempt macOS waitid; on EINVAL fall back to ECHILD so
-        // podman's Go runtime moves on. Earlier attempts to return -ENOSYS
-        // caused Go's stack scan to corrupt; this hybrid approach uses macOS
-        // when possible and returns "nothing to reap" for edge cases.
-        95 => {
-            let idtype = args[0] as i32;
-            let id = args[1] as i32;
-            let infop = args[2];
-            let options = args[3] as i32;
-            let mac_idtype = match idtype {
-                0 => libc::P_ALL,
-                1 => libc::P_PID,
-                2 => libc::P_PGID,
-                _ => return (-10_i64) as u64, // ECHILD
-            };
-            let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let ret = unsafe {
-                libc::waitid(mac_idtype, id as libc::id_t, &mut siginfo, options)
-            };
-            if ret < 0 {
-                let err = unsafe { *libc::__error() };
-                // macOS waitid rejects some option bits Linux accepts (e.g. WNOWAIT
-                // combined with WEXITED). Rather than propagating EINVAL — which
-                // Go treats as programming error — return ECHILD so the caller
-                // moves on.
-                if err == libc::EINVAL {
-                    return (-10_i64) as u64; // ECHILD
-                }
-                return translate::linux_errno();
-            }
-            if infop != 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &siginfo as *const _ as *const u8,
-                        infop as *mut u8,
-                        std::mem::size_of::<libc::siginfo_t>().min(128),
-                    );
-                }
-            }
-            0
-        }
+        // waitid(2) — DIAG: return ENOSYS to test if this affects Go crash
+        95 => (-38_i64) as u64,
         // unshare(2) — we don't actually isolate namespaces, but pretend
         // success so podman's rootless / uid-mapping setup proceeds. We
         // already run as fake root (uid 0) so most calls into the "new"
