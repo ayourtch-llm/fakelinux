@@ -1205,31 +1205,6 @@ pub fn try_fstat_virtual(fd: i32, statbuf: u64) -> Option<()> {
     Some(())
 }
 
-/// If `path` refers to this process's /proc/self/exe (or /proc/<pid>/exe for
-/// our own pid), return the HOST path of the guest executable so it can be
-/// opened as a real file. Used by do_openat: crun opens /proc/self/exe to copy
-/// its own binary into a memfd for a sealed re-exec. (readlink is handled
-/// separately in try_readlink and returns the GUEST path.)
-pub fn self_exe_host_path(path: &[u8]) -> Option<String> {
-    let path_str = std::str::from_utf8(path).ok()?;
-    let normalized = normalize_proc_path(path_str);
-    let path_str = normalized.as_deref().unwrap_or(path_str);
-    if path_str != "/proc/self/exe" {
-        return None;
-    }
-    let guest_exe = with(|pfs| pfs.exe_path.clone());
-    let host_exe = if let Some(root) = crate::rootfs::get_root() {
-        if !root.is_empty() && guest_exe.starts_with('/') {
-            format!("{}{}", root.trim_end_matches('/'), guest_exe)
-        } else {
-            guest_exe
-        }
-    } else {
-        guest_exe
-    };
-    Some(host_exe)
-}
-
 /// Handle readlink on /proc paths.
 pub fn try_readlink(path: &[u8], buf: u64, bufsiz: u64) -> Option<u64> {
     let path_str = std::str::from_utf8(path).ok()?;

@@ -89,7 +89,6 @@ pub const SYS_GETGROUPS: u64 = 158;
 pub const SYS_SETGROUPS: u64 = 159;
 pub const SYS_WAIT4: u64 = 260;
 pub const SYS_EXECVE: u64 = 221;
-pub const SYS_EXECVEAT: u64 = 281;
 pub const SYS_CHDIR: u64 = 49;
 pub const SYS_FCHDIR: u64 = 50;
 pub const SYS_GETCWD: u64 = 17;
