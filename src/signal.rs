@@ -1254,6 +1254,18 @@ unsafe extern "C" fn signal_forwarder(
                 r.x[24], r.x[25], r.x[26], r.x[27], r.x[28], r.fp
             ));
             libc::write(2, buf2.as_ptr() as *const _, n2);
+            // Symbolize pc / lr / far against tracked mappings (sig-safe).
+            for (label, addr) in [("pc", pc), ("lr", mctx.ss.lr), ("far", far)] {
+                let mut nm = [0u8; 256];
+                if let Some((nl, off)) = crate::procfs::lookup_addr_sigsafe(addr, &mut nm) {
+                    let mut sb = [0u8; 320];
+                    let sn = crate::trap::raw_fmt(&mut sb, format_args!(
+                        "  {}={:#x} -> {}+{:#x}\n",
+                        label, addr,
+                        core::str::from_utf8(&nm[..nl]).unwrap_or("?"), off));
+                    libc::write(2, sb.as_ptr() as *const _, sn);
+                }
+            }
             // Top of guest stack — recovers callee-saved spills (e.g. the
             // caller's pointer argument) without a debugger. Safe mach read.
             let mut words = [0u64; 20];

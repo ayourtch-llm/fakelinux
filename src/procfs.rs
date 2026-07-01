@@ -100,6 +100,24 @@ pub fn lookup_addr(addr: u64) -> Option<(String, u64)> {
     })
 }
 
+/// Signal-context-safe variant of lookup_addr: uses try_lock so it can never
+/// deadlock if the interrupted thread held the PROCFS lock. Copies the name
+/// into a caller-provided buffer and returns (name_len, file_offset). Returns
+/// None if the lock is contended or the address isn't in a named mapping.
+pub fn lookup_addr_sigsafe(addr: u64, name_out: &mut [u8]) -> Option<(usize, u64)> {
+    let lock = PROCFS.try_lock().ok()?;
+    let pfs = lock.as_ref()?;
+    for m in pfs.mappings.iter() {
+        if addr >= m.start && addr < m.end && !m.name.is_empty() {
+            let bytes = m.name.as_bytes();
+            let n = bytes.len().min(name_out.len());
+            name_out[..n].copy_from_slice(&bytes[..n]);
+            return Some((n, addr - m.start + m.offset));
+        }
+    }
+    None
+}
+
 /// Store the raw auxv bytes (for /proc/self/auxv).
 pub fn set_auxv(data: Vec<u8>) {
     with(|pfs| pfs.auxv = data);
