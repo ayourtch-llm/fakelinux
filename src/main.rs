@@ -99,6 +99,7 @@ fn main() {
         syscall::set_trace_shutdown(true);
     }
     rootfs::init(&rootfs, &sysroot);
+    rootfs::init_chroot_from_env();
     syscall::init_sysroot(&sysroot);
 
     // Absolutize the ELF path (rootfs prefix matching needs it), then

@@ -467,7 +467,17 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
                 if ret2 < 0 { translate::linux_errno() } else { 0 }
-            } else { translate::linux_errno() }
+            } else {
+                let err = translate::linux_errno();
+                if std::env::var("FAKELINUX_TRACE_CHROOT").is_ok() {
+                    let p = unsafe { std::ffi::CStr::from_ptr(eff_path) };
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: mkdirat({}, {}, {:#o}) → errno {}\n",
+                        args[0] as i32, p.to_string_lossy(), args[2],
+                        err as i64));
+                }
+                err
+            }
         }
         SYS_UNLINKAT => {
             let mac_flags = if args[2] & 0x200 != 0 { libc::AT_REMOVEDIR } else { 0 };
@@ -747,6 +757,41 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
         // to "no seccomp" code paths (typical for libseccomp probes).
         277 => (-38_i64) as u64,
+        // waitid(2) — minimal impl atop macOS waitid. Podman's Pull path uses
+        // it to reap forked children of its OCI storage driver; without it,
+        // Go treats -ENOSYS as a hard error and corrupts its stack scan.
+        95 => {
+            let idtype = args[0] as i32;
+            let id = args[1] as i32;
+            let infop = args[2];
+            let options = args[3] as i32;
+            let mac_idtype = match idtype {
+                0 => libc::P_ALL,
+                1 => libc::P_PID,
+                2 => libc::P_PGID,
+                _ => return (-22_i64) as u64, // EINVAL
+            };
+            let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::waitid(mac_idtype, id as libc::id_t, &mut siginfo, options)
+            };
+            if ret < 0 {
+                return translate::linux_errno();
+            }
+            if infop != 0 {
+                // Linux siginfo_t and macOS siginfo_t share the same first
+                // ~48 bytes for wait-related fields (si_signo, si_errno,
+                // si_code, si_pid, si_uid, si_status). Copy them raw.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &siginfo as *const _ as *const u8,
+                        infop as *mut u8,
+                        std::mem::size_of::<libc::siginfo_t>().min(128),
+                    );
+                }
+            }
+            0
+        }
         // unshare(2) — we don't actually isolate namespaces, but pretend
         // success so podman's rootless / uid-mapping setup proceeds. We
         // already run as fake root (uid 0) so most calls into the "new"
@@ -780,7 +825,17 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             }
             let host_path = unsafe { std::ffi::CStr::from_ptr(eff_path) }
                 .to_string_lossy().into_owned();
-            rootfs::set_chroot_host(Some(host_path));
+            rootfs::set_chroot_host(Some(host_path.clone()));
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] chroot → {}\n",
+                unsafe { libc::getpid() }, host_path));
+            // Also chdir to the new root so that subsequent relative paths
+            // (and getcwd) work correctly. Linux's chroot doesn't auto-chdir
+            // but most callers do it; matching the convention avoids surprise.
+            unsafe { libc::chdir(eff_path); }
+            // build_exec_overrides picks up the chroot dynamically via
+            // rootfs::get_chroot_host() so it survives our re-exec of
+            // fakelinux for /proc/self/exe.
             0
         }
         // name_to_handle_at / open_by_handle_at — return -ENOSYS so callers
@@ -2635,6 +2690,10 @@ fn build_exec_overrides(argv0: Option<Vec<u8>>) -> Vec<(&'static str, Option<Str
         if b.is_empty() { None } else { Some(String::from_utf8_lossy(&b).into_owned()) }
     });
     o.push(("FAKELINUX_ARGV0", argv0_val));
+    // Carry the current chroot HOST path across execve so the re-exec'd
+    // fakelinux (e.g. podman's layer-extract subprocess) picks it up in
+    // init_chroot_from_env(). None = clear the var in the child env.
+    o.push(("FAKELINUX_CHROOT", rootfs::get_chroot_host()));
     o
 }
 

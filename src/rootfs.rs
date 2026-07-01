@@ -28,6 +28,18 @@ pub fn set_chroot_host(host_path: Option<String>) {
     *CHROOT_HOST.lock().unwrap() = host_path;
 }
 
+/// Read the chroot env var (FAKELINUX_CHROOT) at startup so it survives
+/// execve. main.rs calls this after rootfs::init.
+pub fn init_chroot_from_env() {
+    if let Ok(v) = std::env::var("FAKELINUX_CHROOT") {
+        if !v.is_empty() {
+            eprintln!("fakelinux: [{}] chroot restored from env → {}",
+                std::process::id(), v);
+            *CHROOT_HOST.lock().unwrap() = Some(v);
+        }
+    }
+}
+
 /// Get the current chroot host-path, if set.
 pub fn get_chroot_host() -> Option<String> {
     CHROOT_HOST.lock().unwrap().clone()
@@ -106,6 +118,11 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
     if let Some(chroot_host) = get_chroot_host() {
         let resolved = resolve_in_rootfs(chroot_host.as_bytes(), path);
         let mut result = casefold_full_path(chroot_host.as_bytes().len(), resolved);
+        if std::env::var("FAKELINUX_TRACE_CHROOT").is_ok() {
+            eprintln!("fakelinux: chroot translate {:?} → {:?}",
+                std::str::from_utf8(path).unwrap_or("?"),
+                std::str::from_utf8(&result).unwrap_or("?"));
+        }
         if !result.ends_with(&[0]) {
             result.push(0);
         }
