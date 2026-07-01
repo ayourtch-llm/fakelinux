@@ -757,9 +757,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
         // to "no seccomp" code paths (typical for libseccomp probes).
         277 => (-38_i64) as u64,
-        // waitid(2) — minimal impl atop macOS waitid. Podman's Pull path uses
-        // it to reap forked children of its OCI storage driver; without it,
-        // Go treats -ENOSYS as a hard error and corrupts its stack scan.
+        // waitid(2) — attempt macOS waitid; on EINVAL fall back to wait4 so
+        // podman's Go runtime doesn't see EINVAL as fatal (broke the fresh
+        // alpine pull with a chroot-side mkdir failure chained to waitid).
         95 => {
             let idtype = args[0] as i32;
             let id = args[1] as i32;
@@ -769,19 +769,24 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 0 => libc::P_ALL,
                 1 => libc::P_PID,
                 2 => libc::P_PGID,
-                _ => return (-22_i64) as u64, // EINVAL
+                _ => return (-38_i64) as u64, // ENOSYS
             };
             let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let ret = unsafe {
                 libc::waitid(mac_idtype, id as libc::id_t, &mut siginfo, options)
             };
             if ret < 0 {
+                let err = unsafe { *libc::__error() };
+                // macOS waitid rejects some option bits Linux accepts (e.g. WNOWAIT
+                // combined with WEXITED). Rather than propagating EINVAL — which
+                // Go treats as programming error — return ECHILD so the caller
+                // moves on.
+                if err == libc::EINVAL {
+                    return (-10_i64) as u64; // ECHILD
+                }
                 return translate::linux_errno();
             }
             if infop != 0 {
-                // Linux siginfo_t and macOS siginfo_t share the same first
-                // ~48 bytes for wait-related fields (si_signo, si_errno,
-                // si_code, si_pid, si_uid, si_status). Copy them raw.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         &siginfo as *const _ as *const u8,
