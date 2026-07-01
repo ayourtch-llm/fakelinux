@@ -473,8 +473,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                     let p = unsafe { std::ffi::CStr::from_ptr(eff_path) };
                     raw_eprintln_fmt(format_args!(
                         "fakelinux: mkdirat({}, {}, {:#o}) → errno {}\n",
-                        args[0] as i32, p.to_string_lossy(), args[2],
-                        err as i64));
+                        args[0] as i32, p.to_string_lossy(), args[2], err as i64));
                 }
                 err
             }
@@ -757,9 +756,10 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
         // to "no seccomp" code paths (typical for libseccomp probes).
         277 => (-38_i64) as u64,
-        // waitid(2) — attempt macOS waitid; on EINVAL fall back to wait4 so
-        // podman's Go runtime doesn't see EINVAL as fatal (broke the fresh
-        // alpine pull with a chroot-side mkdir failure chained to waitid).
+        // waitid(2) — attempt macOS waitid; on EINVAL fall back to ECHILD so
+        // podman's Go runtime moves on. Earlier attempts to return -ENOSYS
+        // caused Go's stack scan to corrupt; this hybrid approach uses macOS
+        // when possible and returns "nothing to reap" for edge cases.
         95 => {
             let idtype = args[0] as i32;
             let id = args[1] as i32;
@@ -769,7 +769,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
                 0 => libc::P_ALL,
                 1 => libc::P_PID,
                 2 => libc::P_PGID,
-                _ => return (-38_i64) as u64, // ENOSYS
+                _ => return (-10_i64) as u64, // ECHILD
             };
             let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let ret = unsafe {
@@ -834,10 +834,10 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             raw_eprintln_fmt(format_args!(
                 "fakelinux: [{}] chroot → {}\n",
                 unsafe { libc::getpid() }, host_path));
-            // Also chdir to the new root so that subsequent relative paths
-            // (and getcwd) work correctly. Linux's chroot doesn't auto-chdir
-            // but most callers do it; matching the convention avoids surprise.
-            unsafe { libc::chdir(eff_path); }
+            // Do NOT auto-chdir — Linux's chroot doesn't; callers explicitly
+            // chdir("/") after chroot when they want to. Auto-chdir here
+            // caused podman's tar-extract subprocess to mkdirat with wrong
+            // effective host cwd and get EACCES.
             // build_exec_overrides picks up the chroot dynamically via
             // rootfs::get_chroot_host() so it survives our re-exec of
             // fakelinux for /proc/self/exe.
