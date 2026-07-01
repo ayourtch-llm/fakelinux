@@ -462,7 +462,36 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         }
         SYS_MKDIRAT => {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
-            let ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
+            let mut ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
+            if ret < 0 {
+                let err = unsafe { *libc::__error() };
+                // Fake-root permission bypass: on Linux, uid 0 bypasses
+                // directory permission checks. On macOS we run as uid 501,
+                // so a container tool that mkdir'd its chroot dir with mode
+                // 0555 (as podman does for storage subdirs) can't then
+                // mkdir inside it. When guest sees itself as root and macOS
+                // rejects with EACCES, chmod the parent temporarily to add
+                // write permission, retry, then keep the added write bit
+                // since real Linux root would have unconditional write.
+                if err == libc::EACCES {
+                    let path_c = unsafe { std::ffi::CStr::from_ptr(eff_path) };
+                    let path_str = path_c.to_string_lossy().into_owned();
+                    if let Some(parent) = std::path::Path::new(&path_str).parent() {
+                        let parent_str = parent.to_string_lossy().into_owned();
+                        if let Ok(parent_c) = std::ffi::CString::new(parent_str) {
+                            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                            if unsafe { libc::stat(parent_c.as_ptr(), &mut st) } == 0 {
+                                let old_mode = st.st_mode & 0o777;
+                                let new_mode = old_mode | 0o300; // add u+wx
+                                if new_mode != old_mode {
+                                    unsafe { libc::chmod(parent_c.as_ptr(), new_mode as libc::mode_t); }
+                                    ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if ret == 0 { 0 }
             else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
                 let ret2 = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), args[1] as *const i8, args[2] as libc::mode_t) };
