@@ -515,6 +515,13 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
     let normalized = normalize_proc_path(path);
     let path = normalized.as_deref().unwrap_or(path);
 
+    // Collapse /proc/self/task/<tid>/<file> → /proc/self/<file>. Per-thread
+    // proc files mirror the process-level ones for our purposes (mountinfo is
+    // mount-namespace-wide; stat/status/maps for the main thread match the
+    // process). podman's container setup opens /proc/self/task/<tid>/mountinfo.
+    let collapsed = collapse_task_path(path);
+    let path = collapsed.as_deref().unwrap_or(path);
+
     match path {
         "/proc/self/maps" => Some(generate_maps()),
         "/proc/self/auxv" => Some(with(|pfs| pfs.auxv.clone())),
@@ -608,6 +615,18 @@ fn generate_for_other_pid(path: &str) -> Option<Vec<u8>> {
 
 /// If path is /proc/<pid>/... where <pid> matches our PID (real or virtual),
 /// return /proc/self/...
+/// Rewrite /proc/self/task/<tid>/<rest> → /proc/self/<rest>. Returns None if
+/// the path isn't a per-task path.
+fn collapse_task_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/proc/self/task/")?;
+    let slash = rest.find('/')?;
+    // rest[..slash] is the tid (all digits); rest[slash+1..] is the file.
+    if rest[..slash].is_empty() || !rest[..slash].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("/proc/self/{}", &rest[slash + 1..]))
+}
+
 fn normalize_proc_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/proc/")?;
     let slash_pos = rest.find('/')?;

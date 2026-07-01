@@ -649,7 +649,14 @@ pub fn do_shutdown(fd: i32, how: i32) -> u64 {
 }
 
 pub fn do_socketpair(domain: i32, type_: i32, protocol: i32, sv_ptr: u64) -> u64 {
-    let (base_type, nonblock, cloexec) = extract_sock_flags(type_);
+    let (mut base_type, nonblock, cloexec) = extract_sock_flags(type_);
+    // macOS does not support SOCK_SEQPACKET for AF_UNIX (EPROTONOSUPPORT).
+    // conmon creates an AF_UNIX SEQPACKET socketpair for its container
+    // sync/attach channel. Substitute SOCK_STREAM — conmon's protocol is
+    // length-framed, so the loss of message boundaries is not relied upon.
+    if domain == libc::AF_UNIX && base_type == libc::SOCK_SEQPACKET {
+        base_type = libc::SOCK_STREAM;
+    }
     let ret = unsafe {
         libc::socketpair(domain, base_type, protocol, sv_ptr as *mut i32)
     };
