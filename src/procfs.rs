@@ -392,6 +392,20 @@ pub fn try_read(fd: i32, buf: u64, count: u64) -> Option<u64> {
     Some(n as u64)
 }
 
+/// Accept-and-discard write() on writable virtual /proc files (user-ns map
+/// files: uid_map/gid_map/setgroups). Returns Some(count) if handled, None
+/// otherwise (including virtual fds that are read-only — those fall through
+/// to the host write on the pipe read-end, which fails like real /proc).
+pub fn try_write(fd: i32, _buf: u64, count: u64) -> Option<u64> {
+    let lock = vfile_map().lock().unwrap();
+    let map = lock.as_ref()?;
+    let st = map.get(&fd)?;
+    let writable = st.path.ends_with("/uid_map")
+        || st.path.ends_with("/gid_map")
+        || st.path.ends_with("/setgroups");
+    if writable { Some(count) } else { None }
+}
+
 /// Serve lseek() on a virtual /proc file fd. Seeking to the START
 /// regenerates the content (fresh CPU ticks etc. — real /proc semantics for
 /// the reread-with-rewind pattern). Returns Some(new_pos) if handled.
@@ -510,10 +524,31 @@ fn generate_net_route() -> Vec<u8> {
     b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n".to_vec()
 }
 
+/// /proc/<pid>/{uid_map,gid_map,setgroups} for ANY pid — crun/podman write a
+/// child's user-namespace mappings from the parent, then read them back.
+/// Reads serve an identity root mapping; writes are accepted and discarded
+/// (see try_write) since there is no real user namespace to configure.
+fn userns_file_content(path: &str) -> Option<Vec<u8>> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_part, file) = rest.split_once('/')?;
+    if pid_part != "self" && pid_part.parse::<i32>().is_err() {
+        return None;
+    }
+    match file {
+        "uid_map" | "gid_map" => Some(b"         0          0 4294967295\n".to_vec()),
+        "setgroups" => Some(b"allow\n".to_vec()),
+        _ => None,
+    }
+}
+
 fn generate_content(path: &str) -> Option<Vec<u8>> {
     // Normalize /proc/<pid>/... to /proc/self/... when <pid> matches our PID
     let normalized = normalize_proc_path(path);
     let path = normalized.as_deref().unwrap_or(path);
+
+    if let Some(content) = userns_file_content(path) {
+        return Some(content);
+    }
 
     // Collapse /proc/self/task/<tid>/<file> → /proc/self/<file>. Per-thread
     // proc files mirror the process-level ones for our purposes (mountinfo is
@@ -532,14 +567,25 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
             Some(format!("{rss} {rss} 0 0 0 0 0\n", rss = s.rss_pages).into_bytes())
         }
         "/proc/self/cmdline" => Some(generate_cmdline()),
+        // Legacy cgroup-v1 membership, matching generate_mountinfo()'s cgroup
+        // mounts and the statfs magic for /sys/fs/cgroup (see
+        // syscall::statfs_magic_for_guest_path). Rootless crun/podman on v1
+        // disable cgroup management, which is what we want.
+        "/proc/self/cgroup" => Some(
+            b"6:pids:/\n5:memory:/\n4:cpuset:/\n3:cpu:/\n2:blkio:/\n1:name=systemd:/\n"
+                .to_vec(),
+        ),
         "/proc/cpuinfo" => Some(generate_cpuinfo()),
         "/proc/sys/kernel/osrelease" => Some(b"6.1.0-fakelinux\n".to_vec()),
         "/proc/self/mountinfo" => Some(generate_mountinfo()),
+        "/proc/mounts" | "/proc/self/mounts" => Some(generate_mounts()),
         "/proc/meminfo" => Some(generate_meminfo()),
         "/proc/uptime" => Some(generate_uptime()),
         "/proc/stat" => Some(generate_proc_stat()),
         "/proc/loadavg" => Some(generate_loadavg()),
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
+        // Highest capability number (kernel 6.x). crun caps setup reads it.
+        "/proc/sys/kernel/cap_last_cap" => Some(b"40\n".to_vec()),
         // Default Linux core dump pattern. VPP's test framework reads this to
         // locate core files after a crash (test/util.py get_core_pattern).
         "/proc/sys/kernel/core_pattern" => Some(b"core\n".to_vec()),
@@ -817,12 +863,46 @@ fn generate_cpuinfo() -> Vec<u8> {
     out.into_bytes()
 }
 
+/// The mount table presented to the guest — single source of truth for
+/// /proc/self/mountinfo and /proc/mounts (and it must agree with
+/// /proc/self/cgroup and syscall::statfs_magic_for_guest_path). Container
+/// runtimes locate cgroup v1 controllers by scanning for "cgroup" mounts.
+/// Fields: (parent index into this table or usize::MAX for the root mount,
+/// mountpoint, fstype, source, options).
+const GUEST_MOUNTS: &[(usize, &str, &str, &str, &str)] = &[
+    (usize::MAX, "/", "ext4", "/dev/sda1", "rw,relatime"),
+    (0, "/proc", "proc", "proc", "rw,relatime"),
+    (0, "/dev", "devtmpfs", "devtmpfs", "rw,relatime"),
+    (0, "/tmp", "tmpfs", "tmpfs", "rw,relatime"),
+    (0, "/sys", "sysfs", "sysfs", "rw,relatime"),
+    (4, "/sys/fs/cgroup", "tmpfs", "tmpfs", "rw,mode=755"),
+    (5, "/sys/fs/cgroup/systemd", "cgroup", "cgroup", "rw,name=systemd"),
+    (5, "/sys/fs/cgroup/blkio", "cgroup", "cgroup", "rw,blkio"),
+    (5, "/sys/fs/cgroup/cpu", "cgroup", "cgroup", "rw,cpu"),
+    (5, "/sys/fs/cgroup/cpuset", "cgroup", "cgroup", "rw,cpuset"),
+    (5, "/sys/fs/cgroup/memory", "cgroup", "cgroup", "rw,memory"),
+    (5, "/sys/fs/cgroup/pids", "cgroup", "cgroup", "rw,pids"),
+];
+
 fn generate_mountinfo() -> Vec<u8> {
-    b"1 0 0:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
-      2 1 0:2 / /proc rw,relatime - proc proc rw\n\
-      3 1 0:3 / /dev rw,relatime - devtmpfs devtmpfs rw\n\
-      4 1 0:4 / /tmp rw,relatime - tmpfs tmpfs rw\n"
-        .to_vec()
+    let mut out = String::new();
+    for (i, &(parent, mnt, fstype, src, opts)) in GUEST_MOUNTS.iter().enumerate() {
+        let id = i + 1;
+        let parent_id = if parent == usize::MAX { 0 } else { parent + 1 };
+        out.push_str(&format!(
+            "{id} {parent_id} 0:{id} / {mnt} {opts} - {fstype} {src} rw\n"
+        ));
+    }
+    out.into_bytes()
+}
+
+/// /proc/mounts (and /proc/self/mounts) — fstab-style view of GUEST_MOUNTS.
+fn generate_mounts() -> Vec<u8> {
+    let mut out = String::new();
+    for &(_, mnt, fstype, src, opts) in GUEST_MOUNTS {
+        out.push_str(&format!("{src} {mnt} {fstype} {opts} 0 0\n"));
+    }
+    out.into_bytes()
 }
 
 fn generate_meminfo() -> Vec<u8> {
@@ -1377,6 +1457,27 @@ mod tests {
         assert_eq!(sysfs_content("/sys/devices/system/cpu/cpu10/topology/core_id", 10), None);
         assert_eq!(sysfs_content("/sys/devices/system/node/node1/cpulist", 10), None);
         assert_eq!(sysfs_content("/sys/kernel/mm/whatever", 10), None);
+    }
+
+    #[test]
+    fn mounts_and_mountinfo_agree() {
+        // Both views render from GUEST_MOUNTS; every mountpoint must appear
+        // in both, and the cgroup v1 controllers in /proc/self/cgroup must
+        // each have a matching cgroup mount.
+        let mountinfo = String::from_utf8(generate_mountinfo()).unwrap();
+        let mounts = String::from_utf8(generate_mounts()).unwrap();
+        assert_eq!(mountinfo.lines().count(), mounts.lines().count());
+        for &(_, mnt, fstype, _, _) in GUEST_MOUNTS {
+            assert!(mountinfo.lines().any(|l| l.split(' ').nth(4) == Some(mnt)),
+                "mountinfo missing {}", mnt);
+            assert!(mounts.lines().any(|l| l.split(' ').nth(1) == Some(mnt)
+                && l.split(' ').nth(2) == Some(fstype)),
+                "mounts missing {}", mnt);
+        }
+        for ctrl in ["blkio", "cpu", "cpuset", "memory", "pids"] {
+            let path = format!("/sys/fs/cgroup/{}", ctrl);
+            assert!(GUEST_MOUNTS.iter().any(|&(_, m, t, _, _)| m == path && t == "cgroup"));
+        }
     }
 
     #[test]

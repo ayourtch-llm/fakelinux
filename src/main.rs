@@ -7,6 +7,7 @@ mod epoll;
 mod eventfd;
 mod linux;
 mod loader;
+mod mountns;
 mod net;
 mod pidns;
 mod procfs;

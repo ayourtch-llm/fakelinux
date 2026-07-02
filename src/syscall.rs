@@ -3,6 +3,7 @@ use crate::epoll;
 use crate::eventfd;
 use crate::linux::*;
 use crate::loader;
+use crate::mountns;
 use crate::net;
 use crate::pidns;
 use crate::procfs;
@@ -798,8 +799,31 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         // pivot_root(2), mount(2), umount2(2) — single-process emulator has
         // no real filesystem isolation; pretend success so container setup
         // continues. Mount points just don't actually exist; reads of
-        // mounted paths fall through to the rootfs.
-        41 | 40 | 39 => 0,
+        // mounted paths fall through to the rootfs. BUT the mount-table
+        // arithmetic is kept honest (mountns.rs): crun's pivot_root cleanup
+        // loops umount2(".") until EINVAL — an unconditional-success umount
+        // spun it forever at 100% CPU.
+        40 => {
+            if !mountns::is_mount_modification(args[3]) {
+                if let Some(key) = mount_table_key(args[1]) {
+                    mountns::push_mount(&key);
+                }
+            }
+            0
+        }
+        39 => match mount_table_key(args[0]) {
+            Some(key) if mountns::pop_mount(&key) => 0,
+            _ => (-22_i64) as u64, // -EINVAL: not a mount point
+        },
+        // pivot_root(new_root, put_old): the old root ends up stacked at
+        // put_old (crun uses pivot_root(".", ".")) — push a fake mount there
+        // for the subsequent umount2 loop to pop.
+        41 => {
+            if let Some(key) = mount_table_key(args[1]) {
+                mountns::push_mount(&key);
+            }
+            0
+        }
         // chroot(2) — translate the guest path to a host path and store it.
         // Subsequent rootfs::translate_path calls treat this directory as the
         // guest's "/". CRITICAL: stubbing this to either success or ENOSYS was
@@ -857,6 +881,9 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
     let fd_i32 = fd as i32;
     if eventfd::is_eventfd(fd_i32) {
         return eventfd::do_write(fd_i32, buf, count);
+    }
+    if let Some(r) = procfs::try_write(fd_i32, buf, count) {
+        return r;
     }
     // DEBUG: optional per-pid raw-byte dump for write-side pipe tracing.
     // Enable by setting FAKELINUX_DUMP_WRITE_FD=<fd> before launching. Output
@@ -1278,6 +1305,11 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         if let Ok(cs) = std::ffi::CString::new(host_exe) {
             let ret = unsafe { libc::open(cs.as_ptr(), mac_flags, mode) };
             if ret >= 0 {
+                // Report the fd as a fully-sealed memfd: crun/runc's
+                // CVE-2019-5736 guard then skips its memfd self-re-exec
+                // (meaningless inside an emulated rootfs, and its second
+                // incarnation couldn't reopen the unlinked temp binary).
+                set_fd_seals(ret, SELF_EXE_SEALS);
                 return ret as u64;
             }
             return translate::linux_errno();
@@ -1864,6 +1896,7 @@ fn siocgif(request: u64, arg: u64) -> u64 {
         return (-19_i64) as u64; // -ENODEV
     }
     let u = (arg + 16) as *mut u8; // start of the ifr_* union
+    const SIOCSIFFLAGS: u64 = 0x8914;
     const SIOCGIFFLAGS: u64 = 0x8913;
     const SIOCGIFADDR: u64 = 0x8915;
     const SIOCGIFNETMASK: u64 = 0x891b;
@@ -1874,6 +1907,9 @@ fn siocgif(request: u64, arg: u64) -> u64 {
         match request {
             // ifr_flags (short): IFF_UP | IFF_LOOPBACK | IFF_RUNNING.
             SIOCGIFFLAGS => (u as *mut u16).write_unaligned(0x0001 | 0x0008 | 0x0040),
+            // Setting flags on lo (crun brings it up in a new netns): it is
+            // already "up" here, so accept and ignore.
+            SIOCSIFFLAGS => {}
             // ifr_ifindex (int): loopback is index 1.
             SIOCGIFINDEX => (u as *mut i32).write_unaligned(1),
             // ifr_mtu (int).
@@ -4049,7 +4085,63 @@ fn do_membarrier(cmd: i32, _flags: u32, _cpu_id: i32) -> u64 {
     }
 }
 
+/// Filesystem magic override for guest paths where "ext4" is a harmful lie.
+/// crun/podman statfs /sys/fs/cgroup to detect the cgroup layout and abort
+/// with "invalid file system type on `/sys/fs/cgroup`" on anything
+/// unexpected. We present a legacy cgroup-v1 layout (tmpfs mount point,
+/// cgroupfs per controller): rootless crun on v1 disables cgroups entirely,
+/// which is exactly right for an emulator with nothing to enforce.
+fn statfs_magic_for_guest_path(path: &[u8]) -> Option<u64> {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const CGROUP_SUPER_MAGIC: u64 = 0x0027_e0eb;
+    const SYSFS_MAGIC: u64 = 0x6265_6572;
+    let path = if path.len() > 1 && path.ends_with(b"/") {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    if path == b"/sys/fs/cgroup" {
+        return Some(TMPFS_MAGIC);
+    }
+    if path.starts_with(b"/sys/fs/cgroup/") {
+        return Some(CGROUP_SUPER_MAGIC);
+    }
+    if path == b"/sys" || path.starts_with(b"/sys/") {
+        return Some(SYSFS_MAGIC);
+    }
+    None
+}
+
+/// Resolve a guest mount/umount/pivot_root target to a canonical host path
+/// used as the fake mount-table key (mountns.rs). Relative targets (crun
+/// mounts/unmounts ".") resolve against the current directory; realpath
+/// keeps "." and the equivalent absolute path keyed identically.
+fn mount_table_key(path_ptr: u64) -> Option<String> {
+    if path_ptr == 0 {
+        return None;
+    }
+    let (eff, _hold) = effective_path_ptr(path_ptr);
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let rp = unsafe { libc::realpath(eff, buf.as_mut_ptr() as *mut i8) };
+    if !rp.is_null() {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(0);
+        return Some(String::from_utf8_lossy(&buf[..len]).into_owned());
+    }
+    // Target may not exist (or resolution failed): fall back to cwd-joining.
+    let raw = unsafe { std::ffi::CStr::from_ptr(eff) }
+        .to_string_lossy()
+        .into_owned();
+    if raw.starts_with('/') {
+        Some(raw)
+    } else {
+        let cwd = std::env::current_dir().ok()?;
+        Some(cwd.join(raw).to_string_lossy().into_owned())
+    }
+}
+
 fn do_statfs(pathname: u64, buf: u64) -> u64 {
+    let guest_path = unsafe { std::ffi::CStr::from_ptr(pathname as *const i8) };
+    let magic = statfs_magic_for_guest_path(guest_path.to_bytes()).unwrap_or(0xEF53);
     let (eff_path, _hold) = effective_path_ptr(pathname);
     unsafe {
         let mut mac_statfs: libc::statfs = std::mem::zeroed();
@@ -4060,7 +4152,7 @@ fn do_statfs(pathname: u64, buf: u64) -> u64 {
             let w64 = |off: usize, val: u64| {
                 (out.add(off) as *mut u64).write_unaligned(val);
             };
-            w64(0, 0xEF53); // EXT4_SUPER_MAGIC
+            w64(0, magic); // EXT4_SUPER_MAGIC unless overridden (cgroup/sysfs)
             w64(8, mac_statfs.f_bsize as u64);
             w64(16, mac_statfs.f_blocks as u64);
             w64(24, mac_statfs.f_bfree as u64);
@@ -4085,7 +4177,7 @@ fn do_statfs(pathname: u64, buf: u64) -> u64 {
                 let w64 = |off: usize, val: u64| {
                     (out.add(off) as *mut u64).write_unaligned(val);
                 };
-                w64(0, 0xEF53);
+                w64(0, magic);
                 w64(8, mac_statfs.f_bsize as u64);
                 w64(16, mac_statfs.f_blocks as u64);
                 w64(24, mac_statfs.f_bfree as u64);
@@ -4128,8 +4220,20 @@ fn do_fstatfs(fd: i32, buf: u64) -> u64 {
         let w64 = |off: usize, val: u64| {
             (out.add(off) as *mut u64).write_unaligned(val);
         };
-        // EXT4_SUPER_MAGIC = 0xEF53 (pretend to be ext4)
-        w64(0, 0xEF53);
+        // EXT4_SUPER_MAGIC = 0xEF53 (pretend to be ext4), unless the fd's
+        // guest path warrants a cgroup/sysfs magic (crun probes with fstatfs
+        // too when it holds a directory fd on /sys/fs/cgroup).
+        let mut magic: u64 = 0xEF53;
+        let mut pathbuf = [0u8; libc::PATH_MAX as usize];
+        if libc::fcntl(fd, libc::F_GETPATH, pathbuf.as_mut_ptr()) == 0 {
+            let len = pathbuf.iter().position(|&b| b == 0).unwrap_or(0);
+            if let Some(guest) = rootfs::strip_root_prefix(&pathbuf[..len]) {
+                if let Some(m) = statfs_magic_for_guest_path(&guest) {
+                    magic = m;
+                }
+            }
+        }
+        w64(0, magic);
         w64(8, mac_statfs.f_bsize as u64);
         w64(16, mac_statfs.f_blocks as u64);
         w64(24, mac_statfs.f_bfree as u64);
@@ -4633,6 +4737,19 @@ static FD_SEALS: [std::sync::atomic::AtomicU32; 4096] =
 pub(crate) fn clear_fd_seals(fd: i32) {
     if fd >= 0 && (fd as usize) < FD_SEALS.len() {
         FD_SEALS[fd as usize].store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE — the exact set
+/// crun/runc's is_self_cloned() (CVE-2019-5736 guard) expects on a cloned
+/// binary. fds opened via /proc/self/exe report this so the guard concludes
+/// "already a sealed memfd" and skips its self-re-exec entirely (which used
+/// to die with "Failed to re-execute libcrun via memory file descriptor").
+pub(crate) const SELF_EXE_SEALS: u32 = 0xF;
+
+fn set_fd_seals(fd: i32, seals: u32) {
+    if fd >= 0 && (fd as usize) < FD_SEALS.len() {
+        FD_SEALS[fd as usize].store(seals, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -5175,6 +5292,21 @@ mod tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+
+    #[test]
+    fn statfs_magic_cgroup_v1_layout() {
+        // crun aborts spec/run with "invalid file system type on
+        // `/sys/fs/cgroup`" unless statfs reports a real cgroup layout.
+        assert_eq!(statfs_magic_for_guest_path(b"/sys/fs/cgroup"), Some(0x0102_1994));
+        assert_eq!(statfs_magic_for_guest_path(b"/sys/fs/cgroup/"), Some(0x0102_1994));
+        assert_eq!(statfs_magic_for_guest_path(b"/sys/fs/cgroup/memory"), Some(0x0027_e0eb));
+        assert_eq!(statfs_magic_for_guest_path(b"/sys/fs/cgroup/pids/"), Some(0x0027_e0eb));
+        assert_eq!(statfs_magic_for_guest_path(b"/sys"), Some(0x6265_6572));
+        assert_eq!(statfs_magic_for_guest_path(b"/sys/kernel/mm"), Some(0x6265_6572));
+        // Everything else keeps the ext4 default.
+        assert_eq!(statfs_magic_for_guest_path(b"/tmp"), None);
+        assert_eq!(statfs_magic_for_guest_path(b"/system"), None);
     }
 
     #[test]
