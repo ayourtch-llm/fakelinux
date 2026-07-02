@@ -3517,6 +3517,14 @@ pub fn install_handler() {
         libc::sigfillset(&mut sa2.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa2, std::ptr::null_mut());
+
+        // Host SIGPIPE is always ignored: fakelinux's own diagnostics write
+        // to inherited stderr (often a pipe to conmon or a shell) and a
+        // broken-pipe SIGPIPE generated inside the trap handler would stay
+        // pending and kill the GUEST at handler return (how the podman
+        // container init died). Linux SIGPIPE semantics for guest writes are
+        // emulated at the write sites (see guest_epipe_signal in syscall.rs).
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 

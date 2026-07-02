@@ -519,7 +519,8 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
                 let path_bytes = std::slice::from_raw_parts(p.add(2), (addrlen - 2) as usize);
                 let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
                 let path = String::from_utf8_lossy(&path_bytes[..end]);
-                eprintln!("fakelinux: connect(fd={}, AF_UNIX \"{}\", len={})", fd, path, addrlen);
+                eprintln!("fakelinux: [{}] connect(fd={}, AF_UNIX \"{}\", len={})",
+                          unsafe { libc::getpid() }, fd, path, addrlen);
             }
         }
     }
@@ -560,7 +561,11 @@ pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrle
         )
     };
     if ret < 0 {
-        translate::linux_errno()
+        let e = translate::linux_errno();
+        if e as i64 == -32 && (flags & LINUX_MSG_NOSIGNAL) == 0 {
+            crate::signal::guest_epipe_signal();
+        }
+        e
     } else {
         ret as u64
     }
@@ -877,7 +882,11 @@ pub fn do_sendmsg(fd: i32, msg_ptr: u64, flags: i32) -> u64 {
     }
     let ret = unsafe { libc::sendmsg(fd, &mac_msg, mac_flags) };
     if ret < 0 {
-        translate::linux_errno()
+        let e = translate::linux_errno();
+        if e as i64 == -32 && (flags & LINUX_MSG_NOSIGNAL) == 0 {
+            crate::signal::guest_epipe_signal();
+        }
+        e
     } else {
         ret as u64
     }

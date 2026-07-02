@@ -1770,10 +1770,119 @@ fn write_guest_sigaction(ptr: u64, act: &GuestSigaction) {
     }
 }
 
-fn install_forwarder(mac_sig: i32, handler: u64) {
+/// Linux default action for these signals is Terminate/Core. When the guest
+/// sets SIG_DFL for one of them we install this shim instead of the raw macOS
+/// SIG_DFL: it logs the death (otherwise completely silent — how the podman
+/// container init vanished), publishes the signal wstatus to a subreaper
+/// ancestor (conmon needs it for the exit file), then re-raises with the real
+/// default so the kernel-reported wait status is still "killed by signal N".
+extern "C" fn dfl_fatal_shim(sig: libc::c_int, _info: *mut libc::siginfo_t,
+                             _ctx: *mut libc::c_void) {
+    if crate::syscall::trace_enabled() {
+        let (code, spid) = if _info.is_null() { (-999, -999) } else {
+            unsafe { ((*_info).si_code, (*_info).si_pid) }
+        };
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] fatal signal {} with SIG_DFL — dying by default action (si_code={} si_pid={})\n",
+            unsafe { libc::getpid() }, sig, code, spid));
+    }
+    die_by_default_action(sig);
+}
+
+/// Publish the "killed by signal N" wstatus for a subreaper ancestor, then
+/// die by the real default action so the kernel wait status matches.
+pub fn die_by_default_action(sig: libc::c_int) {
+    // wstatus for "killed by signal N" is just N in the low 7 bits.
+    crate::reaper::publish_exit(sig & 0x7f);
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+}
+
+/// Emulate Linux SIGPIPE semantics after a guest write returned EPIPE.
+/// Host SIGPIPE is SIG_IGN (supervisor safety), so the kernel never raises
+/// it — apply the GUEST's disposition here instead: DFL kills the process
+/// (that's how `yes | head` terminates), IGN does nothing, and a custom
+/// handler gets a real SIGPIPE raised (host disposition for that case is
+/// the signal forwarder, which builds the guest sigframe).
+pub fn guest_epipe_signal() {
+    // Linux SIGPIPE = 13.
+    let sa = GUEST_SIGACTIONS[13].load();
+    // Blocked SIGPIPE stays pending on Linux; a DFL death would be wrong
+    // while masked. Keep it simple: only act when unblocked.
+    if sigmask_get() & (1u64 << 12) != 0 {
+        return;
+    }
+    match sa.handler {
+        SIG_IGN => {}
+        SIG_DFL => {
+            if crate::syscall::trace_enabled() {
+                crate::syscall::raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] guest EPIPE write with SIGPIPE=SIG_DFL — dying\n",
+                    unsafe { libc::getpid() }));
+            }
+            die_by_default_action(libc::SIGPIPE);
+        }
+        _custom => unsafe {
+            // Forwarder is installed as the host handler; raise for real.
+            libc::raise(libc::SIGPIPE);
+        },
+    }
+}
+
+/// macOS signals whose default action terminates the process (Term or Core),
+/// excluding SIGKILL/SIGSTOP (uncatchable).
+fn dfl_is_fatal(mac_sig: i32) -> bool {
+    matches!(mac_sig,
+        libc::SIGHUP | libc::SIGINT | libc::SIGQUIT | libc::SIGILL |
+        libc::SIGTRAP | libc::SIGABRT | libc::SIGEMT | libc::SIGFPE |
+        libc::SIGBUS | libc::SIGSEGV | libc::SIGSYS | libc::SIGPIPE |
+        libc::SIGALRM | libc::SIGTERM | libc::SIGXCPU | libc::SIGXFSZ |
+        libc::SIGVTALRM | libc::SIGPROF | libc::SIGUSR1 | libc::SIGUSR2)
+}
+
+fn install_forwarder(mac_sig: i32, handler: u64) {
+    unsafe {
+        // Never override the supervisor's own SIGSEGV/SIGBUS/SIGILL trap
+        // handlers with a raw macOS disposition — they implement lazy
+        // relocation and fault emulation for the WHOLE process. A guest
+        // rt_sigaction(SIGSEGV, SIG_DFL) (crun's container init resets all
+        // handlers) would otherwise kill fault fixups process-wide and the
+        // next lazy-reloc fault dies natively and silently. The guest's
+        // DFL/IGN disposition is recorded in GUEST_SIGACTIONS; trap.rs
+        // consults it for genuinely unhandled guest faults.
+        if (handler == SIG_DFL || handler == SIG_IGN)
+            && matches!(mac_sig, libc::SIGSEGV | libc::SIGBUS | libc::SIGILL)
+        {
+            return;
+        }
+        // Host SIGPIPE stays SIG_IGN for guest DFL/IGN: supervisor
+        // diagnostics must never die of a broken stderr pipe. Guest DFL
+        // ("die on broken pipe write") is emulated at the write sites.
+        if mac_sig == libc::SIGPIPE && (handler == SIG_DFL || handler == SIG_IGN) {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(mac_sig, &sa, std::ptr::null_mut());
+            return;
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
         if handler == SIG_DFL {
+            if dfl_is_fatal(mac_sig) {
+                sa.sa_sigaction = dfl_fatal_shim as *const () as libc::sighandler_t;
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(mac_sig, &sa, std::ptr::null_mut());
+                return;
+            }
             sa.sa_sigaction = libc::SIG_DFL;
         } else if handler == SIG_IGN {
             sa.sa_sigaction = libc::SIG_IGN;
