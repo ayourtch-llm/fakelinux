@@ -289,6 +289,43 @@ pub fn on_close(fd: i32) {
     }
 }
 
+/// Rebuild every epoll instance in a freshly-forked child.
+///
+/// A kqueue descriptor is NOT inherited across fork() on macOS/BSD: the fd
+/// number survives in the child's table but the underlying kqueue is dead,
+/// so the next kevent() returns EBADF. Go's runtime forks (rootless re-exec)
+/// and keeps running with its netpoller epoll fd — that dead kqueue made
+/// epoll_wait fail with EBADF and crashed the runtime ("runtime: netpoll
+/// failed"). For each tracked epoll fd we create a fresh kqueue, dup2 it
+/// back onto the same fd number the guest holds, and replay the
+/// registrations so the child's epoll keeps working.
+pub fn rebuild_after_fork() {
+    let mut guard = EPOLL_STATE.lock().unwrap();
+    let state = match guard.as_mut() {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    for inst in state.values_mut() {
+        let old_fd = inst.kqueue_fd;
+        let new_kq = unsafe { libc::kqueue() };
+        if new_kq < 0 {
+            continue;
+        }
+        // Move the fresh kqueue onto the fd number the guest already holds.
+        if new_kq != old_fd {
+            if unsafe { libc::dup2(new_kq, old_fd) } < 0 {
+                unsafe { libc::close(new_kq) };
+                continue;
+            }
+            unsafe { libc::close(new_kq) };
+        }
+        // Replay all registrations onto the new (same-numbered) kqueue.
+        for (&fd, &(events, _data)) in inst.registrations.iter() {
+            apply_kevents(old_fd, fd, events, true);
+        }
+    }
+}
+
 /// Register kevents for a given fd and event mask. Returns 0 on success.
 fn apply_kevents(kq: i32, fd: i32, events: u32, _add: bool) -> u64 {
     let mut changes: Vec<libc::kevent> = Vec::new();

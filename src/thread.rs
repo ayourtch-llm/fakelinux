@@ -889,6 +889,9 @@ extern "C" fn fork_trampoline_entry() -> ! {
         reset_main_thread_after_fork();
         crate::syscall::reset_socket_waiters_after_fork();
         crate::timers::reset_after_fork();
+        // kqueue fds (our epoll backing) don't survive fork on macOS — rebuild
+        // them so a forked Go runtime's netpoller epoll fd keeps working.
+        crate::epoll::rebuild_after_fork();
         IS_FORK_CHILD.store(true, Ordering::Relaxed);
         // A fork child is never vpid 1 — clear the COW-inherited init flag so
         // getpid() returns the child's own pid (not 1), keeping job-control
