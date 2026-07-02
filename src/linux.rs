@@ -93,6 +93,7 @@ pub const SYS_EXECVEAT: u64 = 281;
 pub const SYS_CHDIR: u64 = 49;
 pub const SYS_FCHDIR: u64 = 50;
 pub const SYS_GETCWD: u64 = 17;
+pub const SYS_MKNODAT: u64 = 33;
 pub const SYS_MKDIRAT: u64 = 34;
 pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_RENAMEAT: u64 = 38;

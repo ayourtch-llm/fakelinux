@@ -135,7 +135,28 @@ enum VirtualDir {
     /// /proc/<pid>/fd or /proc/self/fd — one numeric symlink per open fd.
     /// Used by psutil.num_fds()/lsof-style fd-leak checks (VPP-1486 stats test).
     ProcPidFd(i32),
+    /// A fixed-content virtual directory (the /proc/sys tree). Entries are
+    /// (name, DT_*) pairs. crun opens these to remount them read-only
+    /// (podman's readonlyPaths), so open/stat/getdents must work.
+    StaticDir(&'static [(&'static str, u8)]),
 }
+
+/// The /proc/sys directory tree. Subdir file lists mirror what
+/// generate_content() actually serves, plus the standard top-level layout.
+static PROC_SYS_DIRS: &[(&str, &[(&str, u8)])] = &[
+    ("/proc/sys", &[("kernel", DT_DIR), ("net", DT_DIR), ("vm", DT_DIR), ("fs", DT_DIR)]),
+    ("/proc/sys/kernel", &[
+        ("osrelease", DT_REG), ("pid_max", DT_REG), ("cap_last_cap", DT_REG),
+        ("core_pattern", DT_REG), ("core_uses_pid", DT_REG),
+    ]),
+    ("/proc/sys/net", &[("core", DT_DIR), ("ipv4", DT_DIR)]),
+    ("/proc/sys/net/core", &[]),
+    ("/proc/sys/net/ipv4", &[
+        ("ping_group_range", DT_REG), ("ip_unprivileged_port_start", DT_REG),
+    ]),
+    ("/proc/sys/vm", &[]),
+    ("/proc/sys/fs", &[]),
+];
 
 /// State for an open virtual directory fd. Entries are pre-generated and
 /// consumed by successive getdents64 calls.
@@ -145,6 +166,8 @@ struct VirtualDirState {
     buf: Vec<u8>,
     /// How many bytes have been consumed so far.
     pos: usize,
+    /// Guest path this dir was opened at (for relative openat resolution).
+    path: String,
 }
 
 /// Map of fd → virtual directory state. Protected by mutex.
@@ -169,11 +192,19 @@ fn alloc_virtual_fd() -> Option<i32> {
 }
 
 /// Register a virtual directory fd.
-fn register_virtual_dir(fd: i32, kind: VirtualDir) {
+fn register_virtual_dir(fd: i32, kind: VirtualDir, path: &str) {
     let buf = generate_dir_entries(&kind);
     let mut lock = vdir_map().lock().unwrap();
     let map = lock.get_or_insert_with(HashMap::new);
-    map.insert(fd, VirtualDirState { kind, buf, pos: 0 });
+    map.insert(fd, VirtualDirState { kind, buf, pos: 0, path: path.to_string() });
+}
+
+/// The guest path a virtual directory fd was opened at — lets openat() with a
+/// virtual dirfd (crun: openat(fd_of_/proc/sys, "net/ipv4/ping_group_range"))
+/// resolve relative paths that a pipe-marker fd can't.
+pub fn virtual_dir_path(fd: i32) -> Option<String> {
+    let lock = vdir_map().lock().unwrap();
+    lock.as_ref()?.get(&fd).map(|st| st.path.clone())
 }
 
 /// Check if fd is a virtual directory and handle getdents64.
@@ -312,6 +343,13 @@ fn generate_dir_entries(kind: &VirtualDir) -> Vec<u8> {
                 push_dirent64(&mut buf, 203, DT_DIR, name);
             }
         }
+        VirtualDir::StaticDir(entries) => {
+            push_dirent64(&mut buf, 400, DT_DIR, b".");
+            push_dirent64(&mut buf, 1, DT_DIR, b"..");
+            for (i, (name, dt)) in entries.iter().enumerate() {
+                push_dirent64(&mut buf, 401 + i as u64, *dt, name.as_bytes());
+            }
+        }
         VirtualDir::ProcPidFd(_vpid) => {
             push_dirent64(&mut buf, 300, DT_DIR, b".");
             push_dirent64(&mut buf, 1, DT_DIR, b"..");
@@ -346,7 +384,7 @@ pub fn try_open(path: &[u8]) -> Option<i32> {
     // Check for directory opens first
     if let Some(vdir) = classify_dir_path(path_clean) {
         let fd = alloc_virtual_fd()?;
-        register_virtual_dir(fd, vdir);
+        register_virtual_dir(fd, vdir, path_clean);
         return Some(fd);
     }
 
@@ -355,7 +393,14 @@ pub fn try_open(path: &[u8]) -> Option<i32> {
     // with fflush+rewind+fread every refresh. A drained pipe gave it an
     // empty buffer → ERANGE ("library failed cpu statistics"). lseek(0) on
     // a virtual file fd REGENERATES the content, so top's deltas refresh.
-    let content = generate_content(path_str)?;
+    let content = match generate_content(path_str) {
+        Some(c) => c,
+        // Any other /proc/sys file still opens: reads give EOF, writes are
+        // accepted-and-discarded (crun fatally aborts if a sysctl write-open
+        // fails). Real content for specific sysctls goes in generate_content.
+        None if path_clean.starts_with("/proc/sys/") => Vec::new(),
+        None => return None,
+    };
     let fd = alloc_virtual_fd()?;
     let mut lock = vfile_map().lock().unwrap();
     let map = lock.get_or_insert_with(HashMap::new);
@@ -402,7 +447,10 @@ pub fn try_write(fd: i32, _buf: u64, count: u64) -> Option<u64> {
     let st = map.get(&fd)?;
     let writable = st.path.ends_with("/uid_map")
         || st.path.ends_with("/gid_map")
-        || st.path.ends_with("/setgroups");
+        || st.path.ends_with("/setgroups")
+        // sysctl writes (crun applies podman's defaults, e.g.
+        // net.ipv4.ping_group_range) — accept and discard.
+        || st.path.starts_with("/proc/sys/");
     if writable { Some(count) } else { None }
 }
 
@@ -444,6 +492,13 @@ fn classify_dir_path(path: &str) -> Option<VirtualDir> {
 
     if path == "/proc" {
         return Some(VirtualDir::ProcRoot);
+    }
+
+    // /proc/sys tree — fixed layout.
+    for (dir, entries) in PROC_SYS_DIRS {
+        if path == *dir {
+            return Some(VirtualDir::StaticDir(entries));
+        }
     }
 
     // /proc/self or /proc/<our-pid> or /proc/<our-vpid>
@@ -590,6 +645,9 @@ fn generate_content(path: &str) -> Option<Vec<u8>> {
         // locate core files after a crash (test/util.py get_core_pattern).
         "/proc/sys/kernel/core_pattern" => Some(b"core\n".to_vec()),
         "/proc/sys/kernel/core_uses_pid" => Some(b"0\n".to_vec()),
+        // Serve podman's default-write values so a read-back looks applied.
+        "/proc/sys/net/ipv4/ping_group_range" => Some(b"0\t2147483647\n".to_vec()),
+        "/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(b"1024\n".to_vec()),
         // Minimal but valid network tables. Tools (VPP's test framework, scapy)
         // read these to enumerate interfaces / routes; we expose a loopback and
         // an empty routing table so they don't choke (we have no real netdevs).
@@ -1486,6 +1544,33 @@ mod tests {
         let c = generate_content("/sys/devices/system/cpu/online").expect("served");
         let s = String::from_utf8(c).unwrap();
         assert!(s == "0\n" || (s.starts_with("0-") && s.ends_with('\n')), "{s}");
+    }
+
+    #[test]
+    fn proc_sys_is_an_openable_directory() {
+        // crun opens /proc/sys (podman lists it in readonlyPaths) and
+        // remounts it read-only; the open must succeed and stat as a dir.
+        let mut statbuf = [0u8; 128];
+        try_stat(b"/proc/sys", statbuf.as_mut_ptr() as u64).expect("stat /proc/sys");
+        let mode = u32::from_le_bytes(statbuf[16..20].try_into().unwrap());
+        assert_eq!(mode & 0o170000, 0o040000, "must be a directory: {:o}", mode);
+
+        let fd = try_open(b"/proc/sys").expect("open /proc/sys");
+        assert!(is_virtual_dir(fd));
+        let mut dents = [0u8; 4096];
+        let n = try_getdents64(fd, dents.as_mut_ptr() as u64, 4096).expect("getdents");
+        let names = String::from_utf8_lossy(&dents[..n as usize]).into_owned();
+        assert!(names.contains("kernel"), "entries: {}", names);
+        on_close(fd);
+        unsafe { libc::close(fd) };
+
+        // Subdir with the files we actually serve.
+        let fd2 = try_open(b"/proc/sys/kernel").expect("open /proc/sys/kernel");
+        let n2 = try_getdents64(fd2, dents.as_mut_ptr() as u64, 4096).expect("getdents");
+        let names2 = String::from_utf8_lossy(&dents[..n2 as usize]).into_owned();
+        assert!(names2.contains("cap_last_cap"), "entries: {}", names2);
+        on_close(fd2);
+        unsafe { libc::close(fd2) };
     }
 
     #[test]

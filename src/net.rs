@@ -164,7 +164,13 @@ fn rendezvous_guest_path(host: &[u8]) -> Vec<u8> {
 /// rendezvous was used — do_bind drops a symlink there so the socket is visible
 /// at the location the guest expects (e.g. VPP's appns stat() of the bind path).
 fn translate_unix_path(path: &[u8]) -> Option<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)> {
-    let mut host = crate::rootfs::translate_path(path)?;
+    // sun_path may be the bare "/proc/self/fd/N" form: podman's
+    // openUnixSocket() opens the socket path O_PATH and dials the fd itself.
+    let mut host = if let Some(h) = crate::rootfs::resolve_proc_fd_sun_path(path) {
+        h
+    } else {
+        crate::rootfs::translate_path(path)?
+    };
     if host.ends_with(&[0]) {
         host.pop();
     }
@@ -362,6 +368,31 @@ fn unix_bind_plan(addr_ptr: u64, addrlen: u32) -> Option<(Vec<u8>, Vec<u8>, Vec<
     Some((rootfs_visible, guest_rv, host_bind))
 }
 
+
+/// FAKELINUX_TRACE_UNIX=1 — log every AF_UNIX bind/connect (guest sun_path,
+/// resolved host path, result) to the diagnostic fd. Far lighter than full
+/// tracing, so it doesn't perturb podman's timing.
+pub fn unix_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FAKELINUX_TRACE_UNIX").is_some())
+}
+
+fn unix_trace(op: &str, addr_ptr: u64, addrlen: u32, ret: u64) {
+    if !unix_trace_enabled() || addr_ptr == 0 || addrlen < 3 {
+        return;
+    }
+    let buf = unsafe { std::slice::from_raw_parts(addr_ptr as *const u8, addrlen as usize) };
+    if let Some(path) = linux_sun_path(buf) {
+        let host = translate_unix_path(path)
+            .map(|(h, _)| String::from_utf8_lossy(&h).into_owned())
+            .unwrap_or_else(|| "?".into());
+        crate::syscall::raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] UNIX {} \"{}\" host=\"{}\" ret={}\n",
+            unsafe { libc::getpid() }, op,
+            String::from_utf8_lossy(path), host, ret as i64));
+    }
+}
+
 pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
     let (mac_addr, mac_len) = match sockaddr_for_kernel(addr_ptr, addrlen) {
         Ok(pair) => pair,
@@ -384,7 +415,9 @@ pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
         )
     };
     if ret < 0 {
-        translate::linux_errno()
+        let e = translate::linux_errno();
+        unix_trace("bind", addr_ptr, addrlen, e);
+        e
     } else {
         // Expose the socket at the location the guest expects via a symlink to
         // the (guest) rendezvous path, so post-bind stat()/access() succeed.
@@ -396,10 +429,19 @@ pub fn do_bind(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
             ) {
                 unsafe {
                     libc::unlink(rp.as_ptr()); // clear stale symlink/node
-                    libc::symlink(rv.as_ptr(), rp.as_ptr()); // rootfs_visible -> guest_rv
+                    let sret = libc::symlink(rv.as_ptr(), rp.as_ptr()); // rootfs_visible -> guest_rv
+                    if unix_trace_enabled() {
+                        crate::syscall::raw_eprintln_fmt(format_args!(
+                            "fakelinux: [{}] UNIX bind-symlink {:?} -> {:?} ret={} errno={}\n",
+                            libc::getpid(),
+                            String::from_utf8_lossy(rp.to_bytes()),
+                            String::from_utf8_lossy(rv.to_bytes()),
+                            sret, if sret < 0 { *libc::__error() } else { 0 }));
+                    }
                 }
             }
         }
+        unix_trace("bind", addr_ptr, addrlen, 0);
         0
     }
 }
@@ -468,11 +510,9 @@ pub fn do_connect(fd: i32, addr_ptr: u64, addrlen: u32) -> u64 {
             mac_len,
         )
     };
-    if ret < 0 {
-        translate::linux_errno()
-    } else {
-        0
-    }
+    let r = if ret < 0 { translate::linux_errno() } else { 0 };
+    unix_trace("connect", addr_ptr, addrlen, r);
+    r
 }
 
 pub fn do_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u32) -> u64 {

@@ -188,19 +188,31 @@ fn rebased_at_path(mac_dirfd: i32, pathname: u64, nofollow: bool) -> Option<std:
         .map(|v| unsafe { std::ffi::CString::from_vec_with_nul_unchecked(v) })
 }
 
+/// Fd all raw diagnostics are written to. Defaults to stderr (2), but
+/// FAKELINUX_TRACE_FILE redirects it to a file fd parked high (O_CLOEXEC)
+/// so a daemonizing guest that dup2's /dev/null over 0/1/2 (e.g. conmon)
+/// can't silence — or worse, absorb — supervisor trace output.
+static TRACE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(2);
+
+pub fn set_trace_fd(fd: i32) {
+    TRACE_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Write a diagnostic message to stderr using raw write() — safe after fork.
 /// eprintln! uses Rust's Mutex<Stderr> which deadlocks in forked children.
 fn raw_eprintln(msg: &str) {
-    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+    let fd = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe { libc::write(fd, msg.as_ptr() as *const _, msg.len()); }
 }
 
 pub fn raw_eprintln_fmt(args: std::fmt::Arguments) {
     use std::io::Write;
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 1024];
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
     let _ = cursor.write_fmt(args);
     let pos = cursor.position() as usize;
-    unsafe { libc::write(2, buf.as_ptr() as *const _, pos); }
+    let fd = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe { libc::write(fd, buf.as_ptr() as *const _, pos); }
 }
 
 /// Current program break (heap end), set by the loader after mapping segments.
@@ -465,6 +477,7 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let ret = unsafe { libc::fchdir(args[0] as i32) };
             if ret < 0 { translate::linux_errno() } else { 0 }
         }
+        SYS_MKNODAT => do_mknodat(args[0] as i32, args[1], args[2] as u32, args[3]),
         SYS_MKDIRAT => {
             let (eff_path, _hold) = effective_path_ptr(args[1]);
             let mut ret = unsafe { libc::mkdirat(translate::translate_dirfd(args[0] as i32), eff_path, args[2] as libc::mode_t) };
@@ -788,9 +801,6 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_COPY_FILE_RANGE => do_copy_file_range(args[0] as i32, args[1], args[2] as i32, args[3], args[4], args[5] as u32),
         // Keyring syscalls — stub to -ENOSYS silently (used by apt/gpg, not critical)
         216 | 217 | 219 => (-38_i64) as u64,
-        // seccomp(2) — we don't sandbox; return -ENOSYS so callers fall back
-        // to "no seccomp" code paths (typical for libseccomp probes).
-        277 => (-38_i64) as u64,
         // waitid(2) — DIAG: return ENOSYS to test if this affects Go crash
         95 => (-38_i64) as u64,
         // unshare(2) — we don't actually isolate namespaces, but pretend
@@ -800,6 +810,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         97 => 0,
         // setns(2) — same reasoning as unshare: stub to success.
         268 => 0,
+        // seccomp(2) — crun installs podman's default filter before exec'ing
+        // the container process and treats ENOSYS as fatal. There is no
+        // kernel to enforce BPF filters; accept and ignore (no sandboxing —
+        // consistent with the rest of the isolation façade).
+        277 => 0,
         // sethostname(2)/setdomainname(2) — crun sets the UTS-namespace
         // hostname during container setup. macOS won't let an unprivileged
         // process change the real host name (and we wouldn't want to), so
@@ -1327,6 +1342,19 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         return fd as u64;
     }
 
+    // Relative open against a VIRTUAL directory fd (a pipe marker) — resolve
+    // against the dir's recorded guest path. crun opens /proc/sys once, then
+    // openat(that_fd, "net/ipv4/ping_group_range", O_WRONLY) for each sysctl.
+    if linux_dirfd >= 0 && !path.to_bytes().starts_with(b"/") {
+        if let Some(dir) = procfs::virtual_dir_path(linux_dirfd) {
+            let joined = format!("{}/{}", dir, path.to_string_lossy());
+            if let Some(fd) = procfs::try_open(joined.as_bytes()) {
+                return fd as u64;
+            }
+            return (-2_i64) as u64; // -ENOENT within a virtual dir
+        }
+    }
+
     // Always intercept /etc/ld.so.nohwcap — return ENOENT
     if path.to_bytes() == b"/etc/ld.so.nohwcap" {
         return (-2_i64) as u64; // -ENOENT
@@ -1369,6 +1397,16 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
     };
 
     let ret = unsafe { libc::openat(mac_dirfd, eff_path, mac_flags, mode) };
+    let open_errno = unsafe { *libc::__error() };
+    if crate::net::unix_trace_enabled() && path.to_bytes().windows(6).any(|w| w == b"attach") {
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] OPENDBG {:?} eff={:?} lflags={:#x} mflags={:#x} ret={} errno={}\n",
+            unsafe { libc::getpid() }, path,
+            unsafe { std::ffi::CStr::from_ptr(eff_path) },
+            linux_flags, mac_flags, ret,
+            if ret < 0 { open_errno } else { 0 }));
+        unsafe { *libc::__error() = open_errno; }
+    }
     if ret >= 0 {
         return ret as u64;
     }
@@ -1387,6 +1425,58 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         if ret2 >= 0 {
             return ret2 as u64;
         }
+    }
+
+    // Linux open(O_PATH) works on sockets/fifos; macOS open() cannot open a
+    // socket at all (EOPNOTSUPP), and following a rendezvous symlink whose
+    // target is a guest path fails host-side (ENOENT). When the FINAL
+    // component is a symlink, open the symlink itself (O_SYMLINK): the caller
+    // only wants a path handle, and F_GETPATH on it feeds the
+    // /proc/self/fd/N sun_path resolution (podman's openUnixSocket dance).
+    // Deliberately NOT errno-gated: in a threaded guest (Go), a signal
+    // handler can clobber errno between the failed openat and this check.
+    if linux_flags & translate::LINUX_O_PATH != 0 {
+        let ret2 = unsafe {
+            libc::openat(mac_dirfd, eff_path,
+                         (mac_flags & !libc::O_NOFOLLOW) | libc::O_SYMLINK, mode)
+        };
+        if ret2 >= 0 {
+            if crate::net::unix_trace_enabled() && path.to_bytes().windows(6).any(|w| w == b"attach") {
+                raw_eprintln_fmt(format_args!(
+                    "fakelinux: [{}] OPENDBG O_SYMLINK ok fd={}\n",
+                    unsafe { libc::getpid() }, ret2));
+            }
+            return ret2 as u64;
+        }
+        let symlink_errno = unsafe { *libc::__error() };
+        // Socket/fifo target: macOS can't open those at all, but an
+        // O_PATH fd is only a path handle. Hand out a marker fd and
+        // record the intended host path so "/proc/self/fd/N" sun_path
+        // resolution (podman's openUnixSocket) finds the real socket.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(eff_path, &mut st) } == 0
+            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFSOCK | libc::S_IFIFO)
+        {
+            let devnull = c"/dev/null";
+            let marker = unsafe { libc::open(devnull.as_ptr(), mac_flags & !libc::O_NOFOLLOW & !libc::O_WRONLY & !libc::O_RDWR) };
+            if marker >= 0 {
+                let host = unsafe { std::ffi::CStr::from_ptr(eff_path) };
+                rootfs::register_path_fd(marker, host.to_bytes());
+                if crate::net::unix_trace_enabled() && path.to_bytes().windows(6).any(|w| w == b"attach") {
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: [{}] OPENDBG marker fd={}\n",
+                        unsafe { libc::getpid() }, marker));
+                }
+                return marker as u64;
+            }
+        }
+        if crate::net::unix_trace_enabled() && path.to_bytes().windows(6).any(|w| w == b"attach") {
+            let stat_errno = unsafe { *libc::__error() };
+            raw_eprintln_fmt(format_args!(
+                "fakelinux: [{}] OPENDBG fallbacks failed: symlink_errno={} stat_errno={} st_mode={:o}\n",
+                unsafe { libc::getpid() }, symlink_errno, stat_errno, st.st_mode));
+        }
+        unsafe { *libc::__error() = open_errno; }
     }
 
     // In rootfs mode, if O_NOFOLLOW caused ELOOP, retry without it.
@@ -1542,6 +1632,7 @@ fn do_close(fd: i32) -> u64 {
     signalfd::on_close(fd);
     epoll::on_close(fd);
     procfs::on_close(fd);
+    rootfs::unregister_path_fd(fd);
     if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
     clear_fd_seals(fd);
     wake_socket_before_close(fd);
@@ -4913,6 +5004,59 @@ pub fn merge_envp(
     out
 }
 
+/// The standard container devices crun mknods when running as "root". Guest
+/// opens of /dev/* pass through to the macOS devices, so the on-disk node is
+/// only a directory-listing placeholder — an empty regular file (a symlink to
+/// the macOS device trips crun's containment check: "target not under the
+/// directory"). Unknown devices stay EPERM so nothing writes to a bogus
+/// placeholder believing it is real hardware.
+const KNOWN_DEV_NODES: [&[u8]; 7] =
+    [b"null", b"zero", b"full", b"random", b"urandom", b"tty", b"ptmx"];
+
+/// mknodat — FIFOs and plain files are created for real; the well-known
+/// container device nodes become placeholder files; other device/socket
+/// nodes get EPERM, matching unprivileged Linux.
+fn do_mknodat(dirfd: i32, path_ptr: u64, mode: u32, _dev: u64) -> u64 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFCHR: u32 = 0o020000;
+    let (eff_path, _hold) = effective_path_ptr(path_ptr);
+    let mac_dirfd = translate::translate_dirfd(dirfd);
+    let perm = (mode & 0o7777) as libc::mode_t;
+    let ret = match mode & S_IFMT {
+        S_IFIFO => unsafe { libc::mkfifoat(mac_dirfd, eff_path, perm) },
+        S_IFCHR => {
+            let path_bytes = unsafe { std::ffi::CStr::from_ptr(eff_path) }.to_bytes();
+            let base = path_bytes.rsplit(|&b| b == b'/').next().unwrap_or(path_bytes);
+            if !KNOWN_DEV_NODES.contains(&base) {
+                return (-libc::EPERM as i64) as u64;
+            }
+            let fd = unsafe {
+                libc::openat(mac_dirfd, eff_path,
+                             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                             perm as libc::c_uint)
+            };
+            if fd >= 0 { unsafe { libc::close(fd) }; 0 } else { -1 }
+        }
+        0 | S_IFREG => {
+            let fd = unsafe {
+                libc::openat(mac_dirfd, eff_path,
+                             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                             perm as libc::c_uint)
+            };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+                0
+            } else {
+                -1
+            }
+        }
+        _ => return (-libc::EPERM as i64) as u64,
+    };
+    if ret < 0 { translate::linux_errno() } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4920,6 +5064,43 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn mknodat_creates_fifo_and_rejects_devices() {
+        // conmon mknodat's its terminal ctl FIFO (S_IFIFO|0660) — must work.
+        let dir = std::env::temp_dir().join("flx-mknodat-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("ctl");
+        let cpath = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        const AT_FDCWD_LINUX: i32 = -100;
+        let r = do_mknodat(AT_FDCWD_LINUX, cpath.as_ptr() as u64, 0o010660, 0);
+        assert_eq!(r, 0, "mknodat(S_IFIFO) failed: {}", r as i64);
+        let md = std::fs::metadata(&fifo).unwrap();
+        use std::os::unix::fs::FileTypeExt;
+        assert!(md.file_type().is_fifo());
+        // Second creation → EEXIST (-17).
+        let r2 = do_mknodat(AT_FDCWD_LINUX, cpath.as_ptr() as u64, 0o010660, 0);
+        assert_eq!(r2 as i64, -17);
+        // Well-known character device (crun creates the standard container
+        // devices) → a symlink to the macOS device of the same role.
+        let dev = dir.join("null");
+        let cdev = std::ffi::CString::new(dev.to_str().unwrap()).unwrap();
+        let r3 = do_mknodat(AT_FDCWD_LINUX, cdev.as_ptr() as u64, 0o020666, 0x0103);
+        assert_eq!(r3, 0, "mknod /dev-style null failed: {}", r3 as i64);
+        assert!(std::fs::metadata(&dev).unwrap().file_type().is_file());
+        // Unknown character device → EPERM (-1), like unprivileged Linux.
+        let tun = dir.join("tun0");
+        let ctun = std::ffi::CString::new(tun.to_str().unwrap()).unwrap();
+        let r3b = do_mknodat(AT_FDCWD_LINUX, ctun.as_ptr() as u64, 0o020666, 0x0103);
+        assert_eq!(r3b as i64, -1);
+        // Plain file (type bits 0 = S_IFREG implied).
+        let reg = dir.join("reg");
+        let creg = std::ffi::CString::new(reg.to_str().unwrap()).unwrap();
+        let r4 = do_mknodat(AT_FDCWD_LINUX, creg.as_ptr() as u64, 0o644, 0);
+        assert_eq!(r4, 0);
+        assert!(std::fs::metadata(&reg).unwrap().file_type().is_file());
     }
 
     #[test]

@@ -353,6 +353,10 @@ pub fn mac_errno_to_linux(mac_errno: i32) -> i32 {
         84 => 75,
         // macOS EILSEQ=92 → Linux 84
         92 => 84,
+        // macOS EOPNOTSUPP=102 → Linux 95 (Linux 102 is ENETRESET — leaking
+        // 102 raw turned "can't open a socket" into "network dropped
+        // connection on reset" in podman)
+        102 => 95,
         // Unmapped: return as-is (best effort)
         _ => mac_errno,
     }

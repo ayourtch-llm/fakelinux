@@ -90,6 +90,15 @@ pub fn translate_path(path: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    // /proc/self/fd/<N>/<rest> — traversal THROUGH an fd-dir symlink. conmon
+    // and podman use this to sidestep sun_path length limits (open the socket
+    // dir O_PATH, bind/connect to "/proc/self/fd/N/attach"). Resolve fd N to
+    // its host path and splice <rest> on. Must run before the /proc
+    // early-return below.
+    if let Some(host) = translate_proc_fd_traversal(path) {
+        return Some(host);
+    }
+
     // Don't translate /proc (we handle it virtually)
     if path.starts_with(b"/proc") {
         return None;
@@ -611,21 +620,148 @@ pub fn strip_root_prefix(host_path: &[u8]) -> Option<Vec<u8>> {
     if root.is_empty() {
         return None;
     }
-    let root_bytes = root.as_bytes();
-    if host_path.starts_with(root_bytes) {
-        let rest = &host_path[root_bytes.len()..];
-        if rest.is_empty() {
-            // Path is exactly the root → guest "/"
-            Some(b"/".to_vec())
-        } else if rest[0] == b'/' {
-            Some(rest.to_vec())
-        } else {
-            // Root prefix doesn't end at a path boundary
-            None
+    strip_prefix_at_boundary(host_path, root.as_bytes()).or_else(|| {
+        // FAKELINUX_ROOT may be relative while the host path (e.g. from
+        // F_GETPATH) is absolute — also try the canonicalized root.
+        let abs = ROOT_ABS.get_or_init(|| {
+            std::fs::canonicalize(root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        if abs.is_empty() {
+            return None;
         }
+        strip_prefix_at_boundary(host_path, abs.as_bytes())
+    })
+}
+
+/// Canonicalized (absolute) form of ROOT, computed lazily. Lazy is safe here:
+/// canonicalize() resolves relative to cwd, and ROOT-relative translation only
+/// works while cwd is unchanged anyway.
+static ROOT_ABS: OnceLock<String> = OnceLock::new();
+
+/// Strip `prefix` from `host_path` if it ends at a path-component boundary.
+/// Exactly the prefix → guest "/".
+fn strip_prefix_at_boundary(host_path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    if !host_path.starts_with(prefix) {
+        return None;
+    }
+    let rest = &host_path[prefix.len()..];
+    if rest.is_empty() {
+        Some(b"/".to_vec())
+    } else if rest[0] == b'/' {
+        Some(rest.to_vec())
     } else {
         None
     }
+}
+
+/// Resolve "/proc/self/fd/<N>/<rest>" — traversal through an fd symlink —
+/// to a NUL-terminated HOST path. Plain "/proc/self/fd/<N>" (no rest) stays
+/// virtual (procfs handles open/readlink of it); unresolvable fds return None.
+fn translate_proc_fd_traversal(path: &[u8]) -> Option<Vec<u8>> {
+    let tail = path.strip_prefix(b"/proc/self/fd/".as_slice())?;
+    let slash = tail.iter().position(|&b| b == b'/')?;
+    let (fd_bytes, rest) = (&tail[..slash], &tail[slash + 1..]);
+    if fd_bytes.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let fd: i32 = std::str::from_utf8(fd_bytes).ok()?.parse().ok()?;
+    resolve_fd_plus_rest(fd, rest)
+}
+
+/// Resolve an AF_UNIX sun_path of the form "/proc/self/fd/<N>" or
+/// "/proc/self/fd/<N>/<rest>" to a HOST path (no NUL). podman's
+/// openUnixSocket() opens the socket path O_PATH and dials the bare fd form.
+/// Unlike translate_proc_fd_traversal this accepts an empty rest — for a
+/// sun_path there is no virtual-procfs fallback to preserve.
+pub fn resolve_proc_fd_sun_path(path: &[u8]) -> Option<Vec<u8>> {
+    let tail = path.strip_prefix(b"/proc/self/fd/".as_slice())?;
+    let (fd_bytes, rest) = match tail.iter().position(|&b| b == b'/') {
+        Some(slash) => (&tail[..slash], &tail[slash + 1..]),
+        None => (tail, &b""[..]),
+    };
+    if fd_bytes.is_empty() {
+        return None;
+    }
+    let fd: i32 = std::str::from_utf8(fd_bytes).ok()?.parse().ok()?;
+    let mut host = resolve_fd_plus_rest(fd, rest)?;
+    if host.ends_with(&[0]) {
+        host.pop();
+    }
+    Some(host)
+}
+
+/// O_PATH-emulation registry: macOS cannot open sockets/fifos at all, so
+/// do_openat hands out a marker fd (an open /dev/null) and records the
+/// intended host path here. resolve_fd_plus_rest consults this before
+/// F_GETPATH so "/proc/self/fd/N" sun_paths (podman's openUnixSocket) resolve
+/// to the socket the guest meant, not to /dev/null.
+static PATH_FDS: Mutex<Option<std::collections::HashMap<i32, Vec<u8>>>> = Mutex::new(None);
+
+pub fn register_path_fd(fd: i32, host_path: &[u8]) {
+    let mut lock = PATH_FDS.lock().unwrap();
+    lock.get_or_insert_with(Default::default)
+        .insert(fd, host_path.to_vec());
+}
+
+pub fn unregister_path_fd(fd: i32) {
+    if let Some(map) = PATH_FDS.lock().unwrap().as_mut() {
+        map.remove(&fd);
+    }
+}
+
+fn path_fd_host(fd: i32) -> Option<Vec<u8>> {
+    PATH_FDS.lock().unwrap().as_ref()?.get(&fd).cloned()
+}
+
+/// Shared body: F_GETPATH(fd), map back to a guest path when possible and
+/// re-translate (keeps chroot/casefold/rendezvous identical to direct access),
+/// splice `rest` on (may be empty). Returns a NUL-terminated host path.
+fn resolve_fd_plus_rest(fd: i32, rest: &[u8]) -> Option<Vec<u8>> {
+    // An O_PATH-emulation marker fd? Its real target is in the registry.
+    let registered = path_fd_host(fd);
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let host_dir: &[u8] = if let Some(ref h) = registered {
+        h
+    } else {
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&b| b == 0)?;
+        &buf[..len]
+    };
+    // Prefer mapping the fd's host path back to a GUEST path and re-running
+    // normal translation: that keeps the result byte-identical with direct
+    // guest-path access (chroot, casefold, and the AF_UNIX sun_path-overflow
+    // rendezvous hash all depend on that). Fall back to the raw host path
+    // when the fd points outside the rootfs.
+    let guest_dir = if let Some(chroot_host) = get_chroot_host() {
+        strip_prefix_at_boundary(host_dir, chroot_host.as_bytes()).or_else(|| {
+            let abs = std::fs::canonicalize(&chroot_host).ok()?;
+            strip_prefix_at_boundary(host_dir, abs.to_string_lossy().as_bytes())
+        })
+    } else {
+        strip_root_prefix(host_dir)
+    };
+    if let Some(mut guest) = guest_dir {
+        if !rest.is_empty() {
+            if !guest.ends_with(b"/") {
+                guest.push(b'/');
+            }
+            guest.extend_from_slice(rest);
+        }
+        if let Some(t) = translate_path(&guest) {
+            return Some(t);
+        }
+    }
+    let mut out = host_dir.to_vec();
+    if !rest.is_empty() {
+        out.push(b'/');
+        out.extend_from_slice(rest);
+    }
+    out.push(0);
+    Some(out)
 }
 
 /// Join a guest-visible absolute directory path with a relative path,
@@ -714,6 +850,39 @@ mod tests {
     // Note: These tests use the module-level OnceLock statics, so they can only
     // set ROOT/SYSROOT once across all tests in this module. We test the pure
     // functions (is_library_path, strip_root_prefix logic) independently.
+
+    #[test]
+    fn proc_fd_traversal_resolves_via_fd() {
+        // conmon/podman work around sun_path length limits by opening a dir
+        // O_PATH and binding to "/proc/self/fd/<N>/attach". Resolve the fd via
+        // F_GETPATH and splice the trailing components onto its host path.
+        let dir = std::env::temp_dir().join("flx-procfd-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::fs::File::open(&dir).unwrap();
+        use std::os::fd::AsRawFd;
+        let fd = f.as_raw_fd();
+        let guest = format!("/proc/self/fd/{}/attach.sock", fd).into_bytes();
+        let got = translate_path(&guest).expect("fd-traversal path must translate");
+        let got_str = std::str::from_utf8(&got[..got.len() - 1]).unwrap();
+        assert!(got.ends_with(&[0]));
+        assert!(
+            got_str.ends_with("/flx-procfd-test/attach.sock"),
+            "unexpected translation: {}",
+            got_str
+        );
+        assert!(!got_str.contains("/proc/"), "must not leak /proc: {}", got_str);
+    }
+
+    #[test]
+    fn proc_fd_plain_and_bad_forms_untouched() {
+        // Plain /proc/self/fd/N (no trailing components) stays virtual —
+        // procfs handles open/readlink of it. Non-numeric fds too.
+        assert_eq!(translate_path(b"/proc/self/fd/3"), None);
+        assert_eq!(translate_path(b"/proc/self/fd/3/"), None);
+        assert_eq!(translate_path(b"/proc/self/fd/abc/x"), None);
+        // A closed/bogus fd resolves to nothing → stays untranslated.
+        assert_eq!(translate_path(b"/proc/self/fd/987654/x"), None);
+    }
 
     #[test]
     fn test_resolve_in_rootfs_absolute_symlink_chain() {

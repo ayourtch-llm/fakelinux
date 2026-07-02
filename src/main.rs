@@ -88,6 +88,27 @@ fn main() {
     if std::env::var("FAKELINUX_TRACE").is_ok() {
         syscall::set_trace(true);
     }
+    if let Ok(path) = std::env::var("FAKELINUX_TRACE_FILE") {
+        // Route raw diagnostics to a file so guests that daemonize (dup2
+        // /dev/null over 0/1/2) can't silence tracing. Park the fd high so
+        // guest dup2/close targeting low fds never collides with it.
+        if let Ok(cpath) = std::ffi::CString::new(path) {
+            let fd = unsafe {
+                libc::open(cpath.as_ptr(),
+                           libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+                           0o644)
+            };
+            if fd >= 0 {
+                let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900) };
+                if high >= 0 {
+                    unsafe { libc::close(fd) };
+                    syscall::set_trace_fd(high);
+                } else {
+                    syscall::set_trace_fd(fd);
+                }
+            }
+        }
+    }
     if std::env::var("FAKELINUX_RELOC_ALL").is_ok() {
         loader::RELOC_ALL.store(true, std::sync::atomic::Ordering::Relaxed);
     }
