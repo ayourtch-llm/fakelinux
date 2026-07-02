@@ -157,6 +157,30 @@ fn rendezvous_guest_path(host: &[u8]) -> Vec<u8> {
     format!("/tmp/flx-{:016x}.s", h).into_bytes() // 27 bytes
 }
 
+/// True when `host_path` overflows macOS's sun_path AND its in-rootfs
+/// rendezvous socket exists. Lets do_openat's O_PATH emulation hand out a
+/// marker fd for an attach socket whose guest-visible symlink was removed
+/// (podman/conmon delete and recreate those freely) — sun_path resolution
+/// then hashes to the same rendezvous and connect still succeeds.
+pub fn rendezvous_socket_exists(host_path: &[u8]) -> bool {
+    if mac_sockaddr_un(host_path).is_ok() {
+        return false; // short path — no rendezvous involved
+    }
+    let guest_rv = rendezvous_guest_path(host_path);
+    let Some(mut host_rv) = crate::rootfs::translate_path(&guest_rv) else {
+        return false;
+    };
+    if host_rv.ends_with(&[0]) {
+        host_rv.pop();
+    }
+    let Ok(c) = std::ffi::CString::new(host_rv) else { return false };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::lstat(c.as_ptr(), &mut st) == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    }
+}
+
 /// Translate a guest AF_UNIX `sun_path` to the host path the kernel should
 /// bind/connect to. Handles the sun_path-overflow case with a rendezvous path.
 /// Returns `(host_bind_path, symlink_plan)` where `symlink_plan` is

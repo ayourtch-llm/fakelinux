@@ -897,6 +897,9 @@ extern "C" fn fork_trampoline_entry() -> ! {
         // getpid() returns the child's own pid (not 1), keeping job-control
         // setpgid() of children consistent.
         crate::pidns::clear_init_after_fork();
+        // Subreaper flag is not fork-inherited; the child's nearest subreaper
+        // becomes the forking parent when the parent was one (reaper.rs).
+        crate::reaper::on_fork_child();
 
         // Handle CLONE_CHILD_SETTID: write the child's TID to the
         // child_tid_ptr in the child's address space. On real Linux, the kernel
@@ -1079,7 +1082,19 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
     // unblocked) so a deliverable signal returns -EINTR between chunks. WNOHANG
     // callers keep the single-shot fast path.
     let ret = if options & libc::WNOHANG != 0 {
-        unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) }
+        let r = unsafe { libc::wait4(pid as i32, status_ptr, options, rusage) };
+        // Nothing from the kernel — a subreaper (conmon) may still have a
+        // published exit from an orphaned descendant (reaper.rs).
+        if r <= 0 {
+            if let Some((cpid, wst)) = crate::reaper::try_reap(pid) {
+                status = wst;
+                cpid
+            } else {
+                r
+            }
+        } else {
+            r
+        }
     } else {
         loop {
             if crate::signal::has_unblocked_pending() {
@@ -1089,6 +1104,12 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
             let r = unsafe {
                 libc::wait4(pid as i32, status_ptr, options | libc::WNOHANG, rusage)
             };
+            if r <= 0 {
+                if let Some((cpid, wst)) = crate::reaper::try_reap(pid) {
+                    status = wst;
+                    break cpid;
+                }
+            }
             if r != 0 {
                 break r; // child reaped (>0) or error such as ECHILD (<0)
             }

@@ -10,6 +10,7 @@ mod loader;
 mod mountns;
 mod net;
 mod pidns;
+mod reaper;
 mod procfs;
 mod rootfs;
 mod signal;
@@ -126,6 +127,7 @@ fn main() {
     }
     rootfs::init(&rootfs, &sysroot);
     rootfs::init_chroot_from_env();
+    reaper::init_from_env();
     syscall::init_sysroot(&sysroot);
 
     // Absolutize the ELF path (rootfs prefix matching needs it), then

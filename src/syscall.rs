@@ -290,6 +290,8 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         SYS_EXIT_GROUP => unsafe {
             log_exit(args[0] as i32, "exit_group");
             crate::trap::dump_trap_stats();
+            // Publish wstatus for a subreaper ancestor (conmon) before dying.
+            crate::reaper::publish_exit(((args[0] as i32) & 0xff) << 8);
             libc::_exit(args[0] as i32)
         },
         SYS_EXIT => {
@@ -529,6 +531,14 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             let mac_flags = if args[2] & 0x200 != 0 { libc::AT_REMOVEDIR } else { 0 };
             // unlink/rmdir act on the link itself — never resolve final symlink.
             let (eff_path, _hold) = effective_path_ptr_nofollow(args[1]);
+            if crate::net::unix_trace_enabled() && args[1] != 0 {
+                let p = unsafe { std::ffi::CStr::from_ptr(args[1] as *const i8) };
+                if p.to_bytes().windows(6).any(|w| w == b"attach") {
+                    raw_eprintln_fmt(format_args!(
+                        "fakelinux: [{}] UNLINKDBG {:?}\n",
+                        unsafe { libc::getpid() }, p));
+                }
+            }
             let ret = unsafe { libc::unlinkat(translate::translate_dirfd(args[0] as i32), eff_path, mac_flags) };
             if ret == 0 { 0 }
             else if _hold.is_some() && !rootfs::in_full_rootfs_mode() {
@@ -1453,19 +1463,22 @@ fn do_openat(linux_dirfd: i32, pathname: u64, linux_flags: i32, mode: u32) -> u6
         // O_PATH fd is only a path handle. Hand out a marker fd and
         // record the intended host path so "/proc/self/fd/N" sun_path
         // resolution (podman's openUnixSocket) finds the real socket.
+        // Also taken when the node is GONE but its sun_path-overflow
+        // rendezvous socket exists (podman/conmon recreate the guest-visible
+        // symlink freely; the rendezvous is the durable artifact).
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::stat(eff_path, &mut st) } == 0
-            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFSOCK | libc::S_IFIFO)
-        {
+        let host = unsafe { std::ffi::CStr::from_ptr(eff_path) };
+        let is_sockish = unsafe { libc::stat(eff_path, &mut st) } == 0
+            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFSOCK | libc::S_IFIFO);
+        if is_sockish || crate::net::rendezvous_socket_exists(host.to_bytes()) {
             let devnull = c"/dev/null";
             let marker = unsafe { libc::open(devnull.as_ptr(), mac_flags & !libc::O_NOFOLLOW & !libc::O_WRONLY & !libc::O_RDWR) };
             if marker >= 0 {
-                let host = unsafe { std::ffi::CStr::from_ptr(eff_path) };
                 rootfs::register_path_fd(marker, host.to_bytes());
                 if crate::net::unix_trace_enabled() && path.to_bytes().windows(6).any(|w| w == b"attach") {
                     raw_eprintln_fmt(format_args!(
-                        "fakelinux: [{}] OPENDBG marker fd={}\n",
-                        unsafe { libc::getpid() }, marker));
+                        "fakelinux: [{}] OPENDBG marker fd={} sockish={}\n",
+                        unsafe { libc::getpid() }, marker, is_sockish));
                 }
                 return marker as u64;
             }
@@ -2782,8 +2795,8 @@ unsafe fn collect_guest_env<'a>(envp_ptr: u64) -> Vec<&'a std::ffi::CStr> {
 /// the `&'static str` lifetime on the returned tuple keys is valid. These
 /// leaks are bounded (once per unique FAKELINUX_* name seen per process).
 /// The three FAKELINUX_* vars that are recomputed per-execve (not snapshotted).
-const DYNAMIC_EXEC_KEYS: [&str; 3] =
-    ["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK", "FAKELINUX_ARGV0"];
+const DYNAMIC_EXEC_KEYS: [&str; 4] =
+    ["FAKELINUX_SIGIGN", "FAKELINUX_SIGMASK", "FAKELINUX_ARGV0", "FAKELINUX_SUBREAPER"];
 
 /// Snapshot of the static FAKELINUX_* environment, taken ONCE at startup while
 /// single-threaded and pre-fork. The execve path reads this instead of
@@ -2841,6 +2854,8 @@ fn build_exec_overrides(argv0: Option<Vec<u8>>) -> Vec<(&'static str, Option<Str
     // fakelinux (e.g. podman's layer-extract subprocess) picks it up in
     // init_chroot_from_env(). None = clear the var in the child env.
     o.push(("FAKELINUX_CHROOT", rootfs::get_chroot_host()));
+    // Nearest subreaper ancestor (or self, for a subreaper) — see reaper.rs.
+    o.push(("FAKELINUX_SUBREAPER", crate::reaper::exec_env_value()));
     o
 }
 
@@ -3950,8 +3965,16 @@ fn do_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
     const PR_GET_PDEATHSIG: i32 = 2;
     const PR_CAPBSET_READ: i32 = 23;
     const PR_CAPBSET_DROP: i32 = 24;
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
 
     match option {
+        PR_SET_CHILD_SUBREAPER => {
+            // Emulated: exiting descendants publish their wstatus to this
+            // process's reap registry (see reaper.rs). conmon relies on this
+            // to learn the double-forked container init's exit status.
+            crate::reaper::set_subreaper(arg2 != 0);
+            0
+        }
         PR_SET_NAME => {
             // Set thread name via macOS pthread_setname_np
             if arg2 != 0 {
