@@ -212,7 +212,11 @@ pub fn raw_eprintln_fmt(args: std::fmt::Arguments) {
     let _ = cursor.write_fmt(args);
     let pos = cursor.position() as usize;
     let fd = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
-    unsafe { libc::write(fd, buf.as_ptr() as *const _, pos); }
+    let r = unsafe { libc::write(fd, buf.as_ptr() as *const _, pos) };
+    if r < 0 && fd != 2 {
+        // The parked trace fd died (e.g. guest closed it) — don't go silent.
+        unsafe { libc::write(2, buf.as_ptr() as *const _, pos); }
+    }
 }
 
 /// Current program break (heap end), set by the loader after mapping segments.
@@ -266,14 +270,16 @@ pub fn trace_enabled() -> bool {
 pub fn emulate(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
     let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
     if trace {
+        let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!(
-            "fakelinux: syscall {} (x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x})\n",
-            nr, args[0], args[1], args[2], args[3], args[4], args[5]
+            "fakelinux: [{}] syscall {} (x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x})\n",
+            pid, nr, args[0], args[1], args[2], args[3], args[4], args[5]
         ));
     }
     let result = emulate_inner(nr, args, _mctx);
     if trace {
-        raw_eprintln_fmt(format_args!("fakelinux:   → {:#x} ({})\n", result, result as i64));
+        let pid = unsafe { libc::getpid() };
+        raw_eprintln_fmt(format_args!("fakelinux: [{}]   → {:#x} ({})\n", pid, result, result as i64));
     }
     result
 }
@@ -977,7 +983,11 @@ fn do_write(fd: u64, buf: u64, count: u64) -> u64 {
         raw_eprintln_fmt(format_args!("fakelinux: [{}] write({}, count={}) = {} {:?}\n",
             pid, fd_i32, count, ret, preview));
     }
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    if ret < 0 {
+        let e = translate::linux_errno();
+        if e as i64 == -32 { signal::guest_epipe_signal(); }
+        e
+    } else { ret as u64 }
 }
 
 /// Wait until `fd` is ready for `events` (POLLIN/POLLOUT), interruptibly, so a
@@ -1636,7 +1646,7 @@ fn host_has_multiple_threads() -> bool {
 
 fn do_close(fd: i32) -> u64 {
     CLOSE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if TRACE.load(std::sync::atomic::Ordering::Relaxed) && fd <= 10 {
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
         let pid = unsafe { libc::getpid() };
         raw_eprintln_fmt(format_args!("fakelinux: [{}] close({})\n", pid, fd));
     }
@@ -1667,36 +1677,29 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
     // Clamp to a reasonable range to avoid iterating millions of fds.
     let last = last.min(first.saturating_add(65536));
 
+    // The supervisor's diagnostic fd is not part of the guest's fd table on
+    // real Linux — never let a guest close_range touch it.
+    let trace_fd = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
+
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        // CLOSE_RANGE_CLOEXEC: close fds that have FD_CLOEXEC set.
+        // CLOSE_RANGE_CLOEXEC: mark every open fd in range close-on-exec.
+        // Linux closes NOTHING here — crun's container init relies on that:
+        // it calls close_range(3, ~0, CLOSE_RANGE_CLOEXEC) and then still
+        // reads its exec.fifo fd (already O_CLOEXEC) to wait for `crun start`.
         //
-        // Complication: before macOS fork(), we strip FD_CLOEXEC from all fds
-        // (to prevent atfork handlers from closing them). We only restore it in
-        // the parent. In the child, fds that SHOULD have CLOEXEC don't have it
-        // yet — the child needs to do dup2 first (to set up stdin/stdout from
-        // pipe fds). We can't close those pipe fds before dup2.
-        //
-        // Strategy: for fds that currently lack CLOEXEC but HAD it before fork
-        // (per FORK_SAVED_CLOEXEC), SET the CLOEXEC flag NOW instead of closing.
-        // The actual close happens later at exec time (macOS execve closes
-        // CLOEXEC fds natively). This lets the child dup2 from them first.
+        // FORK_SAVED_CLOEXEC bookkeeping: before macOS fork() we strip
+        // FD_CLOEXEC from all fds (to protect them from atfork handlers) and
+        // only restore it in the parent. Setting the flag here makes it real
+        // again, so consume the saved entry.
         for fd in first..=last {
             let fd_i = fd as i32;
+            if fd_i == trace_fd {
+                continue;
+            }
             let fd_flags = unsafe { libc::fcntl(fd_i, libc::F_GETFD) };
-            let has_cloexec = fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0;
-            if has_cloexec {
-                // Already has CLOEXEC — close it now (native behavior)
-                eventfd::on_close(fd_i);
-                signalfd::on_close(fd_i);
-                epoll::on_close(fd_i);
-                procfs::on_close(fd_i);
-                wake_socket_before_close(fd_i);
-                clear_interruptible_socket_fd(fd_i);
-                unsafe { libc::close(fd_i); }
-            } else if thread::FORK_SAVED_CLOEXEC.take(fd as usize) {
-                // Had CLOEXEC before fork — restore the flag so exec closes it.
-                // Don't close now: the child may need this fd for dup2.
-                if fd_flags >= 0 {
+            if fd_flags >= 0 {
+                thread::FORK_SAVED_CLOEXEC.take(fd as usize);
+                if fd_flags & libc::FD_CLOEXEC == 0 {
                     unsafe { libc::fcntl(fd_i, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC); }
                 }
             }
@@ -1705,6 +1708,9 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
         // Close all fds in range unconditionally.
         for fd in first..=last {
             let fd = fd as i32;
+            if fd == trace_fd {
+                continue;
+            }
             eventfd::on_close(fd);
             signalfd::on_close(fd);
             epoll::on_close(fd);
@@ -2336,7 +2342,11 @@ fn do_fcntl(fd: i32, linux_cmd: i32, arg: u64) -> u64 {
 
 fn do_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
     let ret = unsafe { libc::writev(fd as i32, iov as *const libc::iovec, iovcnt as i32) };
-    if ret < 0 { translate::linux_errno() } else { ret as u64 }
+    if ret < 0 {
+        let e = translate::linux_errno();
+        if e as i64 == -32 { signal::guest_epipe_signal(); }
+        e
+    } else { ret as u64 }
 }
 
 fn do_readv(fd: u64, iov: u64, iovcnt: u64) -> u64 {
@@ -2668,6 +2678,12 @@ fn do_pipe2(pipefd_ptr: u64, flags: i32) -> u64 {
             libc::fcntl((*fds)[0], libc::F_SETFL, libc::O_NONBLOCK);
             libc::fcntl((*fds)[1], libc::F_SETFL, libc::O_NONBLOCK);
         }
+    }
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        let pid = unsafe { libc::getpid() };
+        let (r, w) = unsafe { ((*fds)[0], (*fds)[1]) };
+        raw_eprintln_fmt(format_args!(
+            "fakelinux: [{}] pipe2 -> read={} write={} flags={:#o}\n", pid, r, w, flags));
     }
     0
 }
@@ -5087,6 +5103,61 @@ mod tests {
 
     extern "C" {
         fn ptsname(fd: libc::c_int) -> *mut libc::c_char;
+    }
+
+    #[test]
+    fn close_range_cloexec_marks_but_does_not_close() {
+        // Linux CLOSE_RANGE_CLOEXEC sets FD_CLOEXEC on fds in range; it must
+        // NOT close them. crun's container init calls
+        // close_range(3, ~0, CLOSE_RANGE_CLOEXEC) and then still reads its
+        // exec.fifo fd (which already carries O_CLOEXEC) — closing it here
+        // makes the init exit 1 before ever exec'ing the container command.
+        unsafe {
+            // fd A: opened WITH CLOEXEC (like crun's exec.fifo fd)
+            let a = libc::open(b"/dev/null\0".as_ptr() as *const _,
+                               libc::O_RDONLY | libc::O_CLOEXEC);
+            assert!(a >= 0);
+            // fd B: opened WITHOUT CLOEXEC
+            let b = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY);
+            assert!(b >= 0);
+
+            let lo = a.min(b) as u32;
+            let hi = a.max(b) as u32;
+            let r = do_close_range(lo, hi, 4 /* CLOSE_RANGE_CLOEXEC */);
+            assert_eq!(r, 0);
+
+            // Both fds must still be open...
+            let fa = libc::fcntl(a, libc::F_GETFD);
+            let fb = libc::fcntl(b, libc::F_GETFD);
+            assert!(fa >= 0, "fd with pre-existing CLOEXEC was closed");
+            assert!(fb >= 0, "fd without CLOEXEC was closed");
+            // ...and both must now carry FD_CLOEXEC.
+            assert!(fa & libc::FD_CLOEXEC != 0);
+            assert!(fb & libc::FD_CLOEXEC != 0, "CLOEXEC not set on plain fd");
+
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn close_range_spares_the_trace_fd() {
+        // The supervisor's diagnostic fd (FAKELINUX_TRACE_FILE, parked high)
+        // is not part of the guest's fd table on real Linux — a guest
+        // close_range(3, ~0, 0) must not close it out from under us.
+        unsafe {
+            let t = libc::open(b"/dev/null\0".as_ptr() as *const _,
+                               libc::O_WRONLY | libc::O_CLOEXEC);
+            assert!(t >= 0);
+            let old = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
+            set_trace_fd(t);
+            let r = do_close_range(t as u32, t as u32, 0);
+            assert_eq!(r, 0);
+            let alive = libc::fcntl(t, libc::F_GETFD) >= 0;
+            set_trace_fd(old);
+            assert!(alive, "close_range closed the supervisor trace fd");
+            libc::close(t);
+        }
     }
 
     #[test]
