@@ -1123,6 +1123,14 @@ pub fn do_wait4(pid: i64, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> u6
         return crate::translate::linux_errno();
     }
 
+    // Mirror the reaped child as a SIGCHLD record on any open signalfd, so a
+    // crun/conmon wait loop that watches its signalfd stays consistent with
+    // what wait4 just reaped. (crun's fast path reaps here directly; the
+    // signalfd record covers readers that consult it afterward.)
+    if ret > 0 {
+        crate::signalfd::deliver_sigchld(ret as i32, status);
+    }
+
     // Write status back to guest memory (Linux and macOS wstatus format is compatible)
     if wstatus_ptr != 0 {
         unsafe { (wstatus_ptr as *mut i32).write(status); }

@@ -107,6 +107,7 @@ pub const SYS_PWRITE64: u64 = 68;
 pub const SYS_KILL: u64 = 129;
 pub const SYS_TKILL: u64 = 130;
 pub const SYS_EVENTFD2: u64 = 19;
+pub const SYS_SIGNALFD4: u64 = 74;
 pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
 pub const SYS_EPOLL_PWAIT: u64 = 22;

@@ -9,6 +9,7 @@ use crate::pidns;
 use crate::procfs;
 use crate::rootfs;
 use crate::signal;
+use crate::signalfd;
 use crate::thread;
 use crate::timers;
 use crate::translate;
@@ -399,6 +400,9 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         }
         SYS_PPOLL => do_ppoll(args[0], args[1] as u32, args[2], args[3], args[4]),
         SYS_EVENTFD2 => eventfd::do_eventfd2(args[0] as u32, args[1] as i32),
+        // signalfd4(fd, mask, sizemask, flags) — crun/conmon block all
+        // signals then epoll a signalfd to learn when container init exits.
+        SYS_SIGNALFD4 => signalfd::do_signalfd4(args[0] as i32, args[1], args[2], args[3] as i32),
         SYS_EPOLL_CREATE1 => epoll::do_epoll_create1(args[0] as i32),
         SYS_EPOLL_CTL => epoll::do_epoll_ctl(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
         SYS_EPOLL_PWAIT => epoll::do_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32, args[4]),
@@ -796,6 +800,11 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
         97 => 0,
         // setns(2) — same reasoning as unshare: stub to success.
         268 => 0,
+        // sethostname(2)/setdomainname(2) — crun sets the UTS-namespace
+        // hostname during container setup. macOS won't let an unprivileged
+        // process change the real host name (and we wouldn't want to), so
+        // accept and discard: the container just keeps the default name.
+        161 | 162 => 0,
         // pivot_root(2), mount(2), umount2(2) — single-process emulator has
         // no real filesystem isolation; pretend success so container setup
         // continues. Mount points just don't actually exist; reads of
@@ -811,17 +820,14 @@ fn emulate_inner(nr: u64, args: &[u64; 6], _mctx: &mut MContext64) -> u64 {
             }
             0
         }
-        39 => match mount_table_key(args[0]) {
-            Some(key) if mountns::pop_mount(&key) => 0,
-            _ => (-22_i64) as u64, // -EINVAL: not a mount point
-        },
-        // pivot_root(new_root, put_old): the old root ends up stacked at
-        // put_old (crun uses pivot_root(".", ".")) — push a fake mount there
-        // for the subsequent umount2 loop to pop.
+        39 => {
+            let key = mount_table_key(args[0]).unwrap_or_default();
+            mountns::umount(&key, args[1])
+        }
+        // pivot_root(new_root, put_old): the old root becomes a detachable
+        // subtree that crun's cleanup loop umount2(MNT_DETACH)s afterwards.
         41 => {
-            if let Some(key) = mount_table_key(args[1]) {
-                mountns::push_mount(&key);
-            }
+            mountns::push_pivot_oldroot();
             0
         }
         // chroot(2) — translate the guest path to a host path and store it.
@@ -1533,6 +1539,7 @@ fn do_close(fd: i32) -> u64 {
     }
     // Clean up virtual fd state if this fd is one of those
     eventfd::on_close(fd);
+    signalfd::on_close(fd);
     epoll::on_close(fd);
     procfs::on_close(fd);
     if fd >= 0 { thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize); }
@@ -1576,6 +1583,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
             if has_cloexec {
                 // Already has CLOEXEC — close it now (native behavior)
                 eventfd::on_close(fd_i);
+                signalfd::on_close(fd_i);
                 epoll::on_close(fd_i);
                 procfs::on_close(fd_i);
                 wake_socket_before_close(fd_i);
@@ -1594,6 +1602,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> u64 {
         for fd in first..=last {
             let fd = fd as i32;
             eventfd::on_close(fd);
+            signalfd::on_close(fd);
             epoll::on_close(fd);
             procfs::on_close(fd);
             thread::FORK_SAVED_CLOEXEC.clear_fd(fd as usize);

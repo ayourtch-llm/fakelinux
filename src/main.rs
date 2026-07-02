@@ -13,6 +13,7 @@ mod pidns;
 mod procfs;
 mod rootfs;
 mod signal;
+mod signalfd;
 mod syscall;
 mod thread;
 mod timers;
