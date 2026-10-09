@@ -964,18 +964,27 @@ extern "C" fn fork_trampoline_entry() -> ! {
         let resume_pc = FORK.get_saved_pc(); // instruction after clone SVC = libc+0xBD4EC
         let libc_base = resume_pc - 0xBD4EC;
         let probe_addr = libc_base + 0xC1D28;
-        unsafe {
-            // Read original instruction
-            let orig = (probe_addr as *const u32).read();
-            crate::trap::FORK_RETURN_PROBE_ORIG.store(orig, std::sync::atomic::Ordering::Relaxed);
-            // Make the page writable, patch, flush icache, restore protection
-            let page = probe_addr & !0x3FFF; // 16KB page alignment
-            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
-            (probe_addr as *mut u32).write(crate::trap::UDF_MARKER);
-            extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
-            sys_icache_invalidate(probe_addr as *mut _, 4);
-            libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
-            crate::trap::FORK_RETURN_PROBE.store(probe_addr, std::sync::atomic::Ordering::Relaxed);
+        // The offsets above only hold for one specific glibc build. For any
+        // other guest (static binaries, musl, other glibc versions) probe_addr
+        // is an arbitrary address: reading it can SIGBUS the child, and
+        // patching it would plant a UDF in unrelated code. Only arm the probe
+        // when the target is mapped and really is `mov w0, w19`.
+        const MOV_W0_W19: u32 = 0x2a13_03e0;
+        let probe_word = crate::trap::safe_read_u64(probe_addr & !7)
+            .map(|v| (v >> ((probe_addr & 4) * 8)) as u32);
+        if probe_word == Some(MOV_W0_W19) {
+            unsafe {
+                let orig = MOV_W0_W19;
+                crate::trap::FORK_RETURN_PROBE_ORIG.store(orig, std::sync::atomic::Ordering::Relaxed);
+                // Make the page writable, patch, flush icache, restore protection
+                let page = probe_addr & !0x3FFF; // 16KB page alignment
+                libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE);
+                (probe_addr as *mut u32).write(crate::trap::UDF_MARKER);
+                extern "C" { fn sys_icache_invalidate(start: *mut libc::c_void, size: usize); }
+                sys_icache_invalidate(probe_addr as *mut _, 4);
+                libc::mprotect(page as *mut _, 0x4000, libc::PROT_READ | libc::PROT_EXEC);
+                crate::trap::FORK_RETURN_PROBE.store(probe_addr, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         // Child inherits the FAKELINUX_INIT_PID env var for execve.
     }
