@@ -20,14 +20,17 @@
 #define EPOLLOUT 0x004
 
 /*
- * Linux aarch64 struct epoll_event is packed to 12 bytes:
+ * Linux aarch64 struct epoll_event has natural alignment, 16 bytes:
  *   uint32_t events;    (offset 0)
- *   uint64_t data;      (offset 4)
+ *   uint64_t data;      (offset 8)
+ * The packed 12-byte layout (EPOLL_PACKED) is x86_64-only.
  */
 struct linux_epoll_event {
     unsigned int events;
     unsigned long long data;
-} __attribute__((packed));
+};
+_Static_assert(sizeof(struct linux_epoll_event) == 16,
+               "aarch64 epoll_event must be 16 bytes");
 
 int main(void) {
     int epfd, pipefd[2];
